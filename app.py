@@ -173,8 +173,7 @@ class App(tk.Tk):
                  bg=C_ORANGE, fg=C_WHITE).pack(anchor="w")
         tk.Label(title_frame, text="АНАЛИТИКА КОММЕРЧЕСКОГО ОТДЕЛА",
                  font=("Segoe UI", 7, "bold"),
-                 bg=C_ORANGE, fg="#FFD8B0",
-                 letterSpacing=2).pack(anchor="w")
+                 bg=C_ORANGE, fg="#FFD8B0").pack(anchor="w")
 
         # Разделитель
         tk.Frame(header, bg="#D06A10", width=1).pack(side="left", fill="y",
