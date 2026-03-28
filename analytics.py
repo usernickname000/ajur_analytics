@@ -255,12 +255,13 @@ def run_data_quality_checks(df):
 # ГЛАВНАЯ ФУНКЦИЯ — запускается из app.py
 # ============================================================
 
-def run_analytics(input_path: str, output_path: str, log=print):
+def run_analytics(input_path: str, output_path: str, log=print, manager_plan: dict = None):
     """
     Запускает полный цикл аналитики.
-    input_path  — путь к входному .xlsx
-    output_path — путь к выходному .xlsx
-    log         — функция для вывода сообщений (print или GUI-лог)
+    input_path   — путь к входному .xlsx
+    output_path  — путь к выходному .xlsx
+    log          — функция для вывода сообщений (print или GUI-лог)
+    manager_plan — dict {имя_менеджера: план_руб} или None
     """
 
     if not os.path.exists(input_path):
@@ -623,6 +624,70 @@ def run_analytics(input_path: str, output_path: str, log=print):
             ]
         })
 
+    # ── 19а. План по менеджерам ──────────────────────────────
+    plan_stats = None
+    if manager_plan and manager_stats is not None and len(manager_stats) > 0:
+        log("Считаю выполнение плана...")
+        plan_df = manager_stats.copy()
+        plan_df['План, руб.'] = plan_df[COL_MANAGER].map(manager_plan).fillna(0)
+        plan_df['План, тыс. руб.'] = (plan_df['План, руб.'] / 1000).round(2)
+        plan_df['Выполнение, %'] = plan_df.apply(
+            lambda r: round(r['Сумма выручки, руб.'] / r['План, руб.'] * 100, 1)
+            if r['План, руб.'] > 0 else None,
+            axis=1
+        )
+        plan_df['Остаток до плана, тыс. руб.'] = plan_df.apply(
+            lambda r: round((r['План, руб.'] - r['Сумма выручки, руб.']) / 1000, 2)
+            if r['План, руб.'] > 0 else None,
+            axis=1
+        )
+        plan_df['Статус'] = plan_df['Выполнение, %'].apply(
+            lambda x: '✅ Выполнен' if x is not None and x >= 100
+            else ('⚠ В работе' if x is not None and x >= 70
+            else ('❌ Отстаёт' if x is not None else '— нет плана'))
+        )
+        plan_stats = plan_df[[
+            COL_MANAGER,
+            'Сумма выручки, тыс. руб.',
+            'План, тыс. руб.',
+            'Выполнение, %',
+            'Остаток до плана, тыс. руб.',
+            'Статус'
+        ]].sort_values('Выполнение, %', ascending=False, na_position='last')
+
+    # ── 19б. Топ номенклатур ─────────────────────────────────
+    nomen_stats = None
+    COL_NOMEN_LOCAL = 'Номенклатура'
+    if COL_NOMEN_LOCAL in df_full.columns:
+        log("Считаю топ номенклатур...")
+        nomen_df = df_full.loc[mask_no_events].copy()
+        nomen_stats = (
+            nomen_df.groupby(COL_NOMEN_LOCAL)
+            .agg(
+                Выручка_руб=(revenue_col, 'sum'),
+                Заказов=(COL_ORDER, 'count'),
+                Клиентов=('КОНЕЧНЫЙ_КЛИЕНТ', 'nunique')
+            )
+            .reset_index()
+            .sort_values('Выручка_руб', ascending=False)
+        )
+        nomen_stats['Выручка, тыс. руб.'] = (nomen_stats['Выручка_руб'] / 1000).round(2)
+        nomen_stats['Средний чек, тыс. руб.'] = (
+            nomen_stats['Выручка_руб'] / nomen_stats['Заказов'] / 1000
+        ).round(2)
+        total_rev = nomen_stats['Выручка_руб'].sum()
+        nomen_stats['Доля выручки, %'] = (
+            nomen_stats['Выручка_руб'] / total_rev * 100
+        ).round(1)
+        nomen_stats = nomen_stats[[
+            COL_NOMEN_LOCAL,
+            'Выручка, тыс. руб.',
+            'Доля выручки, %',
+            'Заказов',
+            'Клиентов',
+            'Средний чек, тыс. руб.'
+        ]].head(50)
+
     # ── 19. Сборка и экспорт ─────────────────────────────────
     log("Сохраняю отчёт...")
     export_data = {}
@@ -634,7 +699,11 @@ def run_analytics(input_path: str, output_path: str, log=print):
     export_data['02_Топ_клиентов'] = client_stats.head(50)
     if manager_stats is not None:
         export_data['03_Топ_менеджеров'] = manager_stats.head(30)
+    if plan_stats is not None:
+        export_data['03а_План_менеджеров'] = plan_stats
     export_data['04_Отрасли'] = industry_stats
+    if nomen_stats is not None:
+        export_data['04а_Номенклатура'] = nomen_stats
     if seasonal_stats is not None:
         export_data['05_Сезонность'] = seasonal_stats
     if quarterly_stats is not None:
@@ -658,10 +727,12 @@ def run_analytics(input_path: str, output_path: str, log=print):
                 df_sheet.to_excel(writer, sheet_name=safe_name, index=False)
                 ws = writer.sheets[safe_name]
                 for col_idx, col in enumerate(df_sheet.columns, 1):
-                    max_len = max(
-                        df_sheet[col].astype(str).map(len).max(),
-                        len(str(col))
-                    ) + 2
+                    try:
+                        col_max = df_sheet[col].dropna().astype(str).map(len).max()
+                        col_max = int(col_max) if pd.notna(col_max) else 10
+                        max_len = max(col_max, len(str(col))) + 2
+                    except Exception:
+                        max_len = 14
                     ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len, 60)
             except Exception as e:
                 log(f"Ошибка при сохранении листа {safe_name}: {e}")
