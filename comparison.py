@@ -390,42 +390,51 @@ def _sheet_movement(wb, df_a, df_b, label_a, label_b):
 
 def _sheet_charts(wb, mgr_merged, cli_merged, label_a, label_b):
     ws = wb.create_sheet("05_Графики")
-    ws['A1'] = "Сравнительные графики"
-    ws['A1'].font = Font(bold=True, size=13, name="Segoe UI")
+    ws.sheet_view.showGridLines = False
 
-    col_a = f'Выручка_{label_a}_тыс'
-    col_b = f'Выручка_{label_b}_тыс'
+    ws["A1"] = f"СРАВНЕНИЕ: {label_a}  vs  {label_b}"
+    ws["A1"].font = Font(bold=True, size=14, name="Segoe UI", color="F38120")
+    ws.row_dimensions[1].height = 28
 
-    # ── Данные для графика менеджеров ────────────────────────
-    ws['A3'] = "Менеджер"
-    ws['B3'] = label_a
-    ws['C3'] = label_b
-    for cell in [ws['A3'], ws['B3'], ws['C3']]:
+    col_a = f"Выручка_{label_a}_тыс"
+    col_b = f"Выручка_{label_b}_тыс"
+
+    # ── 1. Менеджеры: сгруппированный горизонтальный столбчатый
+    ws["A3"] = "Менеджер"
+    ws["B3"] = label_a
+    ws["C3"] = label_b
+    for cell in [ws["A3"], ws["B3"], ws["C3"]]:
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
 
-    for i, row in mgr_merged.head(10).iterrows():
+    mgr_top = mgr_merged.head(10).reset_index(drop=True)
+    for i, row in mgr_top.iterrows():
         r = 4 + i
         ws.cell(r, 1, row[COL_MANAGER])
         ws.cell(r, 2, float(row[col_a]) if col_a in mgr_merged.columns else 0)
         ws.cell(r, 3, float(row[col_b]) if col_b in mgr_merged.columns else 0)
 
-    n_mgr = min(10, len(mgr_merged))
+    n_mgr = len(mgr_top)
     chart_mgr = BarChart()
     chart_mgr.type = "bar"
-    chart_mgr.title = f"Выручка по менеджерам: {label_a} vs {label_b}"
-    chart_mgr.y_axis.title = "тыс. руб."
+    chart_mgr.grouping = "clustered"
+    chart_mgr.title = f"Менеджеры: {label_a} vs {label_b}"
     chart_mgr.style = 10
-    chart_mgr.width = 22
-    chart_mgr.height = 14
+    chart_mgr.width = 24
+    chart_mgr.height = 16
+    chart_mgr.x_axis.title = "тыс. руб."
 
     cats = Reference(ws, min_col=1, min_row=4, max_row=3 + n_mgr)
     data_mgr = Reference(ws, min_col=2, max_col=3, min_row=3, max_row=3 + n_mgr)
     chart_mgr.add_data(data_mgr, titles_from_data=True)
     chart_mgr.set_categories(cats)
+    if chart_mgr.series:
+        chart_mgr.series[0].graphicalProperties.solidFill = "F38120"
+    if len(chart_mgr.series) > 1:
+        chart_mgr.series[1].graphicalProperties.solidFill = "4A90D9"
     ws.add_chart(chart_mgr, "E3")
 
-    # ── Данные для графика клиентов (топ-15) ─────────────────
+    # ── 2. Клиенты: сгруппированный вертикальный столбчатый
     start_row = 4 + n_mgr + 3
     ws.cell(start_row, 1, "Клиент")
     ws.cell(start_row, 2, label_a)
@@ -434,31 +443,67 @@ def _sheet_charts(wb, mgr_merged, cli_merged, label_a, label_b):
         ws.cell(start_row, c).fill = HEADER_FILL
         ws.cell(start_row, c).font = HEADER_FONT
 
-    # Топ-15 по сумме двух периодов
     cli_top = cli_merged.copy()
-    cli_top['_total'] = cli_top[col_a] + cli_top[col_b]
-    cli_top = cli_top.nlargest(15, '_total')
+    cli_top["_total"] = cli_top[col_a] + cli_top[col_b]
+    cli_top = cli_top.nlargest(10, "_total").reset_index(drop=True)
 
-    for i, (_, row) in enumerate(cli_top.iterrows()):
+    for i, row in cli_top.iterrows():
         r = start_row + 1 + i
-        ws.cell(r, 1, row['КОНЕЧНЫЙ_КЛИЕНТ'])
+        ws.cell(r, 1, str(row["КОНЕЧНЫЙ_КЛИЕНТ"])[:30])
         ws.cell(r, 2, float(row[col_a]) if col_a in cli_merged.columns else 0)
         ws.cell(r, 3, float(row[col_b]) if col_b in cli_merged.columns else 0)
 
     n_cli = len(cli_top)
     chart_cli = BarChart()
-    chart_cli.type = "bar"
-    chart_cli.title = f"Топ-15 клиентов: {label_a} vs {label_b}"
-    chart_cli.y_axis.title = "тыс. руб."
+    chart_cli.type = "col"
+    chart_cli.grouping = "clustered"
+    chart_cli.title = f"Топ-10 клиентов: {label_a} vs {label_b}"
     chart_cli.style = 10
-    chart_cli.width = 22
+    chart_cli.width = 24
     chart_cli.height = 16
+    chart_cli.y_axis.title = "тыс. руб."
 
-    cats2 = Reference(ws, min_col=1, min_row=start_row + 1, max_row=start_row + n_cli)
-    data_cli = Reference(ws, min_col=2, max_col=3, min_row=start_row, max_row=start_row + n_cli)
+    cats2 = Reference(ws, min_col=1, min_row=start_row+1, max_row=start_row+n_cli)
+    data_cli = Reference(ws, min_col=2, max_col=3, min_row=start_row, max_row=start_row+n_cli)
     chart_cli.add_data(data_cli, titles_from_data=True)
     chart_cli.set_categories(cats2)
-    ws.add_chart(chart_cli, f"E{start_row}")
+    if chart_cli.series:
+        chart_cli.series[0].graphicalProperties.solidFill = "F38120"
+    if len(chart_cli.series) > 1:
+        chart_cli.series[1].graphicalProperties.solidFill = "4A90D9"
+    ws.add_chart(chart_cli, f"A{start_row}")
+
+    # ── 3. Дельта выручки менеджеров (водопадный через столбчатый)
+    delta_row = start_row + n_cli + 5
+    ws.cell(delta_row, 1, "Менеджер")
+    ws.cell(delta_row, 2, "Δ выручка, тыс.")
+    ws.cell(delta_row, 1).fill = HEADER_FILL
+    ws.cell(delta_row, 1).font = HEADER_FONT
+    ws.cell(delta_row, 2).fill = HEADER_FILL
+    ws.cell(delta_row, 2).font = HEADER_FONT
+
+    delta_col = "Δ выручка, тыс."
+    if delta_col in mgr_merged.columns:
+        for i, row in mgr_top.iterrows():
+            r = delta_row + 1 + i
+            ws.cell(r, 1, row[COL_MANAGER])
+            ws.cell(r, 2, float(row[delta_col]) if delta_col in row.index else 0)
+
+        chart_delta = BarChart()
+        chart_delta.type = "col"
+        chart_delta.title = f"Изменение выручки по менеджерам (Δ тыс. руб.)"
+        chart_delta.style = 10
+        chart_delta.width = 24
+        chart_delta.height = 14
+        chart_delta.y_axis.title = "тыс. руб."
+
+        cats3 = Reference(ws, min_col=1, min_row=delta_row+1, max_row=delta_row+n_mgr)
+        data_delta = Reference(ws, min_col=2, min_row=delta_row, max_row=delta_row+n_mgr)
+        chart_delta.add_data(data_delta, titles_from_data=True)
+        chart_delta.set_categories(cats3)
+        if chart_delta.series:
+            chart_delta.series[0].graphicalProperties.solidFill = "22C55E"
+        ws.add_chart(chart_delta, f"E{delta_row}")
 
     _auto_width(ws)
 

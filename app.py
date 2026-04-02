@@ -1,5 +1,5 @@
 # ============================================================
-# app.py — Аналитика заказов, Фонтанка.ру
+# app.py — Аналитика заказов, Фонтанка.ру  v2.0
 # ============================================================
 
 import tkinter as tk
@@ -7,26 +7,61 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 import threading
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from analytics import run_analytics
 from comparison import run_comparison
 from watcher import FolderWatcher
+from dashboard import generate_dashboard
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 ICON_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
 
 C_ORANGE  = "#F38120"
 C_DARK    = "#D06A10"
-C_BG      = "#F5F5F5"
-C_WHITE   = "#FFFFFF"
-C_BORDER  = "#DEDEDE"
-C_TEXT    = "#1A1A1A"
-C_MUTED   = "#777777"
-C_LOG_BG  = "#1C1C1E"
-C_LOG_FG  = "#F0EDE8"
-C_GREEN   = "#27AE60"
-C_RED     = "#E74C3C"
+C_GREEN   = "#22C55E"
+C_GREEN_D = "#16A34A"
+C_RED     = "#EF4444"
+C_RED_D   = "#DC2626"
+
+THEMES = {
+    "light": {
+        "bg":         "#F8F8F8",
+        "surface":    "#FFFFFF",
+        "surface2":   "#F0F0F0",
+        "border":     "#E2E2E2",
+        "text":       "#0A0A0A",
+        "text2":      "#555555",
+        "muted":      "#888888",
+        "log_bg":     "#111111",
+        "log_fg":     "#E8E8E8",
+        "entry_bg":   "#FFFFFF",
+        "entry_fg":   "#0A0A0A",
+        "sb_bg":      "#EFEFEF",
+        "plan_alt":   "#F8F0EA",
+        "tag_ok":     "#16A34A",
+        "tag_err":    "#DC2626",
+        "tag_warn":   "#D97706",
+    },
+    "dark": {
+        "bg":         "#0A0A0A",
+        "surface":    "#141414",
+        "surface2":   "#1E1E1E",
+        "border":     "#2A2A2A",
+        "text":       "#F0F0F0",
+        "text2":      "#AAAAAA",
+        "muted":      "#666666",
+        "log_bg":     "#000000",
+        "log_fg":     "#DDDDDD",
+        "entry_bg":   "#1E1E1E",
+        "entry_fg":   "#F0F0F0",
+        "sb_bg":      "#000000",
+        "plan_alt":   "#1A1A1A",
+        "tag_ok":     "#22C55E",
+        "tag_err":    "#EF4444",
+        "tag_warn":   "#F59E0B",
+    },
+}
 
 
 def load_config():
@@ -46,119 +81,303 @@ def save_config(cfg):
         pass
 
 
+# ── Анимированная кнопка ─────────────────────────────────────
+class AnimButton(tk.Button):
+    STEPS = 8
+    DELAY = 12
+
+    def __init__(self, master, bg_n, bg_h, **kw):
+        self._bg_n = bg_n
+        self._bg_h = bg_h
+        self._cur  = list(self._hex(bg_n))
+        self._tgt  = list(self._hex(bg_n))
+        self._job  = None
+        super().__init__(master, bg=bg_n, relief="flat",
+                         cursor="hand2", bd=0,
+                         activebackground=bg_h,
+                         activeforeground=kw.get("fg", "#FFFFFF"), **kw)
+        self.bind("<Enter>", lambda e: self._go(self._hex(bg_h)))
+        self.bind("<Leave>", lambda e: self._go(self._hex(bg_n)))
+
+    def _hex(self, c):
+        c = c.lstrip("#")
+        return [int(c[i:i+2], 16) for i in (0, 2, 4)]
+
+    def _go(self, tgt):
+        self._tgt = tgt
+        if self._job:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+        self._tick()
+
+    def _tick(self):
+        done = True
+        for i in range(3):
+            d = self._tgt[i] - self._cur[i]
+            if d:
+                done = False
+                self._cur[i] += max(1, abs(d) // self.STEPS) * (1 if d > 0 else -1)
+                self._cur[i] = max(0, min(255, self._cur[i]))
+        try:
+            self.config(bg="#{:02x}{:02x}{:02x}".format(*[int(x) for x in self._cur]))
+        except Exception:
+            return
+        if not done:
+            self._job = self.after(self.DELAY, self._tick)
+
+
+# ============================================================
+# ГЛАВНОЕ ОКНО
+# ============================================================
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Аналитика заказов — Фонтанка.ру")
-        self.geometry("740x660")
+        self.geometry("760x680")
         self.resizable(False, False)
-        self.configure(bg=C_BG)
 
         if os.path.exists(ICON_PATH):
             try:
-                self.iconbitmap(ICON_PATH)
+                self.iconbitmap(default=ICON_PATH)
             except Exception:
                 pass
 
-        self._cfg = load_config()
+        self._cfg  = load_config()
+        self._tn   = self._cfg.get("theme", "light")
+        self._T    = THEMES[self._tn]
+        self._tw   = []  # themed widgets list
         self._watcher = None
         self._plan_vars = {}
         self._anim_running = False
         self._anim_step = 0
 
+        self.configure(bg=self._T["bg"])
         self._build_header()
         self._build_tabs()
         self._build_statusbar()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _on_close(self):
+        if self._watcher:
+            self._watcher.stop()
+        self._cfg["theme"] = self._tn
+        save_config(self._cfg)
+        self.destroy()
+
+    # ── Регистрация виджета для перекраски ───────────────────
+    def _r(self, w, role):
+        self._tw.append((w, role))
+        return w
+
+    # ── Применить тему ───────────────────────────────────────
+    def _apply_theme(self):
+        T = self._T
+        self.configure(bg=T["bg"])
+
+        role_map = {
+            "bg":      lambda w: w.configure(bg=T["bg"]),
+            "surface": lambda w: w.configure(bg=T["surface"]),
+            "surface2":lambda w: w.configure(bg=T["surface2"]),
+            "border":  lambda w: w.configure(bg=T["border"]),
+            "text_bg": lambda w: w.configure(bg=T["bg"], fg=T["text"]),
+            "text2_bg":lambda w: w.configure(bg=T["bg"], fg=T["text2"]),
+            "muted_bg":lambda w: w.configure(bg=T["bg"], fg=T["muted"]),
+            "text_sf": lambda w: w.configure(bg=T["surface"], fg=T["text"]),
+            "muted_sf":lambda w: w.configure(bg=T["surface"], fg=T["muted"]),
+            "entry":   lambda w: w.configure(bg=T["entry_bg"], fg=T["entry_fg"],
+                                              readonlybackground=T["entry_bg"],
+                                              insertbackground=T["entry_fg"],
+                                              disabledbackground=T["entry_bg"]),
+            "sb":      lambda w: w.configure(bg=T["sb_bg"], fg=T["muted"]),
+            "plan_e":  lambda w: w.configure(bg=T["surface"],  fg=T["text"]),
+            "plan_o":  lambda w: w.configure(bg=T["plan_alt"], fg=T["text"]),
+            "plan_le": lambda w: w.configure(bg=T["surface"],  fg=T["text"]),
+            "plan_lo": lambda w: w.configure(bg=T["plan_alt"], fg=T["text"]),
+        }
+
+        for (w, role) in self._tw:
+            try:
+                if role in role_map:
+                    role_map[role](w)
+            except Exception:
+                pass
+
+        # Статус-бар
+        try:
+            self._sb_f.configure(bg=T["sb_bg"])
+            self._sb_lbl.configure(bg=T["sb_bg"], fg=T["muted"])
+            self._sb_ver.configure(bg=T["sb_bg"], fg=T["muted"])
+            self._anim_lbl.configure(bg=T["sb_bg"])
+        except Exception:
+            pass
+
+        # Логи — обновляем теги
+        for box in [self.log_box, self.cmp_log_box, self.watch_log_box]:
+            try:
+                box.configure(bg=T["log_bg"], fg=T["log_fg"])
+                box.tag_config("ok",   foreground=T["tag_ok"])
+                box.tag_config("err",  foreground=T["tag_err"])
+                box.tag_config("warn", foreground=T["tag_warn"])
+            except Exception:
+                pass
+
+        # ttk стили
+        style = ttk.Style()
+        style.configure("F.TNotebook", background=T["bg"])
+        style.configure("F.TNotebook.Tab",
+                        background=T["surface2"],
+                        foreground=T["muted"])
+        style.map("F.TNotebook.Tab",
+                  background=[("selected", T["surface"])],
+                  foreground=[("selected", C_ORANGE)])
+        style.configure("F.Horizontal.TProgressbar",
+                        troughcolor=T["border"],
+                        background=C_ORANGE)
+
+    def _toggle_theme(self):
+        self._tn = "dark" if self._tn == "light" else "light"
+        self._T  = THEMES[self._tn]
+        self._cfg["theme"] = self._tn
+        save_config(self._cfg)
+        self._apply_theme()
+        self._theme_btn.config(
+            text="☀️" if self._tn == "dark" else "🌙",
+            bg=C_ORANGE, activebackground=C_DARK)
+
+    # ============================================================
+    # ШАПКА
+    # ============================================================
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=C_ORANGE, height=68)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+
+        # Левая часть — логотип
+        left = tk.Frame(hdr, bg=C_ORANGE)
+        left.pack(side="left", fill="y")
+
+        tk.Label(left, text="фонтанка.ру",
+                 font=("Georgia", 19, "bold italic"),
+                 bg=C_ORANGE, fg="#FFFFFF",
+                 padx=20).pack(side="left", pady=16)
+
+        sep = tk.Frame(hdr, bg="#D8711A", width=1)
+        sep.pack(side="left", fill="y", pady=12, padx=2)
+
+        tk.Label(hdr, text="АНАЛИТИКА  /  КОММЕРЧЕСКИЙ ОТДЕЛ",
+                 font=("Segoe UI", 8, "bold"),
+                 bg=C_ORANGE, fg="#FFD8A8",
+                 padx=14).pack(side="left", pady=22)
+
+        # Правая часть — часы + кнопка темы
+        right = tk.Frame(hdr, bg=C_ORANGE)
+        right.pack(side="right", fill="y", padx=16)
+
+        # Кнопка темы
+        icon = "🌙" if self._tn == "light" else "☀️"
+        self._theme_btn = tk.Button(
+            right, text=icon,
+            font=("Segoe UI", 16),
+            bg=C_ORANGE, fg="#FFFFFF",
+            activebackground=C_DARK,
+            activeforeground="#FFFFFF",
+            relief="flat", bd=0, cursor="hand2",
+            command=self._toggle_theme)
+        self._theme_btn.pack(side="right", padx=(8, 0), pady=18)
+
+        # Часы
+        clock_frame = tk.Frame(right, bg=C_ORANGE)
+        clock_frame.pack(side="right", fill="y", pady=10)
+
+        self._clock_time = tk.StringVar()
+        self._clock_date = tk.StringVar()
+
+        tk.Label(clock_frame, textvariable=self._clock_time,
+                 font=("Segoe UI", 15, "bold"),
+                 bg=C_ORANGE, fg="#FFFFFF").pack(anchor="e")
+        tk.Label(clock_frame, textvariable=self._clock_date,
+                 font=("Segoe UI", 8),
+                 bg=C_ORANGE, fg="#FFD8A8").pack(anchor="e")
+
+        self._update_clock()
+
     def _update_clock(self):
         try:
-            from datetime import timezone, timedelta
             msk = timezone(timedelta(hours=3))
             now = datetime.now(tz=msk)
         except Exception:
             now = datetime.now()
-        self._clock_var.set(now.strftime("%d.%m.%Y  %H:%M  МСК"))
+        self._clock_time.set(now.strftime("%H:%M  МСК"))
+        self._clock_date.set(now.strftime("%d  %B  %Y").upper())
         self.after(60000, self._update_clock)
 
-    def _on_close(self):
-        if self._watcher:
-            self._watcher.stop()
-        save_config(self._cfg)
-        self.destroy()
-
-    # ── Шапка ────────────────────────────────────────────────
-    def _build_header(self):
-        hdr = tk.Frame(self, bg=C_ORANGE, height=64)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-
-        # Логотип текстом
-        tk.Label(hdr, text="фонтанка.ру",
-                 font=("Georgia", 20, "bold italic"),
-                 bg=C_ORANGE, fg=C_WHITE).pack(side="left", padx=20, pady=14)
-
-        # Разделитель
-        tk.Frame(hdr, bg="#D06A10", width=1).pack(side="left", fill="y", pady=10, padx=4)
-
-        # Подзаголовок
-        tk.Label(hdr, text="АНАЛИТИКА КОММЕРЧЕСКОГО ОТДЕЛА",
-                 font=("Segoe UI", 9),
-                 bg=C_ORANGE, fg="#FFD8B0").pack(side="left", padx=16)
-
-        # Дата + время (обновляется каждую минуту)
-        self._clock_var = tk.StringVar()
-        tk.Label(hdr, textvariable=self._clock_var,
-                 font=("Segoe UI", 11, "bold"),
-                 bg=C_ORANGE, fg=C_WHITE).pack(side="right", padx=20)
-        self._update_clock()
-
-    # ── Вкладки ──────────────────────────────────────────────
+    # ============================================================
+    # ВКЛАДКИ
+    # ============================================================
     def _build_tabs(self):
+        T = self._T
         style = ttk.Style(self)
         style.theme_use("default")
-        style.configure("F.TNotebook", background=C_BG, borderwidth=0)
+        style.configure("F.TNotebook", background=T["bg"], borderwidth=0)
         style.configure("F.TNotebook.Tab",
-                        font=("Segoe UI", 10), padding=[14, 7],
-                        background=C_BORDER, foreground=C_MUTED)
+                        font=("Segoe UI", 10), padding=[16, 8],
+                        background=T["surface2"], foreground=T["muted"])
         style.map("F.TNotebook.Tab",
-                  background=[("selected", C_WHITE)],
+                  background=[("selected", T["surface"])],
                   foreground=[("selected", C_ORANGE)],
                   font=[("selected", ("Segoe UI", 10, "bold"))])
 
-        nb = ttk.Notebook(self, style="F.TNotebook")
-        nb.pack(fill="both", expand=True)
-        self.notebook = nb
+        self.notebook = ttk.Notebook(self, style="F.TNotebook")
+        self.notebook.pack(fill="both", expand=True)
 
-        self.tab_main    = tk.Frame(nb, bg=C_BG)
-        self.tab_compare = tk.Frame(nb, bg=C_BG)
-        self.tab_plan    = tk.Frame(nb, bg=C_BG)
-        self.tab_watch   = tk.Frame(nb, bg=C_BG)
+        self.tab_main    = self._r(tk.Frame(self.notebook, bg=T["bg"]), "bg")
+        self.tab_compare = self._r(tk.Frame(self.notebook, bg=T["bg"]), "bg")
+        self.tab_plan    = self._r(tk.Frame(self.notebook, bg=T["bg"]), "bg")
+        self.tab_watch   = self._r(tk.Frame(self.notebook, bg=T["bg"]), "bg")
+        self.tab_dash    = self._r(tk.Frame(self.notebook, bg=T["bg"]), "bg")
 
-        nb.add(self.tab_main,    text="  Анализ  ")
-        nb.add(self.tab_compare, text="  Сравнение  ")
-        nb.add(self.tab_plan,    text="  План  ")
-        nb.add(self.tab_watch,   text="  Наблюдатель  ")
+        self.notebook.add(self.tab_main,    text="  Анализ  ")
+        self.notebook.add(self.tab_compare, text="  Сравнение  ")
+        self.notebook.add(self.tab_plan,    text="  План  ")
+        self.notebook.add(self.tab_watch,   text="  Наблюдатель  ")
+        self.notebook.add(self.tab_dash,    text="  Дашборд  ")
 
         self._build_tab_main()
         self._build_tab_compare()
         self._build_tab_plan()
         self._build_tab_watch()
+        self._build_tab_dash()
 
-    # ── Статус-бар ───────────────────────────────────────────
+    # ============================================================
+    # СТАТУС-БАР
+    # ============================================================
     def _build_statusbar(self):
-        sb = tk.Frame(self, bg=C_BORDER, height=24)
-        sb.pack(fill="x", side="bottom")
-        sb.pack_propagate(False)
+        T = self._T
+        self._sb_f = tk.Frame(self, bg=T["sb_bg"], height=26)
+        self._sb_f.pack(fill="x", side="bottom")
+        self._sb_f.pack_propagate(False)
+
+        # Цветная полоска сверху статус-бара
+        tk.Frame(self._sb_f, bg=C_ORANGE, height=1).pack(fill="x", side="top")
+
         self._status_var = tk.StringVar(value="Готов к работе")
-        tk.Label(sb, textvariable=self._status_var,
-                 font=("Segoe UI", 8), bg=C_BORDER,
-                 fg=C_MUTED, anchor="w").pack(side="left", padx=10)
-        self._anim_lbl = tk.Label(sb, text="", font=("Segoe UI", 8),
-                                   bg=C_BORDER, fg=C_ORANGE)
-        self._anim_lbl.pack(side="right", padx=10)
-        tk.Label(sb, text="v1.5", font=("Segoe UI", 8),
-                 bg=C_BORDER, fg=C_MUTED).pack(side="right", padx=10)
+        self._sb_lbl = tk.Label(
+            self._sb_f, textvariable=self._status_var,
+            font=("Segoe UI", 8), bg=T["sb_bg"], fg=T["muted"], anchor="w")
+        self._sb_lbl.pack(side="left", padx=12)
+
+        self._anim_lbl = tk.Label(
+            self._sb_f, text="", font=("Segoe UI", 9),
+            bg=T["sb_bg"], fg=C_ORANGE)
+        self._anim_lbl.pack(side="right", padx=12)
+
+        self._sb_ver = tk.Label(
+            self._sb_f, text="v2.0  ·  Фонтанка.ру",
+            font=("Segoe UI", 8), bg=T["sb_bg"], fg=T["muted"])
+        self._sb_ver.pack(side="right", padx=12)
 
     def _start_anim(self):
         self._anim_running = True
@@ -167,106 +386,176 @@ class App(tk.Tk):
 
     def _stop_anim(self):
         self._anim_running = False
-        self._anim_lbl.config(text="")
+        try:
+            self._anim_lbl.config(text="")
+        except Exception:
+            pass
 
     def _tick_anim(self):
         if not self._anim_running:
             return
-        f = ["●○○", "○●○", "○○●", "○●○"]
-        self._anim_lbl.config(text=f[self._anim_step % 4])
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        try:
+            self._anim_lbl.config(text=frames[self._anim_step % len(frames)])
+        except Exception:
+            return
         self._anim_step += 1
-        self.after(250, self._tick_anim)
+        self.after(100, self._tick_anim)
 
-    # ── Общие строители ──────────────────────────────────────
+    # ============================================================
+    # СТРОИТЕЛИ ВИДЖЕТОВ
+    # ============================================================
     def _card(self, parent, title):
-        """Белая карточка с оранжевой полоской заголовка."""
-        wrap = tk.Frame(parent, bg=C_BG)
-        wrap.pack(fill="x", padx=14, pady=4)
-        tk.Label(wrap, text=f"  {title}",
+        T = self._T
+        outer = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
+        outer.pack(fill="x", padx=16, pady=(4, 2))
+
+        # Заголовок с оранжевой левой полоской
+        hdr_row = self._r(tk.Frame(outer, bg=T["surface"]), "surface")
+        hdr_row.pack(fill="x")
+
+        tk.Frame(hdr_row, bg=C_ORANGE, width=3).pack(side="left", fill="y")
+        tk.Label(hdr_row, text=f"  {title}",
                  font=("Segoe UI", 8, "bold"),
-                 bg=C_ORANGE, fg=C_WHITE,
-                 anchor="w", height=2).pack(fill="x")
-        inner = tk.Frame(wrap, bg=C_WHITE,
-                         highlightbackground=C_BORDER,
-                         highlightthickness=1)
-        inner.pack(fill="x")
-        pad = tk.Frame(inner, bg=C_WHITE)
-        pad.pack(fill="x", padx=10, pady=6)
+                 bg=T["surface"], fg=C_ORANGE,
+                 anchor="w", pady=6).pack(side="left", fill="x", expand=True)
+
+        # Тело карточки
+        body = self._r(
+            tk.Frame(outer, bg=T["surface"],
+                     highlightbackground=T["border"],
+                     highlightthickness=1), "surface")
+        body.pack(fill="x")
+        pad = self._r(tk.Frame(body, bg=T["surface"]), "surface")
+        pad.pack(fill="x", padx=12, pady=8)
         return pad
 
     def _file_row(self, parent, var, cmd):
-        row = tk.Frame(parent, bg=C_WHITE)
+        T = self._T
+        row = self._r(tk.Frame(parent, bg=T["surface"]), "surface")
         row.pack(fill="x")
-        tk.Entry(row, textvariable=var, font=("Segoe UI", 9),
-                 state="readonly", relief="solid", bd=1,
-                 bg="#FAFAFA").pack(side="left", fill="x", expand=True, padx=(0, 8))
-        btn = tk.Button(row, text="Обзор...", font=("Segoe UI", 9),
-                        command=cmd, bg=C_ORANGE, fg=C_WHITE,
-                        activebackground=C_DARK, relief="flat",
-                        padx=10, pady=3, cursor="hand2")
+
+        e = tk.Entry(row, textvariable=var, font=("Segoe UI", 9),
+                     state="readonly", relief="flat", bd=0,
+                     bg=T["entry_bg"], fg=T["entry_fg"],
+                     readonlybackground=T["entry_bg"],
+                     highlightbackground=T["border"],
+                     highlightthickness=1)
+        self._r(e, "entry")
+        e.pack(side="left", fill="x", expand=True, padx=(0, 10), ipady=4)
+
+        btn = AnimButton(row, C_ORANGE, C_DARK,
+                         text="Обзор", font=("Segoe UI", 9, "bold"),
+                         fg="#FFFFFF", command=cmd, padx=14, pady=4)
         btn.pack(side="left")
         return btn
 
+    def _label(self, parent, text, size=9, color="muted", bold=False, **kw):
+        T = self._T
+        fg = {"muted": T["muted"], "text": T["text"], "text2": T["text2"],
+              "orange": C_ORANGE}.get(color, T["muted"])
+        font = ("Segoe UI", size, "bold") if bold else ("Segoe UI", size)
+        lbl = tk.Label(parent, text=text, font=font,
+                       bg=T["bg"], fg=fg, **kw)
+        self._r(lbl, "muted_bg" if color == "muted" else "text_bg")
+        return lbl
+
+    def _section_lbl(self, parent, text):
+        T = self._T
+        f = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
+        f.pack(fill="x", padx=16, pady=(10, 2))
+        tk.Frame(f, bg=C_ORANGE, width=2, height=14).pack(side="left", padx=(0, 8))
+        lbl = tk.Label(f, text=text, font=("Segoe UI", 8, "bold"),
+                       bg=T["bg"], fg=T["text2"])
+        self._r(lbl, "text2_bg")
+        lbl.pack(side="left")
+
     def _log_box(self, parent, height=7):
+        T = self._T
         box = scrolledtext.ScrolledText(
             parent, font=("Consolas", 9), height=height,
-            state="disabled", bg=C_LOG_BG, fg=C_LOG_FG,
-            relief="flat", selectbackground=C_ORANGE)
-        box.pack(fill="both", expand=True, padx=14, pady=(0, 4))
-        box.tag_config("ok",   foreground="#6ECB6E")
-        box.tag_config("err",  foreground="#FF6B6B")
-        box.tag_config("warn", foreground="#FFD080")
+            state="disabled", bg=T["log_bg"], fg=T["log_fg"],
+            relief="flat", selectbackground=C_ORANGE,
+            insertbackground=T["log_fg"], padx=8, pady=6)
+        box.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+        box.tag_config("ok",   foreground=T["tag_ok"])
+        box.tag_config("err",  foreground=T["tag_err"])
+        box.tag_config("warn", foreground=T["tag_warn"])
         return box
 
     def _progress_row(self, parent):
-        row = tk.Frame(parent, bg=C_BG)
-        row.pack(fill="x", padx=14, pady=(2, 4))
+        T = self._T
+        row = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
+        row.pack(fill="x", padx=16, pady=(2, 4))
+
         style = ttk.Style()
         style.configure("F.Horizontal.TProgressbar",
-                        troughcolor=C_BORDER,
-                        background=C_ORANGE, thickness=8)
+                        troughcolor=T["border"],
+                        background=C_ORANGE, thickness=6)
         bar = ttk.Progressbar(row, style="F.Horizontal.TProgressbar",
-                               mode="determinate", length=560)
-        bar.pack(side="left", fill="x", expand=True, padx=(0, 8))
+                               mode="determinate")
+        bar.pack(side="left", fill="x", expand=True, padx=(0, 12), ipady=1)
+
         lbl = tk.Label(row, text="0%", font=("Segoe UI", 9, "bold"),
-                       bg=C_BG, fg=C_ORANGE, width=4)
+                       bg=T["bg"], fg=C_ORANGE, width=5, anchor="e")
+        self._r(lbl, "bg")
         lbl.pack(side="left")
         return bar, lbl
 
-    def _run_btn(self, parent, text, cmd, color=None):
-        c = color or C_ORANGE
-        d = C_DARK if c == C_ORANGE else "#1E5E2A"
-        b = tk.Button(parent, text=text,
-                      font=("Segoe UI", 11, "bold"),
-                      command=cmd, bg=c, fg=C_WHITE,
-                      activebackground=d, relief="flat",
-                      padx=22, pady=10, cursor="hand2")
-        b.pack(pady=(4, 12))
-        b.bind("<Enter>", lambda e: b.config(bg=d))
-        b.bind("<Leave>", lambda e: b.config(bg=c))
-        return b
+    def _run_btn(self, parent, text, cmd, color=C_ORANGE, hover=C_DARK):
+        btn = AnimButton(parent, color, hover,
+                         text=text, font=("Segoe UI", 10, "bold"),
+                         fg="#FFFFFF", command=cmd, padx=28, pady=12)
+        btn.pack(pady=(6, 14))
+        return btn
 
     def _write_log(self, box, msg):
-        ts = datetime.now().strftime("%H:%M:%S")
+        T = self._T
         tag = ("ok"   if "✅" in msg or "Готово" in msg else
                "err"  if "❌" in msg or "ОШИБКА" in msg else
                "warn" if "⚠" in msg else None)
+        ts = datetime.now().strftime("%H:%M:%S")
         box.configure(state="normal")
-        line = f"[{ts}] {msg}\n"
-        if tag:
-            box.insert("end", line, tag)
-        else:
-            box.insert("end", line)
+        # Временная метка серым
+        box.insert("end", f"[{ts}] ", "ts")
+        box.tag_config("ts", foreground=T["muted"])
+        line = f"{msg}\n"
+        box.insert("end", line, tag) if tag else box.insert("end", line)
         box.see("end")
         box.configure(state="disabled")
         self._status_var.set(msg[:90])
 
-    # ── Вкладка 1: Анализ ────────────────────────────────────
+    # ── Прогресс ─────────────────────────────────────────────
+    STEPS = {
+        "загрузк": 1, "качеств": 2, "клиент": 3, "менеджер": 4,
+        "отрасл": 5, "сезонн": 6, "rfm": 7, "лояльн": 8,
+        "план": 9, "номенклатур": 10, "сохран": 11,
+    }
+    TOTAL = 11
+
+    def _progress_log(self, bar, pct_lbl):
+        counter = [0]
+        def fn(msg):
+            lo = msg.lower()
+            for kw, step in self.STEPS.items():
+                if kw in lo and step > counter[0]:
+                    counter[0] = step
+                    pct = int(step / self.TOTAL * 100)
+                    self.after(0, lambda p=pct: (
+                        bar.config(value=p),
+                        pct_lbl.config(text=f"{p}%")))
+                    break
+            self._log(msg)
+        return fn
+
+    # ============================================================
+    # ВКЛАДКА 1: АНАЛИЗ
+    # ============================================================
     def _build_tab_main(self):
         p = self.tab_main
-        tk.Label(p, text="Выберите файл и запустите анализ",
-                 font=("Segoe UI", 10), bg=C_BG,
-                 fg=C_MUTED).pack(pady=(10, 4))
+
+        self._label(p, "Загрузите файл выгрузки из CRM и запустите анализ",
+                    size=10, color="muted").pack(pady=(12, 6), padx=16, anchor="w")
 
         c1 = self._card(p, "ВХОДНОЙ ФАЙЛ")
         self.input_var = tk.StringVar(value=self._cfg.get("last_input", ""))
@@ -276,72 +565,75 @@ class App(tk.Tk):
         self.output_dir_var = tk.StringVar(value=self._cfg.get("last_output_dir", ""))
         self._file_row(c2, self.output_dir_var, self._browse_output)
 
-        tk.Label(p, text="ПРОГРЕСС", font=("Segoe UI", 8, "bold"),
-                 bg=C_BG, fg=C_MUTED).pack(anchor="w", padx=14, pady=(8, 0))
+        self._section_lbl(p, "ПРОГРЕСС ВЫПОЛНЕНИЯ")
         self.main_bar, self.main_pct = self._progress_row(p)
 
-        tk.Label(p, text="ЖУРНАЛ", font=("Segoe UI", 8, "bold"),
-                 bg=C_BG, fg=C_MUTED).pack(anchor="w", padx=14, pady=(4, 2))
-        self.log_box = self._log_box(p, height=7)
-        self.run_btn = self._run_btn(p, "▶  Запустить анализ",
+        self._section_lbl(p, "ЖУРНАЛ")
+        self.log_box = self._log_box(p, height=6)
+        self.run_btn = self._run_btn(p, "▶   Запустить анализ",
                                       self._start_analysis)
 
-    # ── Вкладка 2: Сравнение ─────────────────────────────────
+    # ============================================================
+    # ВКЛАДКА 2: СРАВНЕНИЕ
+    # ============================================================
     def _build_tab_compare(self):
         p = self.tab_compare
-        tk.Label(p, text="Сравните два периода",
-                 font=("Segoe UI", 10), bg=C_BG,
-                 fg=C_MUTED).pack(pady=(10, 4))
 
-        ca = self._card(p, "ПЕРИОД А")
-        self.cmp_path_a = tk.StringVar()
-        self._file_row(ca, self.cmp_path_a,
-                       lambda: self._browse_cmp(self.cmp_path_a))
-        lra = tk.Frame(ca, bg=C_WHITE)
-        lra.pack(fill="x", pady=(4, 0))
-        tk.Label(lra, text="Название:", font=("Segoe UI", 9),
-                 bg=C_WHITE, fg=C_MUTED).pack(side="left")
+        self._label(p, "Сравните показатели двух произвольных периодов",
+                    size=10, color="muted").pack(pady=(12, 6), padx=16, anchor="w")
+
+        def period_block(title, path_var, label_var):
+            c = self._card(p, title)
+            self._file_row(c, path_var, lambda v=path_var: self._browse_cmp(v))
+            row = self._r(tk.Frame(c, bg=self._T["surface"]), "surface")
+            row.pack(fill="x", pady=(6, 0))
+            self._r(tk.Label(row, text="Метка периода:",
+                             font=("Segoe UI", 9),
+                             bg=self._T["surface"],
+                             fg=self._T["muted"]), "muted_sf").pack(side="left")
+            e = tk.Entry(row, textvariable=label_var,
+                         font=("Segoe UI", 9), width=22,
+                         relief="flat", bd=0,
+                         highlightbackground=self._T["border"],
+                         highlightthickness=1,
+                         bg=self._T["entry_bg"], fg=self._T["entry_fg"])
+            self._r(e, "entry")
+            e.pack(side="left", padx=10, ipady=3)
+
+        self.cmp_path_a  = tk.StringVar()
         self.cmp_label_a = tk.StringVar(value="Период А")
-        tk.Entry(lra, textvariable=self.cmp_label_a,
-                 font=("Segoe UI", 9), width=22,
-                 relief="solid", bd=1).pack(side="left", padx=8)
-
-        cb = self._card(p, "ПЕРИОД Б")
-        self.cmp_path_b = tk.StringVar()
-        self._file_row(cb, self.cmp_path_b,
-                       lambda: self._browse_cmp(self.cmp_path_b))
-        lrb = tk.Frame(cb, bg=C_WHITE)
-        lrb.pack(fill="x", pady=(4, 0))
-        tk.Label(lrb, text="Название:", font=("Segoe UI", 9),
-                 bg=C_WHITE, fg=C_MUTED).pack(side="left")
+        self.cmp_path_b  = tk.StringVar()
         self.cmp_label_b = tk.StringVar(value="Период Б")
-        tk.Entry(lrb, textvariable=self.cmp_label_b,
-                 font=("Segoe UI", 9), width=22,
-                 relief="solid", bd=1).pack(side="left", padx=8)
+        period_block("ПЕРИОД А", self.cmp_path_a, self.cmp_label_a)
+        period_block("ПЕРИОД Б", self.cmp_path_b, self.cmp_label_b)
 
         co = self._card(p, "ПАПКА ДЛЯ ОТЧЁТА")
         self.cmp_output_dir = tk.StringVar(value=self._cfg.get("last_output_dir", ""))
         self._file_row(co, self.cmp_output_dir, self._browse_cmp_output)
 
-        tk.Label(p, text="ЖУРНАЛ", font=("Segoe UI", 8, "bold"),
-                 bg=C_BG, fg=C_MUTED).pack(anchor="w", padx=14, pady=(8, 2))
-        self.cmp_log_box = self._log_box(p, height=6)
-        self.cmp_run_btn = self._run_btn(p, "▶  Сравнить периоды",
+        self._section_lbl(p, "ЖУРНАЛ")
+        self.cmp_log_box = self._log_box(p, height=5)
+        self.cmp_run_btn = self._run_btn(p, "▶   Сравнить периоды",
                                           self._start_comparison)
 
-    # ── Вкладка 3: План ──────────────────────────────────────
+    # ============================================================
+    # ВКЛАДКА 3: ПЛАН
+    # ============================================================
     def _build_tab_plan(self):
         p = self.tab_plan
-        tk.Label(p, text="Плановые суммы по менеджерам (тыс. руб.)",
-                 font=("Segoe UI", 10), bg=C_BG, fg=C_MUTED).pack(pady=(10, 2))
-        tk.Label(p, text="Сохраняется автоматически. Применяется при каждом запуске анализа.",
-                 font=("Segoe UI", 8), bg=C_BG, fg=C_MUTED).pack()
+        T = self._T
 
-        outer = tk.Frame(p, bg=C_BG)
-        outer.pack(fill="both", expand=True, padx=14, pady=8)
-        canvas = tk.Canvas(outer, bg=C_BG, highlightthickness=0)
+        self._label(p, "Плановые суммы по менеджерам (тыс. руб.)",
+                    size=10, color="muted").pack(pady=(12, 2), padx=16, anchor="w")
+        self._label(p, "Планы сохраняются автоматически и применяются при каждом запуске анализа",
+                    size=8, color="muted").pack(padx=16, anchor="w")
+
+        outer = self._r(tk.Frame(p, bg=T["bg"]), "bg")
+        outer.pack(fill="both", expand=True, padx=16, pady=8)
+
+        canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0)
         sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        self._plan_inner = tk.Frame(canvas, bg=C_WHITE)
+        self._plan_inner = self._r(tk.Frame(canvas, bg=T["surface"]), "surface")
         self._plan_inner.bind("<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=self._plan_inner, anchor="nw")
@@ -349,15 +641,17 @@ class App(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        # Заголовок
+        # Заголовок таблицы
         hdr = tk.Frame(self._plan_inner, bg=C_ORANGE)
         hdr.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Label(hdr, text="  Менеджер", font=("Segoe UI", 9, "bold"),
-                 bg=C_ORANGE, fg=C_WHITE, width=28,
-                 anchor="w", pady=5).pack(side="left")
-        tk.Label(hdr, text="План, тыс. руб.", font=("Segoe UI", 9, "bold"),
-                 bg=C_ORANGE, fg=C_WHITE, width=14,
-                 pady=5).pack(side="left")
+        tk.Label(hdr, text="  Менеджер",
+                 font=("Segoe UI", 9, "bold"),
+                 bg=C_ORANGE, fg="#FFFFFF",
+                 width=30, anchor="w", pady=7).pack(side="left")
+        tk.Label(hdr, text="План, тыс. руб.",
+                 font=("Segoe UI", 9, "bold"),
+                 bg=C_ORANGE, fg="#FFFFFF",
+                 width=16, pady=7).pack(side="left")
 
         saved = self._cfg.get("manager_plan", {})
         managers = list(dict.fromkeys([
@@ -369,43 +663,58 @@ class App(tk.Tk):
         for i, name in enumerate(managers, 1):
             self._add_plan_row(name, str(saved.get(name, "")), i)
 
-        add = tk.Frame(p, bg=C_BG)
-        add.pack(fill="x", padx=14, pady=(4, 8))
-        tk.Label(add, text="Добавить:", font=("Segoe UI", 9),
-                 bg=C_BG).pack(side="left")
+        add = self._r(tk.Frame(p, bg=T["bg"]), "bg")
+        add.pack(fill="x", padx=16, pady=(4, 8))
+        self._r(tk.Label(add, text="Добавить менеджера:",
+                         font=("Segoe UI", 9),
+                         bg=T["bg"], fg=T["text2"]), "text2_bg").pack(side="left")
         self._new_mgr = tk.StringVar()
-        tk.Entry(add, textvariable=self._new_mgr,
-                 font=("Segoe UI", 9), width=22,
-                 relief="solid", bd=1).pack(side="left", padx=8)
-        tk.Button(add, text="Добавить", font=("Segoe UI", 9),
-                  command=self._add_manager_ui,
-                  bg=C_ORANGE, fg=C_WHITE,
-                  activebackground=C_DARK,
-                  relief="flat", padx=10, pady=3,
-                  cursor="hand2").pack(side="left")
+        ne = tk.Entry(add, textvariable=self._new_mgr,
+                      font=("Segoe UI", 9), width=22,
+                      relief="flat", bd=0,
+                      highlightbackground=T["border"],
+                      highlightthickness=1,
+                      bg=T["entry_bg"], fg=T["entry_fg"])
+        self._r(ne, "entry")
+        ne.pack(side="left", padx=10, ipady=3)
+        AnimButton(add, C_ORANGE, C_DARK,
+                   text="+ Добавить", font=("Segoe UI", 9, "bold"),
+                   fg="#FFFFFF", command=self._add_manager_ui,
+                   padx=12, pady=4).pack(side="left")
 
     def _add_plan_row(self, name, val="", idx=None):
+        T = self._T
         if idx is None:
             idx = len(self._plan_vars) + 1
-        bg = C_WHITE if idx % 2 == 0 else "#FFF7F0"
-        tk.Label(self._plan_inner, text=f"  {name}",
-                 font=("Segoe UI", 9), bg=bg, anchor="w",
-                 pady=4).grid(row=idx, column=0, sticky="ew")
+        even = idx % 2 == 0
+        bg = T["surface"] if even else T["plan_alt"]
+
+        lbl = tk.Label(self._plan_inner, text=f"  {name}",
+                       font=("Segoe UI", 9), bg=bg,
+                       fg=T["text"], anchor="w", pady=5)
+        self._r(lbl, "plan_le" if even else "plan_lo")
+        lbl.grid(row=idx, column=0, sticky="ew")
+
         var = tk.StringVar(value=val)
-        var.trace_add("write",
-            lambda *_, n=name, v=var: self._save_plan(n, v))
+        var.trace_add("write", lambda *_, n=name, v=var: self._save_plan(n, v))
         self._plan_vars[name] = var
-        tk.Entry(self._plan_inner, textvariable=var,
-                 font=("Segoe UI", 9), width=14,
-                 relief="solid", bd=1, bg=bg).grid(
-                     row=idx, column=1, pady=1, padx=6)
+
+        ent = tk.Entry(self._plan_inner, textvariable=var,
+                       font=("Segoe UI", 9), width=14,
+                       relief="flat", bd=0,
+                       highlightbackground=T["border"],
+                       highlightthickness=1,
+                       bg=bg, fg=T["text"],
+                       insertbackground=T["text"])
+        self._r(ent, "plan_e" if even else "plan_o")
+        ent.grid(row=idx, column=1, pady=2, padx=8)
 
     def _add_manager_ui(self):
         name = self._new_mgr.get().strip()
         if not name:
             return
         if name in self._plan_vars:
-            messagebox.showinfo("", f"«{name}» уже есть.")
+            messagebox.showinfo("", f"«{name}» уже есть в списке.")
             return
         self._add_plan_row(name)
         self._new_mgr.set("")
@@ -430,14 +739,16 @@ class App(tk.Tk):
                     pass
         return result or None
 
-    # ── Вкладка 4: Наблюдатель ───────────────────────────────
+    # ============================================================
+    # ВКЛАДКА 4: НАБЛЮДАТЕЛЬ
+    # ============================================================
     def _build_tab_watch(self):
         p = self.tab_watch
-        tk.Label(p,
-                 text="Автоматически запускает анализ через 5 минут\n"
-                      "после появления нового .xlsx в папке",
-                 font=("Segoe UI", 10), bg=C_BG,
-                 fg=C_MUTED, justify="center").pack(pady=(10, 8))
+        T = self._T
+
+        self._label(p,
+                    "Автоматически запускает анализ через 5 минут после появления нового .xlsx",
+                    size=10, color="muted").pack(pady=(12, 6), padx=16, anchor="w")
 
         cw = self._card(p, "ПАПКА ДЛЯ НАБЛЮДЕНИЯ")
         self.watch_dir_var = tk.StringVar(value=self._cfg.get("watch_dir", ""))
@@ -447,41 +758,48 @@ class App(tk.Tk):
         self.watch_out_var = tk.StringVar(value=self._cfg.get("watch_output_dir", ""))
         self._file_row(co, self.watch_out_var, self._browse_watch_out)
 
-        self.watch_status_var = tk.StringVar(value="⏹  Остановлен")
+        # Статус индикатор
+        sf = self._r(tk.Frame(p, bg=T["bg"]), "bg")
+        sf.pack(fill="x", padx=16, pady=(12, 4))
+
+        self._status_dot = tk.Label(sf, text="●", font=("Segoe UI", 14),
+                                     bg=T["bg"], fg=T["muted"])
+        self._r(self._status_dot, "muted_bg")
+        self._status_dot.pack(side="left", padx=(0, 8))
+
+        self.watch_status_var = tk.StringVar(value="Остановлен")
         self.watch_status_lbl = tk.Label(
-            p, textvariable=self.watch_status_var,
+            sf, textvariable=self.watch_status_var,
             font=("Segoe UI", 11, "bold"),
-            bg=C_BG, fg=C_MUTED)
-        self.watch_status_lbl.pack(pady=(10, 4))
+            bg=T["bg"], fg=T["muted"])
+        self._r(self.watch_status_lbl, "muted_bg")
+        self.watch_status_lbl.pack(side="left")
 
-        tk.Label(p, text="ЖУРНАЛ", font=("Segoe UI", 8, "bold"),
-                 bg=C_BG, fg=C_MUTED).pack(anchor="w", padx=14, pady=(4, 2))
-        self.watch_log_box = self._log_box(p, height=8)
+        self._section_lbl(p, "ЖУРНАЛ")
+        self.watch_log_box = self._log_box(p, height=7)
 
-        bf = tk.Frame(p, bg=C_BG)
-        bf.pack(pady=(4, 12))
-        self.watch_start_btn = tk.Button(
-            bf, text="▶  Запустить наблюдатель",
+        bf = self._r(tk.Frame(p, bg=T["bg"]), "bg")
+        bf.pack(pady=(4, 14))
+
+        self.watch_start_btn = AnimButton(
+            bf, C_GREEN, C_GREEN_D,
+            text="▶   Запустить наблюдатель",
             font=("Segoe UI", 10, "bold"),
-            command=self._start_watcher,
-            bg=C_GREEN, fg=C_WHITE,
-            activebackground="#1E5E2A",
-            relief="flat", padx=16, pady=9, cursor="hand2")
+            fg="#FFFFFF", command=self._start_watcher,
+            padx=18, pady=10)
         self.watch_start_btn.pack(side="left", padx=(0, 10))
-        self.watch_stop_btn = tk.Button(
-            bf, text="⏹  Остановить",
+
+        self.watch_stop_btn = AnimButton(
+            bf, C_RED, C_RED_D,
+            text="⏹   Остановить",
             font=("Segoe UI", 10, "bold"),
-            command=self._stop_watcher,
-            bg=C_RED, fg=C_WHITE,
-            activebackground="#A93226",
-            relief="flat", padx=16, pady=9,
-            cursor="hand2", state="disabled")
+            fg="#FFFFFF", command=self._stop_watcher,
+            padx=18, pady=10, state="disabled")
         self.watch_stop_btn.pack(side="left")
 
     # ── Browse ───────────────────────────────────────────────
     def _browse_input(self):
-        p = filedialog.askopenfilename(
-            filetypes=[("Excel", "*.xlsx *.xls")])
+        p = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
         if p:
             self.input_var.set(p)
             self._cfg["last_input"] = p
@@ -499,8 +817,7 @@ class App(tk.Tk):
             save_config(self._cfg)
 
     def _browse_cmp(self, var):
-        p = filedialog.askopenfilename(
-            filetypes=[("Excel", "*.xlsx *.xls")])
+        p = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
         if p:
             var.set(p)
             if not self.cmp_output_dir.get():
@@ -538,30 +855,7 @@ class App(tk.Tk):
     def _watch_log(self, msg):
         self.after(0, lambda: self._write_log(self.watch_log_box, msg))
 
-    # ── Прогресс ─────────────────────────────────────────────
-    STEPS = {
-        "загрузк": 1, "качеств": 2, "клиент": 3, "менеджер": 4,
-        "отрасл": 5, "сезонн": 6, "rfm": 7, "лояльн": 8,
-        "план": 9, "номенклатур": 10, "сохран": 11,
-    }
-    TOTAL = 11
-
-    def _progress_log(self, bar, pct_lbl):
-        counter = [0]
-        def fn(msg):
-            lo = msg.lower()
-            for kw, step in self.STEPS.items():
-                if kw in lo and step > counter[0]:
-                    counter[0] = step
-                    pct = int(step / self.TOTAL * 100)
-                    self.after(0, lambda p=pct: (
-                        bar.config(value=p),
-                        pct_lbl.config(text=f"{p}%")))
-                    break
-            self._log(msg)
-        return fn
-
-    # ── Запуск анализа ───────────────────────────────────────
+    # ── Анализ ───────────────────────────────────────────────
     def _start_analysis(self):
         inp = self.input_var.get().strip()
         out = self.output_dir_var.get().strip()
@@ -576,13 +870,12 @@ class App(tk.Tk):
         plan = self._get_plan_rub()
         self.main_bar.config(value=0)
         self.main_pct.config(text="0%")
-        self.run_btn.configure(state="disabled", text="⏳ Выполняется...")
+        self.run_btn.configure(state="disabled", text="  Выполняется...")
         self._start_anim()
         log_fn = self._progress_log(self.main_bar, self.main_pct)
-        threading.Thread(
-            target=self._thread_analysis,
-            args=(inp, out_path, plan, log_fn),
-            daemon=True).start()
+        threading.Thread(target=self._thread_analysis,
+                         args=(inp, out_path, plan, log_fn),
+                         daemon=True).start()
 
     def _thread_analysis(self, inp, out_path, plan, log_fn):
         try:
@@ -599,9 +892,9 @@ class App(tk.Tk):
         finally:
             self._stop_anim()
             self.after(0, lambda: self.run_btn.configure(
-                state="normal", text="▶  Запустить анализ"))
+                state="normal", text="▶   Запустить анализ"))
 
-    # ── Запуск сравнения ─────────────────────────────────────
+    # ── Сравнение ────────────────────────────────────────────
     def _start_comparison(self):
         pa = self.cmp_path_a.get().strip()
         pb = self.cmp_path_b.get().strip()
@@ -619,12 +912,11 @@ class App(tk.Tk):
             return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(od, f"сравнение_{ts}.xlsx")
-        self.cmp_run_btn.configure(state="disabled", text="⏳ Выполняется...")
+        self.cmp_run_btn.configure(state="disabled", text="  Выполняется...")
         self._start_anim()
-        threading.Thread(
-            target=self._thread_comparison,
-            args=(pa, pb, out_path, la, lb),
-            daemon=True).start()
+        threading.Thread(target=self._thread_comparison,
+                         args=(pa, pb, out_path, la, lb),
+                         daemon=True).start()
 
     def _thread_comparison(self, pa, pb, out_path, la, lb):
         try:
@@ -638,7 +930,7 @@ class App(tk.Tk):
         finally:
             self._stop_anim()
             self.after(0, lambda: self.cmp_run_btn.configure(
-                state="normal", text="▶  Сравнить периоды"))
+                state="normal", text="▶   Сравнить периоды"))
 
     # ── Наблюдатель ──────────────────────────────────────────
     def _start_watcher(self):
@@ -652,8 +944,9 @@ class App(tk.Tk):
             return
         self._watcher = FolderWatcher(wd, wo, self._watch_log)
         self._watcher.start()
-        self.watch_status_var.set("👁  Наблюдатель активен")
+        self.watch_status_var.set("Наблюдатель активен")
         self.watch_status_lbl.config(fg=C_GREEN)
+        self._status_dot.config(fg=C_GREEN)
         self.watch_start_btn.configure(state="disabled")
         self.watch_stop_btn.configure(state="normal")
 
@@ -661,10 +954,98 @@ class App(tk.Tk):
         if self._watcher:
             self._watcher.stop()
             self._watcher = None
-        self.watch_status_var.set("⏹  Остановлен")
-        self.watch_status_lbl.config(fg=C_MUTED)
+        T = self._T
+        self.watch_status_var.set("Остановлен")
+        self.watch_status_lbl.config(fg=T["muted"])
+        self._status_dot.config(fg=T["muted"])
         self.watch_start_btn.configure(state="normal")
         self.watch_stop_btn.configure(state="disabled")
+
+    # ============================================================
+    # ВКЛАДКА 5: ДАШБОРД
+    # ============================================================
+    def _build_tab_dash(self):
+        p = self.tab_dash
+        T = self._T
+
+        self._label(p,
+                    "Загрузите файл и откройте интерактивный дашборд в браузере",
+                    size=10, color="muted").pack(pady=(12, 6), padx=16, anchor="w")
+        self._label(p,
+                    "Дашборд включает: KPI, выручка по месяцам, топ клиентов и менеджеров, отрасли",
+                    size=8, color="muted").pack(padx=16, anchor="w", pady=(0, 8))
+
+        c1 = self._card(p, "ВХОДНОЙ ФАЙЛ")
+        self.dash_input_var = tk.StringVar(value=self._cfg.get("last_input", ""))
+        self._file_row(c1, self.dash_input_var, self._browse_dash_input)
+
+        # Превью — что будет в дашборде
+        preview = self._r(tk.Frame(p, bg=T["bg"]), "bg")
+        preview.pack(fill="x", padx=16, pady=(8, 4))
+
+        items = [
+            ("📈", "Выручка по месяцам", "Линейный график с градиентом"),
+            ("🏆", "Топ-10 клиентов",    "Горизонтальный столбчатый"),
+            ("👤", "Топ-10 менеджеров",  "Вертикальный столбчатый"),
+            ("🍩", "Отрасли",             "Пончик (doughnut)"),
+        ]
+
+        row = self._r(tk.Frame(preview, bg=T["bg"]), "bg")
+        row.pack(fill="x")
+        for icon, title, desc in items:
+            card = self._r(tk.Frame(row, bg=T["surface"],
+                                    highlightbackground=T["border"],
+                                    highlightthickness=1), "surface")
+            card.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4, ipady=10, ipadx=8)
+            tk.Label(card, text=icon, font=("Segoe UI", 22),
+                     bg=T["surface"]).pack()
+            tk.Label(card, text=title, font=("Segoe UI", 9, "bold"),
+                     bg=T["surface"], fg=T["text"]).pack()
+            tk.Label(card, text=desc, font=("Segoe UI", 8),
+                     bg=T["surface"], fg=T["muted"]).pack()
+
+        self._section_lbl(p, "ЖУРНАЛ")
+        self.dash_log_box = self._log_box(p, height=5)
+
+        self.dash_btn = self._run_btn(
+            p, "🌐   Открыть дашборд в браузере",
+            self._start_dashboard,
+            color="#1D4ED8", hover="#1E40AF")
+
+    def _browse_dash_input(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
+        if path:
+            self.dash_input_var.set(path)
+            self._cfg["last_input"] = path
+            # синхронизируем с вкладкой Анализ
+            self.input_var.set(path)
+            save_config(self._cfg)
+
+    def _dash_log(self, msg):
+        self._write_log(self.dash_log_box, msg)
+
+    def _start_dashboard(self):
+        inp = self.dash_input_var.get().strip()
+        if not inp:
+            messagebox.showwarning("", "Выберите входной файл.")
+            return
+        self.dash_btn.configure(state="disabled", text="⏳ Генерирую...")
+        self._start_anim()
+        threading.Thread(
+            target=self._thread_dashboard,
+            args=(inp,),
+            daemon=True).start()
+
+    def _thread_dashboard(self, inp):
+        try:
+            generate_dashboard(inp, log=self._dash_log)
+        except Exception as e:
+            self._dash_log(f"❌ ОШИБКА: {e}")
+            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+        finally:
+            self._stop_anim()
+            self.after(0, lambda: self.dash_btn.configure(
+                state="normal", text="🌐   Открыть дашборд в браузере"))
 
     def _on_success(self, path):
         self._status_var.set(f"Готово: {os.path.basename(path)}")

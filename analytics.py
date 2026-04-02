@@ -737,5 +737,166 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
             except Exception as e:
                 log(f"Ошибка при сохранении листа {safe_name}: {e}")
 
+    # ── Добавляем графики ────────────────────────────────────
+    log("Строю графики...")
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+        from openpyxl.chart.series import DataPoint
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter as gcl
+
+        wb = load_workbook(output_path)
+
+        # Создаём лист с графиками
+        ws_charts = wb.create_sheet("📊 Графики", 0)
+        ws_charts.sheet_view.showGridLines = False
+
+        # Заголовок листа
+        ws_charts['A1'] = "АНАЛИТИКА — ГРАФИКИ"
+        ws_charts['A1'].font = Font(name='Segoe UI', size=16, bold=True, color="F38120")
+        ws_charts.row_dimensions[1].height = 30
+
+        chart_row = 3  # текущая строка для размещения графиков
+
+        # ── 1. Выручка по месяцам (линейный) ─────────────────
+        sheet_monthly = '01_Месячная_статистика'
+        if sheet_monthly in wb.sheetnames:
+            ws_m = wb[sheet_monthly]
+            max_row = ws_m.max_row
+
+            if max_row > 2:
+                chart = LineChart()
+                chart.title = "Выручка по месяцам, тыс. руб."
+                chart.style = 10
+                chart.y_axis.title = "тыс. руб."
+                chart.x_axis.title = "Период"
+                chart.width = 22
+                chart.height = 14
+                chart.grouping = "standard"
+                chart.smooth = True
+
+                # Находим колонку с выручкой тыс.руб.
+                rev_col = None
+                for c in range(1, ws_m.max_column + 1):
+                    val = ws_m.cell(1, c).value
+                    if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
+                        rev_col = c
+                        break
+                if rev_col is None:
+                    rev_col = 2  # fallback
+
+                data = Reference(ws_m, min_col=rev_col, min_row=1, max_row=max_row)
+                cats = Reference(ws_m, min_col=1, min_row=2, max_row=max_row)
+                chart.add_data(data, titles_from_data=True)
+                chart.set_categories(cats)
+                chart.series[0].graphicalProperties.line.solidFill = "F38120"
+                chart.series[0].graphicalProperties.line.width = 25000
+                chart.series[0].smooth = True
+
+                ws_charts.add_chart(chart, f"A{chart_row}")
+                chart_row += 25
+
+        # ── 2. Топ-10 менеджеров (горизонтальный столбчатый) ──
+        sheet_mgr = '03_Топ_менеджеров'
+        if sheet_mgr in wb.sheetnames:
+            ws_mgr = wb[sheet_mgr]
+            n = min(11, ws_mgr.max_row)
+
+            if n > 2:
+                chart = BarChart()
+                chart.type = "bar"
+                chart.title = "Топ-10 менеджеров, тыс. руб."
+                chart.style = 10
+                chart.y_axis.title = "Менеджер"
+                chart.x_axis.title = "тыс. руб."
+                chart.width = 22
+                chart.height = 14
+
+                rev_col = None
+                for c in range(1, ws_mgr.max_column + 1):
+                    val = ws_mgr.cell(1, c).value
+                    if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
+                        rev_col = c
+                        break
+                if rev_col is None:
+                    rev_col = 2
+
+                data = Reference(ws_mgr, min_col=rev_col, min_row=1, max_row=n)
+                cats = Reference(ws_mgr, min_col=1, min_row=2, max_row=n)
+                chart.add_data(data, titles_from_data=True)
+                chart.set_categories(cats)
+                chart.series[0].graphicalProperties.solidFill = "F38120"
+
+                ws_charts.add_chart(chart, f"L{chart_row - 25 + 3}")
+
+        # ── 3. Топ-10 клиентов (вертикальный столбчатый) ──────
+        sheet_cli = '02_Топ_клиентов'
+        if sheet_cli in wb.sheetnames:
+            ws_cli = wb[sheet_cli]
+            n = min(11, ws_cli.max_row)
+
+            if n > 2:
+                chart = BarChart()
+                chart.type = "col"
+                chart.title = "Топ-10 клиентов, тыс. руб."
+                chart.style = 10
+                chart.y_axis.title = "тыс. руб."
+                chart.width = 22
+                chart.height = 14
+
+                rev_col = None
+                for c in range(1, ws_cli.max_column + 1):
+                    val = ws_cli.cell(1, c).value
+                    if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
+                        rev_col = c
+                        break
+                if rev_col is None:
+                    rev_col = 2
+
+                data = Reference(ws_cli, min_col=rev_col, min_row=1, max_row=n)
+                cats = Reference(ws_cli, min_col=1, min_row=2, max_row=n)
+                chart.add_data(data, titles_from_data=True)
+                chart.set_categories(cats)
+                chart.series[0].graphicalProperties.solidFill = "4A90D9"
+
+                ws_charts.add_chart(chart, f"A{chart_row}")
+                chart_row += 25
+
+        # ── 4. Отрасли (круговая диаграмма) ───────────────────
+        sheet_ind = '04_Отрасли'
+        if sheet_ind in wb.sheetnames:
+            ws_ind = wb[sheet_ind]
+            n = min(11, ws_ind.max_row)
+
+            if n > 2:
+                chart = PieChart()
+                chart.title = "Выручка по отраслям"
+                chart.style = 10
+                chart.width = 18
+                chart.height = 14
+
+                rev_col = None
+                for c in range(1, ws_ind.max_column + 1):
+                    val = ws_ind.cell(1, c).value
+                    if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
+                        rev_col = c
+                        break
+                if rev_col is None:
+                    rev_col = 2
+
+                data = Reference(ws_ind, min_col=rev_col, min_row=1, max_row=n)
+                cats = Reference(ws_ind, min_col=1, min_row=2, max_row=n)
+                chart.add_data(data, titles_from_data=True)
+                chart.set_categories(cats)
+                chart.dataLabels = None
+
+                ws_charts.add_chart(chart, f"L{chart_row - 25 + 3}")
+
+        wb.save(output_path)
+        log("Графики добавлены ✅")
+    except Exception as e:
+        log(f"⚠ Графики не добавлены: {e}")
+
     log(f"✅ Готово! Отчёт сохранён: {output_path}")
     return output_path
