@@ -27,6 +27,57 @@ EXCLUDE_PROJECTS = [
 
 DISCOUNT_BUCKETS = [0, 5, 10, 15, 20, 25, 50]
 
+COL_BARTER = 'Бартер'
+PROGRAMMATIC_PROJECTS = []
+
+# Верифицированные цифры из бухгалтерии/биллинга (руб, не тыс.)
+# Заполняются вручную — CRM не содержит их точно из-за разной методологии учёта.
+# Если поставить None — строка не будет выводиться в сводке.
+VERIFIED_TOTAL_WITH_BARTER_NO_PROG = 363_000_166   # с бартером, без программатика
+VERIFIED_ADVERTISING_NO_EVENTS     = 243_005_820   # рекламная без мероприятий
+VERIFIED_TOTAL_WITH_PROG           = 482_404_000   # всё с программатиком и бартером
+
+# ── Внешние доходы (не попадают в CRM) ──────────────────────────
+# Эти цифры берутся из файла "Доходы_2025.xlsx" вручную.
+# Программатик из внешних платформ, не попадающий в CRM:
+EXTERNAL_PROGRAMMATIC_TOTAL = 119_403_897     # руб, из строки "Программатик" в Доходы
+# Прочие доходы (47News внешн., ИРИ/АНО, гранты, ФФ/АМ взаимозачёт):
+EXTERNAL_OTHER_INCOME       = 41_057_102      # руб, "Total Прочие доходы"
+
+# ── Маппинг проектов CRM → бизнес-группа ────────────────────────
+# Структура повторяет логику Доходы_2025.xlsx: Ads / Events / Прочее / Программатик.
+# Если появится новый проект — добавь его сюда, иначе он попадёт в "НЕ КЛАССИФИЦИРОВАНО".
+PROJECT_GROUP_MAP = {
+    # ── Реклама Фонтанка ──
+    'Фонтанка.ру: Тексты':              'Реклама Фонтанка',
+    'Фонтанка.ру: СММ':                 'Реклама Фонтанка',
+    'Фонтанка.ру: Спецпроекты':         'Реклама Фонтанка',
+    'Фонтанка.ру: Баннерная реклама':   'Реклама Фонтанка',
+    'Фонтанка.ру: Мобильная версия':    'Реклама Фонтанка',
+    'Фонтанка.ру':                      'Реклама Фонтанка',
+    'IC Доходы Фонтанка':               'Реклама Фонтанка',
+    'IC Доходы Фонтанка спецпроекты':   'Реклама Фонтанка',
+    'IC Доходы Фонтанка СММ':           'Реклама Фонтанка',
+    # ── Реклама Доктор ──
+    'ДокторПитер.ру: Реклама (баннеры + тексты)': 'Реклама Доктор',
+    'ДокторПитер.ру: Спецпроекты':      'Реклама Доктор',
+    'doctorpiter.ru: СММ':              'Реклама Доктор',
+    'ДокторПитер.ру: Информ. услуги':   'Реклама Доктор',
+    'IC Доходы Доктор':                 'Реклама Доктор',
+    'IC Доходы Доктор (спецпроекты)':   'Реклама Доктор',
+    # ── Программатик (CRM-часть, малая) ──
+    'Программатик Фонтанка':            'Программатик',
+    'Программатик ДокторПитер':         'Программатик',
+    # ── Мероприятия ──
+    'Мероприятия (деловые)':            'Мероприятия',
+    'Мероприятия (городские)':          'Мероприятия',
+    'IC Доходы Эвенты':                 'Мероприятия',
+    # ── 47News / Прочее ──
+    '47News':                           '47News / Прочее',
+    '47News: Прочие услуги':            '47News / Прочее',
+}
+
+
 REVENUE_BUCKETS = [
     ('Менее 10 тыс. руб.', 0, 10_000),
     ('10-50 тыс. руб.', 10_000, 50_000),
@@ -323,11 +374,27 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
         )
         df_full['Категория_скидки'] = df_full['Скидка_%_число'].apply(bucket_discount)
 
-    # ── 9. Маска «без мероприятий» ───────────────────────────
+    # ── 9. Маски фильтрации ──────────────────────────────────
     if COL_PROJECT in df_full.columns:
         mask_no_events = ~df_full[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS)
     else:
         mask_no_events = pd.Series(True, index=df_full.index)
+
+    if COL_BARTER in df_full.columns:
+        mask_no_barter = (
+            df_full[COL_BARTER].astype(str).str.strip().str.lower() != 'да'
+        )
+    else:
+        mask_no_barter = pd.Series(True, index=df_full.index)
+
+    if COL_PROJECT in df_full.columns:
+        mask_no_prog = ~df_full[COL_PROJECT].fillna('').str.contains(
+            'программатик|programmatic', case=False, regex=True
+        )
+        if PROGRAMMATIC_PROJECTS:
+            mask_no_prog = mask_no_prog & ~df_full[COL_PROJECT].fillna('').isin(PROGRAMMATIC_PROJECTS)
+    else:
+        mask_no_prog = pd.Series(True, index=df_full.index)
 
     # ── 10. Месячная статистика ──────────────────────────────
     monthly_stats = None
@@ -407,6 +474,54 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
         industry_stats.reset_index()
         .sort_values('Сумма выручки, тыс. руб.', ascending=False)
     )
+
+    # ── 13а. Выручка по бизнес-группам (логика бухгалтерии) ──
+    log("Считаю выручку по группам...")
+    df_full['БИЗНЕС_ГРУППА'] = (
+        df_full[COL_PROJECT].map(PROJECT_GROUP_MAP).fillna('НЕ КЛАССИФИЦИРОВАНО')
+        if COL_PROJECT in df_full.columns else 'НЕ КЛАССИФИЦИРОВАНО'
+    )
+
+    group_stats = (
+        df_full.groupby('БИЗНЕС_ГРУППА')
+        .agg({revenue_col: ['sum', 'count']}).round(2)
+    )
+    group_stats.columns = ['Выручка CRM, руб.', 'Заказов']
+    group_stats['Выручка CRM, тыс. руб.'] = (group_stats['Выручка CRM, руб.'] / 1000).round(2)
+    group_stats = (
+        group_stats.reset_index()
+        .sort_values('Выручка CRM, тыс. руб.', ascending=False)
+    )
+
+    # Сводка по группам — CRM vs бухгалтерия (без попытки сложить, чтобы не дублировать)
+    crm_ads      = df_full.loc[df_full['БИЗНЕС_ГРУППА'].isin(['Реклама Фонтанка', 'Реклама Доктор']), revenue_col].sum()
+    crm_prog     = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'Программатик', revenue_col].sum()
+    crm_events   = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'Мероприятия', revenue_col].sum()
+    crm_47other  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == '47News / Прочее', revenue_col].sum()
+    crm_unclass  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'НЕ КЛАССИФИЦИРОВАНО', revenue_col].sum()
+    crm_total    = df_full[revenue_col].sum()
+
+    group_summary_rows = [
+        ('═══ CRM (расчёт по выгрузке) ═══', ''),
+        ('Реклама Фонтанка + Доктор, тыс. руб.', round(crm_ads / 1000, 2)),
+        ('Программатик (CRM-часть), тыс. руб.', round(crm_prog / 1000, 2)),
+        ('Мероприятия, тыс. руб.', round(crm_events / 1000, 2)),
+        ('47News / Прочее, тыс. руб.', round(crm_47other / 1000, 2)),
+        ('НЕ классифицированное, тыс. руб.', round(crm_unclass / 1000, 2)),
+        ('Итого CRM, тыс. руб.', round(crm_total / 1000, 2)),
+        ('═══ Бухгалтерия (внешние цифры) ═══', ''),
+        ('Программатик полный (вне CRM), тыс. руб.',
+            round((EXTERNAL_PROGRAMMATIC_TOTAL or 0) / 1000, 2) if EXTERNAL_PROGRAMMATIC_TOTAL else '—'),
+        ('Прочие доходы (ИРИ/гранты/47 закупка), тыс. руб.',
+            round((EXTERNAL_OTHER_INCOME or 0) / 1000, 2) if EXTERNAL_OTHER_INCOME else '—'),
+        ('Итого с программатиком + бартер (верифицировано), тыс. руб.',
+            round((VERIFIED_TOTAL_WITH_PROG or 0) / 1000, 2) if VERIFIED_TOTAL_WITH_PROG else '—'),
+        ('Итого с бартером без программатика (верифицировано), тыс. руб.',
+            round((VERIFIED_TOTAL_WITH_BARTER_NO_PROG or 0) / 1000, 2) if VERIFIED_TOTAL_WITH_BARTER_NO_PROG else '—'),
+        ('Рекламная без мероприятий (верифицировано), тыс. руб.',
+            round((VERIFIED_ADVERTISING_NO_EVENTS or 0) / 1000, 2) if VERIFIED_ADVERTISING_NO_EVENTS else '—'),
+    ]
+    group_summary_df = pd.DataFrame(group_summary_rows, columns=['Показатель', 'Значение'])
 
     # ── 14. Сезонность ───────────────────────────────────────
     seasonal_stats = None
@@ -545,33 +660,35 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
         row = client_stats.iloc[0]
         best_client, best_client_revenue = row['КОНЕЧНЫЙ_КЛИЕНТ'], row['Сумма выручки, тыс. руб.']
 
-    extended_summary = pd.DataFrame({
-        'Метрика': [
-            'Общая выручка, тыс. руб.',
-            'Средний чек БЕЗ мероприятий, тыс. руб.',
-            'Медианный чек БЕЗ мероприятий, тыс. руб.',
-            'Количество заказов',
-            'Уникальных клиентов',
-            'Уникальных проектов',
-            'Самый прибыльный месяц',
-            'Выручка в лучший месяц, тыс. руб.',
-            'Самый прибыльный менеджер',
-            'Выручка топ-менеджера, тыс. руб.',
-            'Самый прибыльный клиент',
-            'Выручка топ-клиента, тыс. руб.'
-        ],
-        'Значение': [
-            round(df_full[revenue_col].sum() / 1000, 2),
-            round(df_full.loc[mask_no_events, revenue_col].mean() / 1000, 2),
-            round(df_full.loc[mask_no_events, revenue_col].median() / 1000, 2),
-            len(df_full),
-            df_full['КОНЕЧНЫЙ_КЛИЕНТ'].nunique(),
-            df_full[COL_PROJECT].nunique() if COL_PROJECT in df_full.columns else None,
-            best_month, best_month_revenue,
-            best_manager, best_manager_revenue,
-            best_client, best_client_revenue
-        ]
-    })
+    rev_all      = df_full[revenue_col].sum() / 1000
+    rev_bez_prog = df_full.loc[mask_no_prog, revenue_col].sum() / 1000
+    rev_reklama  = df_full.loc[mask_no_prog & mask_no_events, revenue_col].sum() / 1000
+
+    # Собираем сводку — CRM-расчёт и верифицированные цифры бухгалтерии
+    summary_rows = [
+        ('— CRM (расчёт по выгрузке) —', ''),
+        ('Выручка: все заказы в CRM, тыс. руб.', round(rev_all, 2)),
+        ('Выручка: CRM без программатика, тыс. руб.', round(rev_bez_prog, 2)),
+        ('Выручка: CRM рекламная без мероприятий, тыс. руб.', round(rev_reklama, 2)),
+        ('— Верифицированные (из бухгалтерии) —', ''),
+    ]
+    if VERIFIED_TOTAL_WITH_PROG is not None:
+        summary_rows.append(('Верифицированная: всего с программатиком, тыс. руб.', round(VERIFIED_TOTAL_WITH_PROG / 1000, 2)))
+    if VERIFIED_TOTAL_WITH_BARTER_NO_PROG is not None:
+        summary_rows.append(('Верифицированная: с бартером без программатика, тыс. руб.', round(VERIFIED_TOTAL_WITH_BARTER_NO_PROG / 1000, 2)))
+    if VERIFIED_ADVERTISING_NO_EVENTS is not None:
+        summary_rows.append(('Верифицированная: рекламная без мероприятий, тыс. руб.', round(VERIFIED_ADVERTISING_NO_EVENTS / 1000, 2)))
+
+    summary_rows.extend([
+        ('— Прочее —', ''),
+        ('Средний чек БЕЗ мероприятий, тыс. руб.', round(df_full.loc[mask_no_events, revenue_col].mean() / 1000, 2)),
+        ('Медианный чек БЕЗ мероприятий, тыс. руб.', round(df_full.loc[mask_no_events, revenue_col].median() / 1000, 2)),
+        ('Количество заказов', len(df_full)),
+        ('Уникальных клиентов', df_full['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()),
+        ('Уникальных менеджеров', df_full[COL_MANAGER].nunique() if COL_MANAGER in df_full.columns else None),
+    ])
+
+    summary_df = pd.DataFrame(summary_rows, columns=['Метрика', 'Значение'])
 
     df_raw_for_compare = df_raw.copy()
     if COL_MONTH in df_raw_for_compare.columns:
@@ -582,24 +699,23 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
     df_raw_for_compare[COL_REVENUE] = pd.to_numeric(df_raw_for_compare[COL_REVENUE], errors='coerce')
 
     comparison_metrics = pd.DataFrame({
-        'Показатель': ['Количество заказов', 'Общая выручка, тыс. руб.', 'Средний чек, тыс. руб.', 'Медианный чек, тыс. руб.'],
-        'Исходные данные': [
-            len(df_raw_for_compare),
-            round(df_raw_for_compare[COL_REVENUE].sum() / 1000, 2),
-            round(df_raw_for_compare[COL_REVENUE].mean() / 1000, 2),
-            round(df_raw_for_compare[COL_REVENUE].median() / 1000, 2)
+        'Показатель': [
+            'Количество заказов (исходник)',
+            'Количество заказов (после очистки)',
+            'Выручка исходник, тыс. руб.',
+            'Выручка все в CRM, тыс. руб.',
+            'Выручка с бартером без программатика, тыс. руб.',
+            'Выручка рекламная без мероприятий, тыс. руб.',
         ],
-        'После фильтров': [
+        'Значение': [
+            len(df_raw_for_compare),
             len(df_full),
-            round(df_full[revenue_col].sum() / 1000, 2),
-            round(df_full.loc[mask_no_events, revenue_col].mean() / 1000, 2),
-            round(df_full.loc[mask_no_events, revenue_col].median() / 1000, 2)
+            round(df_raw_for_compare[COL_REVENUE].sum() / 1000, 2),
+            round(rev_all, 2),
+            round(rev_bez_prog, 2),
+            round(rev_reklama, 2),
         ]
     })
-    comparison_metrics['Разница'] = comparison_metrics['После фильтров'] - comparison_metrics['Исходные данные']
-    comparison_metrics['Изменение, %'] = (
-        comparison_metrics['Разница'] / comparison_metrics['Исходные данные'] * 100
-    ).round(2)
 
     # ── 18. Прогноз ──────────────────────────────────────────
     forecast_summary = None
@@ -715,10 +831,12 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
     if rfm_non_top is not None:
         export_data['09_RFM_не_топ'] = rfm_non_top
     export_data['10_Распределение_заказов'] = order_freq_df
-    export_data['11_Расширенный_сводный']   = extended_summary
+    export_data['11_Расширенный_сводный']   = summary_df
     export_data['12_Сравнение']             = comparison_metrics
     if forecast_summary is not None:
         export_data['13_Прогноз']           = forecast_summary
+    export_data['14_Выручка_по_группам']    = group_stats
+    export_data['15_Сводка_по_группам']     = group_summary_df
 
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         for sheet_name, df_sheet in export_data.items():
