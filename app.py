@@ -1,5 +1,5 @@
 # ============================================================
-# app.py — Аналитика заказов, Фонтанка.ру  v2.0
+# app.py — Аналитика заказов, Фонтанка.ру  v2.1
 # ============================================================
 
 import tkinter as tk
@@ -14,8 +14,22 @@ from comparison import run_comparison
 from watcher import FolderWatcher
 from dashboard import generate_dashboard
 
+# Опциональные модули — редакторы JSON (подключаем если файлы есть)
+try:
+    from external_income_editor import ExternalIncomeEditor
+    HAS_EXT_EDITOR = True
+except ImportError:
+    HAS_EXT_EDITOR = False
+
+try:
+    from verified_figures_editor import VerifiedFiguresEditor
+    HAS_VF_EDITOR = True
+except ImportError:
+    HAS_VF_EDITOR = False
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 ICON_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+APP_DIR     = os.path.dirname(os.path.abspath(__file__))
 
 C_ORANGE  = "#F38120"
 C_DARK    = "#D06A10"
@@ -23,6 +37,7 @@ C_GREEN   = "#22C55E"
 C_GREEN_D = "#16A34A"
 C_RED     = "#EF4444"
 C_RED_D   = "#DC2626"
+C_AMBER   = "#F39C12"
 
 THEMES = {
     "light": {
@@ -136,7 +151,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Аналитика заказов — Фонтанка.ру")
-        self.geometry("760x680")
+        self.geometry("820x780")
         self.resizable(False, False)
 
         if os.path.exists(ICON_PATH):
@@ -153,6 +168,8 @@ class App(tk.Tk):
         self._plan_vars = {}
         self._anim_running = False
         self._anim_step = 0
+        # НОВОЕ: выбор базы даты
+        self._date_by = tk.StringVar(value=self._cfg.get("date_by", "order"))
 
         self.configure(bg=self._T["bg"])
         self._build_header()
@@ -164,6 +181,7 @@ class App(tk.Tk):
         if self._watcher:
             self._watcher.stop()
         self._cfg["theme"] = self._tn
+        self._cfg["date_by"] = self._date_by.get()
         save_config(self._cfg)
         self.destroy()
 
@@ -255,7 +273,6 @@ class App(tk.Tk):
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
 
-        # Левая часть — логотип
         left = tk.Frame(hdr, bg=C_ORANGE)
         left.pack(side="left", fill="y")
 
@@ -272,11 +289,9 @@ class App(tk.Tk):
                  bg=C_ORANGE, fg="#FFD8A8",
                  padx=14).pack(side="left", pady=22)
 
-        # Правая часть — часы + кнопка темы
         right = tk.Frame(hdr, bg=C_ORANGE)
         right.pack(side="right", fill="y", padx=16)
 
-        # Кнопка темы
         icon = "🌙" if self._tn == "light" else "☀️"
         self._theme_btn = tk.Button(
             right, text=icon,
@@ -288,7 +303,6 @@ class App(tk.Tk):
             command=self._toggle_theme)
         self._theme_btn.pack(side="right", padx=(8, 0), pady=18)
 
-        # Часы
         clock_frame = tk.Frame(right, bg=C_ORANGE)
         clock_frame.pack(side="right", fill="y", pady=10)
 
@@ -360,7 +374,6 @@ class App(tk.Tk):
         self._sb_f.pack(fill="x", side="bottom")
         self._sb_f.pack_propagate(False)
 
-        # Цветная полоска сверху статус-бара
         tk.Frame(self._sb_f, bg=C_ORANGE, height=1).pack(fill="x", side="top")
 
         self._status_var = tk.StringVar(value="Готов к работе")
@@ -375,7 +388,7 @@ class App(tk.Tk):
         self._anim_lbl.pack(side="right", padx=12)
 
         self._sb_ver = tk.Label(
-            self._sb_f, text="v2.0  ·  Фонтанка.ру",
+            self._sb_f, text="v2.1  ·  Фонтанка.ру",
             font=("Segoe UI", 8), bg=T["sb_bg"], fg=T["muted"])
         self._sb_ver.pack(side="right", padx=12)
 
@@ -410,7 +423,6 @@ class App(tk.Tk):
         outer = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
         outer.pack(fill="x", padx=16, pady=(4, 2))
 
-        # Заголовок с оранжевой левой полоской
         hdr_row = self._r(tk.Frame(outer, bg=T["surface"]), "surface")
         hdr_row.pack(fill="x")
 
@@ -420,7 +432,6 @@ class App(tk.Tk):
                  bg=T["surface"], fg=C_ORANGE,
                  anchor="w", pady=6).pack(side="left", fill="x", expand=True)
 
-        # Тело карточки
         body = self._r(
             tk.Frame(outer, bg=T["surface"],
                      highlightbackground=T["border"],
@@ -516,7 +527,6 @@ class App(tk.Tk):
                "warn" if "⚠" in msg else None)
         ts = datetime.now().strftime("%H:%M:%S")
         box.configure(state="normal")
-        # Временная метка серым
         box.insert("end", f"[{ts}] ", "ts")
         box.tag_config("ts", foreground=T["muted"])
         line = f"{msg}\n"
@@ -565,13 +575,130 @@ class App(tk.Tk):
         self.output_dir_var = tk.StringVar(value=self._cfg.get("last_output_dir", ""))
         self._file_row(c2, self.output_dir_var, self._browse_output)
 
+        # НОВОЕ: настройки отчёта
+        c3 = self._card(p, "НАСТРОЙКИ ОТЧЁТА")
+        self._build_settings_card(c3)
+
         self._section_lbl(p, "ПРОГРЕСС ВЫПОЛНЕНИЯ")
         self.main_bar, self.main_pct = self._progress_row(p)
 
         self._section_lbl(p, "ЖУРНАЛ")
-        self.log_box = self._log_box(p, height=6)
+        self.log_box = self._log_box(p, height=5)
+
+        # НОВОЕ: индикатор расхождения с бухгалтерией
+        self._build_recon_indicator(p)
+
         self.run_btn = self._run_btn(p, "▶   Запустить анализ",
                                       self._start_analysis)
+
+    # ── НОВЫЙ блок: настройки отчёта ─────────────────────────
+    def _build_settings_card(self, parent):
+        T = self._T
+        # Первая строка — переключатель даты
+        row1 = self._r(tk.Frame(parent, bg=T["surface"]), "surface")
+        row1.pack(fill="x", pady=(0, 4))
+
+        lbl1 = tk.Label(row1, text="Основная дата для итогов:",
+                        font=("Segoe UI", 9),
+                        bg=T["surface"], fg=T["text"])
+        self._r(lbl1, "text_sf")
+        lbl1.pack(side="left")
+
+        rb1 = tk.Radiobutton(row1, text="Дата заказа",
+                             variable=self._date_by, value="order",
+                             bg=T["surface"], fg=T["text"],
+                             activebackground=T["surface"],
+                             selectcolor=T["surface"],
+                             font=("Segoe UI", 9),
+                             cursor="hand2")
+        self._r(rb1, "text_sf")
+        rb1.pack(side="left", padx=(10, 6))
+
+        rb2 = tk.Radiobutton(row1, text="Дата оплаты (бьётся с бухгалтерией)",
+                             variable=self._date_by, value="payment",
+                             bg=T["surface"], fg=T["text"],
+                             activebackground=T["surface"],
+                             selectcolor=T["surface"],
+                             font=("Segoe UI", 9),
+                             cursor="hand2")
+        self._r(rb2, "text_sf")
+        rb2.pack(side="left")
+
+        # Вторая строка — кнопки редакторов
+        row2 = self._r(tk.Frame(parent, bg=T["surface"]), "surface")
+        row2.pack(fill="x", pady=(6, 0))
+
+        lbl2 = tk.Label(row2, text="Данные бухгалтерии:",
+                        font=("Segoe UI", 9),
+                        bg=T["surface"], fg=T["text"])
+        self._r(lbl2, "text_sf")
+        lbl2.pack(side="left")
+
+        if HAS_VF_EDITOR:
+            btn1 = AnimButton(row2, T["surface2"], T["border"],
+                              text="⚙ Верифицированные цифры",
+                              font=("Segoe UI", 9),
+                              fg=T["text"],
+                              command=self._open_verified_editor,
+                              padx=10, pady=3)
+            btn1.pack(side="left", padx=(10, 6))
+
+        if HAS_EXT_EDITOR:
+            btn2 = AnimButton(row2, T["surface2"], T["border"],
+                              text="⚙ Внешние доходы (программатик)",
+                              font=("Segoe UI", 9),
+                              fg=T["text"],
+                              command=self._open_external_editor,
+                              padx=10, pady=3)
+            btn2.pack(side="left")
+
+    # ── НОВЫЙ блок: индикатор расхождения ────────────────────
+    def _build_recon_indicator(self, parent):
+        T = self._T
+        f = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
+        f.pack(fill="x", padx=16, pady=(4, 4))
+
+        self._recon_label = tk.Label(
+            f, text="  Сверка с бухгалтерией появится после запуска анализа",
+            font=("Segoe UI", 9),
+            bg=T["bg"], fg=T["muted"],
+            anchor="w", justify="left",
+            padx=10, pady=8)
+        self._r(self._recon_label, "muted_bg")
+        self._recon_label.pack(fill="x")
+
+    # ── Открытие редакторов ──────────────────────────────────
+    def _open_external_editor(self):
+        path = os.path.join(APP_DIR, "external_income.json")
+        if not os.path.exists(path):
+            messagebox.showerror(
+                "Нет файла",
+                f"Файл external_income.json не найден.\n\n"
+                f"Ожидается по пути:\n{path}")
+            return
+        ExternalIncomeEditor(self, path, theme=self._T)
+
+    def _open_verified_editor(self):
+        path = os.path.join(APP_DIR, "verified_figures.json")
+        if not os.path.exists(path):
+            # Создаём дефолтный
+            default = {
+                "_описание": "Верифицированные годовые итоги из бухгалтерии.",
+                "_год": 2025,
+                "total_with_prog": 482404000,
+                "total_with_barter_no_prog": 363000166,
+                "advertising_no_events": 243005820,
+                "programmatic_external": 119403897,
+                "other_external_income": 41057102
+            }
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(default, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                messagebox.showerror("Ошибка",
+                    f"Не удалось создать verified_figures.json:\n{e}")
+                return
+        VerifiedFiguresEditor(self, path, theme=self._T)
 
     # ============================================================
     # ВКЛАДКА 2: СРАВНЕНИЕ
@@ -641,7 +768,6 @@ class App(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        # Заголовок таблицы
         hdr = tk.Frame(self._plan_inner, bg=C_ORANGE)
         hdr.grid(row=0, column=0, columnspan=2, sticky="ew")
         tk.Label(hdr, text="  Менеджер",
@@ -758,7 +884,6 @@ class App(tk.Tk):
         self.watch_out_var = tk.StringVar(value=self._cfg.get("watch_output_dir", ""))
         self._file_row(co, self.watch_out_var, self._browse_watch_out)
 
-        # Статус индикатор
         sf = self._r(tk.Frame(p, bg=T["bg"]), "bg")
         sf.pack(fill="x", padx=16, pady=(12, 4))
 
@@ -872,6 +997,10 @@ class App(tk.Tk):
         self.main_pct.config(text="0%")
         self.run_btn.configure(state="disabled", text="  Выполняется...")
         self._start_anim()
+        # Сбрасываем индикатор
+        self._recon_label.config(
+            text="  Считаю...",
+            fg=self._T["muted"])
         log_fn = self._progress_log(self.main_bar, self.main_pct)
         threading.Thread(target=self._thread_analysis,
                          args=(inp, out_path, plan, log_fn),
@@ -880,12 +1009,24 @@ class App(tk.Tk):
     def _thread_analysis(self, inp, out_path, plan, log_fn):
         try:
             log_fn(f"Файл: {os.path.basename(inp)}")
-            run_analytics(inp, out_path, log=log_fn, manager_plan=plan)
+            date_by = self._date_by.get()
+            result = run_analytics(inp, out_path,
+                                   log=log_fn,
+                                   manager_plan=plan,
+                                   date_by=date_by)
             log_fn(f"✅ Готово: {out_path}")
             self.after(0, lambda: (
                 self.main_bar.config(value=100),
                 self.main_pct.config(text="100%")))
-            self.after(0, lambda: self._on_success(out_path))
+
+            # Обработка нового (dict) и старого (str) формата
+            if isinstance(result, dict):
+                path = result.get("output_path", out_path)
+                self.after(0, lambda r=result: self._update_recon(r))
+            else:
+                path = result or out_path
+
+            self.after(0, lambda: self._on_success(path))
         except Exception as e:
             log_fn(f"❌ ОШИБКА: {e}")
             self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
@@ -893,6 +1034,41 @@ class App(tk.Tk):
             self._stop_anim()
             self.after(0, lambda: self.run_btn.configure(
                 state="normal", text="▶   Запустить анализ"))
+
+    def _update_recon(self, result):
+        """Обновляет индикатор расхождения с бухгалтерией."""
+        pct = result.get("deviation_pct")
+        grand = result.get("grand_total", 0)
+        verified = result.get("verified_total", 0)
+        date_by = result.get("date_by", "order")
+
+        if pct is None or verified <= 0:
+            self._recon_label.config(
+                text=f"  CRM+внешние: {grand:,.0f} тыс. руб.".replace(",", " "),
+                fg=self._T["text"])
+            return
+
+        if abs(pct) < 2:
+            color = C_GREEN
+            icon = "✅"
+            verdict = "отлично"
+        elif abs(pct) < 5:
+            color = C_AMBER
+            icon = "⚠"
+            verdict = "в норме"
+        else:
+            color = C_RED
+            icon = "❌"
+            verdict = "большое расхождение"
+
+        date_label = "дата оплаты" if date_by == "payment" else "дата заказа"
+
+        text = (f"  {icon}  {date_label.capitalize()}: "
+                f"CRM+внешние {grand:,.0f} тыс. │ "
+                f"Цель: {verified:,.0f} тыс. │ "
+                f"{pct:+.2f}% — {verdict}").replace(",", " ")
+
+        self._recon_label.config(text=text, fg=color)
 
     # ── Сравнение ────────────────────────────────────────────
     def _start_comparison(self):
@@ -979,7 +1155,6 @@ class App(tk.Tk):
         self.dash_input_var = tk.StringVar(value=self._cfg.get("last_input", ""))
         self._file_row(c1, self.dash_input_var, self._browse_dash_input)
 
-        # Превью — что будет в дашборде
         preview = self._r(tk.Frame(p, bg=T["bg"]), "bg")
         preview.pack(fill="x", padx=16, pady=(8, 4))
 
@@ -1017,7 +1192,6 @@ class App(tk.Tk):
         if path:
             self.dash_input_var.set(path)
             self._cfg["last_input"] = path
-            # синхронизируем с вкладкой Анализ
             self.input_var.set(path)
             save_config(self._cfg)
 

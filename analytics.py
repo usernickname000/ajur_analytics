@@ -31,19 +31,15 @@ DISCOUNT_BUCKETS = [0, 5, 10, 15, 20, 25, 50]
 COL_BARTER = 'Бартер'
 PROGRAMMATIC_PROJECTS = []
 
-# Верифицированные цифры из бухгалтерии/биллинга (руб, не тыс.)
-# Заполняются вручную — CRM не содержит их точно из-за разной методологии учёта.
-# Если поставить None — строка не будет выводиться в сводке.
-VERIFIED_TOTAL_WITH_BARTER_NO_PROG = 363_000_166   # с бартером, без программатика
-VERIFIED_ADVERTISING_NO_EVENTS     = 243_005_820   # рекламная без мероприятий
-VERIFIED_TOTAL_WITH_PROG           = 482_404_000   # всё с программатиком и бартером
-
-# ── Внешние доходы (не попадают в CRM) ──────────────────────────
-# Эти цифры берутся из файла "Доходы_2025.xlsx" вручную.
-# Программатик из внешних платформ, не попадающий в CRM:
-EXTERNAL_PROGRAMMATIC_TOTAL = 119_403_897     # руб, из строки "Программатик" в Доходы
-# Прочие доходы (47News внешн., ИРИ/АНО, гранты, ФФ/АМ взаимозачёт):
-EXTERNAL_OTHER_INCOME       = 41_057_102      # руб, "Total Прочие доходы"
+# ── Верифицированные цифры из бухгалтерии ──────────────────
+# Загружаются из verified_figures.json при запуске.
+# Константы-fallback на случай если JSON отсутствует:
+VERIFIED_FIGURES_JSON = 'verified_figures.json'
+VERIFIED_TOTAL_WITH_BARTER_NO_PROG = 363_000_166   # fallback
+VERIFIED_ADVERTISING_NO_EVENTS     = 243_005_820   # fallback
+VERIFIED_TOTAL_WITH_PROG           = 482_404_000   # fallback
+EXTERNAL_PROGRAMMATIC_TOTAL        = 119_403_897   # fallback
+EXTERNAL_OTHER_INCOME              = 41_057_102    # fallback
 
 # ── Путь к JSON с внешними доходами по месяцам (для бухгалтерской таблицы) ──
 # Если файл есть — строится полная бухгалтерская таблица с разбивкой по месяцам.
@@ -331,6 +327,61 @@ def bucket_discount(x):
     return 'прочие'
 
 
+def load_verified_figures(path):
+    """
+    Загружает verified_figures.json. Возвращает dict с ключами:
+    total_with_prog, total_with_barter_no_prog, advertising_no_events,
+    programmatic_external, other_external_income, _год.
+    Если файла нет — возвращает None.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def get_external_monthly_totals(external_json_path):
+    """
+    Читает external_income.json и возвращает dict {месяц: сумма_руб} — 
+    сумму тех внешних доходов, которые явно перечислены в '_включать_в_аналитику'
+    (программатик, бартер, ИРИ, гранты — т.е. реальная выручка, а не вычеты).
+    Если списка '_включать_в_аналитику' нет — суммируются ВСЕ не-служебные строки.
+    Если файла нет или он пустой — возвращает None.
+    """
+    if not os.path.exists(external_json_path):
+        return None
+    try:
+        with open(external_json_path, 'r', encoding='utf-8') as f:
+            ext = json.load(f)
+    except Exception:
+        return None
+
+    months = [f"{m:02d}" for m in range(1, 13)]
+    monthly_total = {m: 0.0 for m in months}
+
+    # Если задан список — берём только его, иначе все не-служебные
+    include_list = ext.get('_включать_в_аналитику')
+    if include_list:
+        rows_to_sum = [r for r in include_list if r in ext and isinstance(ext[r], dict)]
+    else:
+        rows_to_sum = [
+            r for r, v in ext.items()
+            if not r.startswith('_') and isinstance(v, dict)
+        ]
+
+    for row_name in rows_to_sum:
+        row_data = ext[row_name]
+        for m in months:
+            v = row_data.get(m, 0) or 0
+            if isinstance(v, (int, float)):
+                monthly_total[m] += v
+
+    return monthly_total
+
+
 def parse_month(s):
     try:
         if pd.isna(s):
@@ -578,17 +629,56 @@ def run_data_quality_checks(df):
 # ГЛАВНАЯ ФУНКЦИЯ — запускается из app.py
 # ============================================================
 
-def run_analytics(input_path: str, output_path: str, log=print, manager_plan: dict = None):
+def run_analytics(input_path: str, output_path: str, log=print,
+                  manager_plan: dict = None, date_by: str = 'order'):
     """
     Запускает полный цикл аналитики.
     input_path   — путь к входному .xlsx
     output_path  — путь к выходному .xlsx
     log          — функция для вывода сообщений (print или GUI-лог)
     manager_plan — dict {имя_менеджера: план_руб} или None
+    date_by      — 'order' (дата заказа, по умолчанию) или 'payment' (дата оплаты)
+
+    Возвращает: dict с ключами:
+        'output_path'       — путь к созданному файлу
+        'crm_total'         — итог CRM, тыс. руб.
+        'crm_paydate_total' — итог CRM по дате оплаты, тыс. руб.
+        'external_total'    — внешние доходы, тыс. руб.
+        'grand_total'       — CRM + внешние, тыс. руб. (по выбранной дате)
+        'verified_total'    — верифицированная цель, тыс. руб.
+        'deviation_pct'     — процент отклонения от верифицированной цели
     """
 
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Файл не найден: {input_path}")
+
+    # ── 0. Загрузка verified_figures.json (или fallback на константы) ──
+    verified = None
+    vf_candidates = [
+        os.path.join(os.path.dirname(input_path), VERIFIED_FIGURES_JSON),
+        VERIFIED_FIGURES_JSON,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), VERIFIED_FIGURES_JSON),
+    ]
+    for vf_path in vf_candidates:
+        if os.path.exists(vf_path):
+            verified = load_verified_figures(vf_path)
+            if verified:
+                log(f"Верифицированные цифры подгружены из {os.path.basename(vf_path)}")
+                break
+
+    if verified:
+        vf_total_with_prog = verified.get('total_with_prog', VERIFIED_TOTAL_WITH_PROG)
+        vf_total_no_prog   = verified.get('total_with_barter_no_prog', VERIFIED_TOTAL_WITH_BARTER_NO_PROG)
+        vf_ads_no_events   = verified.get('advertising_no_events', VERIFIED_ADVERTISING_NO_EVENTS)
+        ext_prog_total     = verified.get('programmatic_external', EXTERNAL_PROGRAMMATIC_TOTAL)
+        ext_other_total    = verified.get('other_external_income', EXTERNAL_OTHER_INCOME)
+    else:
+        log("⚠ verified_figures.json не найден — использую константы из analytics.py")
+        vf_total_with_prog = VERIFIED_TOTAL_WITH_PROG
+        vf_total_no_prog   = VERIFIED_TOTAL_WITH_BARTER_NO_PROG
+        vf_ads_no_events   = VERIFIED_ADVERTISING_NO_EVENTS
+        ext_prog_total     = EXTERNAL_PROGRAMMATIC_TOTAL
+        ext_other_total    = EXTERNAL_OTHER_INCOME
 
     # ── 1. Загрузка ──────────────────────────────────────────
     log("Загрузка файла...")
@@ -633,6 +723,26 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
     df_full['ОТРАСЛЬ_КЛИЕНТА'] = df_full.apply(pick_industry, axis=1)
     df_full['ОТРАСЛЬ_КЛИЕНТА_НОРМ'] = df_full.apply(classify_industry, axis=1)
 
+    # ── 7.5. Парсинг даты оплаты ─────────────────────────────
+    # Колонка "ДатаСуммаОплаты_" имеет формат "25.02.2025 135000"
+    # Используется как опциональный источник месячной разбивки (бьётся с бухгалтерией)
+    if 'ДатаСуммаОплаты_' in df_full.columns:
+        import re as _re
+        _date_pat = _re.compile(r'(\d{2}\.\d{2}\.\d{4})')
+        def _parse_paydate(s):
+            if pd.isna(s):
+                return None
+            m = _date_pat.match(str(s).strip())
+            if m:
+                try:
+                    return pd.to_datetime(m.group(1), format='%d.%m.%Y')
+                except Exception:
+                    return None
+            return None
+        df_full['Дата_оплаты'] = df_full['ДатаСуммаОплаты_'].apply(_parse_paydate)
+    else:
+        df_full['Дата_оплаты'] = pd.NaT
+
     # ── 8. Категории выручки и скидок ────────────────────────
     df_full['Категория выручки'] = df_full[revenue_col].apply(categorize_revenue_amount)
 
@@ -668,6 +778,22 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
     else:
         mask_no_prog = pd.Series(True, index=df_full.index)
 
+    # ── 9.5. Загрузка внешних доходов (для agregates по периодам) ──
+    # Эти цифры добавляются к CRM-выручке в month/quarter/season статистике,
+    # чтобы итоги совпадали с бухгалтерией. Клиенты/менеджеры/отрасли не трогаем.
+    ext_monthly = None
+    json_candidates = [
+        os.path.join(os.path.dirname(input_path), EXTERNAL_INCOME_JSON),
+        EXTERNAL_INCOME_JSON,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), EXTERNAL_INCOME_JSON),
+    ]
+    for json_path in json_candidates:
+        if os.path.exists(json_path):
+            ext_monthly = get_external_monthly_totals(json_path)
+            if ext_monthly:
+                log(f"Внешние доходы подгружены: {sum(ext_monthly.values())/1000:,.0f} тыс. руб.")
+            break
+
     # ── 10. Месячная статистика ──────────────────────────────
     monthly_stats = None
     if COL_MONTH in df_full.columns:
@@ -691,6 +817,39 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
         monthly_stats['Средний чек, руб.'] = monthly_mean
         monthly_stats['Сумма выручки, тыс. руб.'] = monthly_stats['Сумма выручки, руб.'] / 1000
         monthly_stats = monthly_stats.reset_index().rename(columns={'Дата_месяц': 'Период'})
+
+        # ── Выручка по дате оплаты (для сверки с бухгалтерией) ──
+        if df_full['Дата_оплаты'].notna().any():
+            paydate_sums = (
+                df_full.dropna(subset=['Дата_оплаты'])
+                .groupby(df_full['Дата_оплаты'].dt.strftime('%m.%Y'))[revenue_col]
+                .sum() / 1000
+            ).round(2).to_dict()
+            monthly_stats['Выручка по дате оплаты, тыс. руб.'] = (
+                monthly_stats['Период'].map(paydate_sums).fillna(0).round(2)
+            )
+
+        # Добавляем колонки с внешними доходами, если JSON есть
+        if ext_monthly is not None:
+            def get_ext(period):
+                # period формат '07.2025' → ключ '07'
+                try:
+                    m = str(period).split('.')[0].zfill(2)
+                    return ext_monthly.get(m, 0) / 1000  # в тыс. руб.
+                except Exception:
+                    return 0
+
+            monthly_stats['Внешние доходы, тыс. руб.'] = (
+                monthly_stats['Период'].apply(get_ext).round(2)
+            )
+            monthly_stats['Итого с внешними, тыс. руб.'] = (
+                monthly_stats['Сумма выручки, тыс. руб.'] + monthly_stats['Внешние доходы, тыс. руб.']
+            ).round(2)
+            # Итог по дате оплаты + внешние (если колонка есть)
+            if 'Выручка по дате оплаты, тыс. руб.' in monthly_stats.columns:
+                monthly_stats['Итого по оплате + внешние, тыс. руб.'] = (
+                    monthly_stats['Выручка по дате оплаты, тыс. руб.'] + monthly_stats['Внешние доходы, тыс. руб.']
+                ).round(2)
 
     # ── 11. Топ клиентов ─────────────────────────────────────
     log("Считаю топ клиентов...")
@@ -783,15 +942,15 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
         ('Итого CRM, тыс. руб.', round(crm_total / 1000, 2)),
         ('═══ Бухгалтерия (внешние цифры) ═══', ''),
         ('Программатик полный (вне CRM), тыс. руб.',
-            round((EXTERNAL_PROGRAMMATIC_TOTAL or 0) / 1000, 2) if EXTERNAL_PROGRAMMATIC_TOTAL else '—'),
+            round(ext_prog_total / 1000, 2) if ext_prog_total else '—'),
         ('Прочие доходы (ИРИ/гранты/47 закупка), тыс. руб.',
-            round((EXTERNAL_OTHER_INCOME or 0) / 1000, 2) if EXTERNAL_OTHER_INCOME else '—'),
+            round(ext_other_total / 1000, 2) if ext_other_total else '—'),
         ('Итого с программатиком + бартер (верифицировано), тыс. руб.',
-            round((VERIFIED_TOTAL_WITH_PROG or 0) / 1000, 2) if VERIFIED_TOTAL_WITH_PROG else '—'),
+            round(vf_total_with_prog / 1000, 2) if vf_total_with_prog else '—'),
         ('Итого с бартером без программатика (верифицировано), тыс. руб.',
-            round((VERIFIED_TOTAL_WITH_BARTER_NO_PROG or 0) / 1000, 2) if VERIFIED_TOTAL_WITH_BARTER_NO_PROG else '—'),
+            round(vf_total_no_prog / 1000, 2) if vf_total_no_prog else '—'),
         ('Рекламная без мероприятий (верифицировано), тыс. руб.',
-            round((VERIFIED_ADVERTISING_NO_EVENTS or 0) / 1000, 2) if VERIFIED_ADVERTISING_NO_EVENTS else '—'),
+            round(vf_ads_no_events / 1000, 2) if vf_ads_no_events else '—'),
     ]
     group_summary_df = pd.DataFrame(group_summary_rows, columns=['Показатель', 'Значение'])
 
@@ -829,6 +988,40 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
         avg_q = quarterly_stats['Выручка, тыс. руб.'].mean()
         quarterly_stats['Коэф. сезонности'] = (quarterly_stats['Выручка, тыс. руб.'] / avg_q).round(2)
         quarterly_stats = quarterly_stats.reset_index()
+
+        # ── Добавляем внешние доходы по кварталам и сезонам ──
+        if ext_monthly is not None:
+            month_to_quarter = {
+                '01': 1, '02': 1, '03': 1,
+                '04': 2, '05': 2, '06': 2,
+                '07': 3, '08': 3, '09': 3,
+                '10': 4, '11': 4, '12': 4,
+            }
+            month_to_season = {
+                '12': 'Зима', '01': 'Зима', '02': 'Зима',
+                '03': 'Весна', '04': 'Весна', '05': 'Весна',
+                '06': 'Лето', '07': 'Лето', '08': 'Лето',
+                '09': 'Осень', '10': 'Осень', '11': 'Осень',
+            }
+            ext_by_quarter = {1: 0, 2: 0, 3: 0, 4: 0}
+            ext_by_season = {'Зима': 0, 'Весна': 0, 'Лето': 0, 'Осень': 0}
+            for m, v in ext_monthly.items():
+                ext_by_quarter[month_to_quarter[m]] += v / 1000
+                ext_by_season[month_to_season[m]] += v / 1000
+
+            quarterly_stats['Внешние доходы, тыс. руб.'] = (
+                quarterly_stats['Квартал'].map(ext_by_quarter).round(2)
+            )
+            quarterly_stats['Итого с внешними, тыс. руб.'] = (
+                quarterly_stats['Выручка, тыс. руб.'] + quarterly_stats['Внешние доходы, тыс. руб.']
+            ).round(2)
+
+            seasonal_stats['Внешние доходы, тыс. руб.'] = (
+                seasonal_stats['Сезон'].map(ext_by_season).round(2)
+            )
+            seasonal_stats['Итого с внешними, тыс. руб.'] = (
+                seasonal_stats['Выручка, тыс. руб.'] + seasonal_stats['Внешние доходы, тыс. руб.']
+            ).round(2)
 
     # ── 15. RFM-анализ ───────────────────────────────────────
     rfm_all = rfm_segment_extended = rfm_non_top = None
@@ -944,12 +1137,12 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
         ('Выручка: CRM рекламная без мероприятий, тыс. руб.', round(rev_reklama, 2)),
         ('— Верифицированные (из бухгалтерии) —', ''),
     ]
-    if VERIFIED_TOTAL_WITH_PROG is not None:
-        summary_rows.append(('Верифицированная: всего с программатиком, тыс. руб.', round(VERIFIED_TOTAL_WITH_PROG / 1000, 2)))
-    if VERIFIED_TOTAL_WITH_BARTER_NO_PROG is not None:
-        summary_rows.append(('Верифицированная: с бартером без программатика, тыс. руб.', round(VERIFIED_TOTAL_WITH_BARTER_NO_PROG / 1000, 2)))
-    if VERIFIED_ADVERTISING_NO_EVENTS is not None:
-        summary_rows.append(('Верифицированная: рекламная без мероприятий, тыс. руб.', round(VERIFIED_ADVERTISING_NO_EVENTS / 1000, 2)))
+    if vf_total_with_prog:
+        summary_rows.append(('Верифицированная: всего с программатиком, тыс. руб.', round(vf_total_with_prog / 1000, 2)))
+    if vf_total_no_prog:
+        summary_rows.append(('Верифицированная: с бартером без программатика, тыс. руб.', round(vf_total_no_prog / 1000, 2)))
+    if vf_ads_no_events:
+        summary_rows.append(('Верифицированная: рекламная без мероприятий, тыс. руб.', round(vf_ads_no_events / 1000, 2)))
 
     summary_rows.extend([
         ('— Прочее —', ''),
@@ -1307,4 +1500,43 @@ def run_analytics(input_path: str, output_path: str, log=print, manager_plan: di
         log(f"⚠ Графики не добавлены: {e}")
 
     log(f"✅ Готово! Отчёт сохранён: {output_path}")
-    return output_path
+
+    # ── Сводка расхождения для GUI ───────────────────────────
+    crm_total_k       = df_full[revenue_col].sum() / 1000
+    crm_paydate_total_k = (
+        df_full.dropna(subset=['Дата_оплаты'])[revenue_col].sum() / 1000
+        if df_full['Дата_оплаты'].notna().any() else 0
+    )
+    external_total_k  = sum(ext_monthly.values()) / 1000 if ext_monthly else 0
+
+    # Главный итог — по выбранной дате + внешние
+    if date_by == 'payment' and crm_paydate_total_k > 0:
+        grand_total_k = crm_paydate_total_k + external_total_k
+    else:
+        grand_total_k = crm_total_k + external_total_k
+
+    verified_total_k = vf_total_with_prog / 1000 if vf_total_with_prog else 0
+    deviation_pct = (
+        (grand_total_k / verified_total_k - 1) * 100
+        if verified_total_k > 0 else None
+    )
+
+    report_info = {
+        'output_path':        output_path,
+        'crm_total':          round(crm_total_k, 2),
+        'crm_paydate_total':  round(crm_paydate_total_k, 2),
+        'external_total':     round(external_total_k, 2),
+        'grand_total':        round(grand_total_k, 2),
+        'verified_total':     round(verified_total_k, 2),
+        'deviation_pct':      round(deviation_pct, 2) if deviation_pct is not None else None,
+        'date_by':            date_by,
+    }
+
+    crm_used_k = crm_paydate_total_k if (date_by == 'payment' and crm_paydate_total_k > 0) else crm_total_k
+    date_label = "по дате оплаты" if (date_by == 'payment' and crm_paydate_total_k > 0) else "по дате заказа"
+    log(f"📊 CRM ({date_label}): {crm_used_k:,.0f} тыс. | Внешние: {external_total_k:,.0f} тыс.")
+    log(f"📊 Итого: {grand_total_k:,.0f} тыс. | Цель: {verified_total_k:,.0f} тыс. | "
+        f"Отклонение: {deviation_pct:+.2f}%" if deviation_pct is not None
+        else f"📊 Итого: {grand_total_k:,.0f} тыс.")
+
+    return report_info
