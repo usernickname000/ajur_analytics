@@ -380,7 +380,30 @@ def get_external_monthly_totals(external_json_path):
                 monthly_total[m] += v
 
     return monthly_total
+def get_full_external_total(external_json_path):
+    """
+    Суммирует ВСЕ не-служебные строки external_income.json (включая не-программатик:
+    бартер, ФФ/АМ, ИРИ, рек. системы и т.д.). Используется для сверки с бухгалтерией.
+    Возвращает итог в рублях. Отрицательные значения (Корректировка скидки) учитываются.
+    """
+    if not os.path.exists(external_json_path):
+        return 0.0
+    try:
+        with open(external_json_path, 'r', encoding='utf-8') as f:
+            ext = json.load(f)
+    except Exception:
+        return 0.0
 
+    months = [f"{m:02d}" for m in range(1, 13)]
+    total = 0.0
+    for key, val in ext.items():
+        if key.startswith('_') or not isinstance(val, dict):
+            continue
+        for m in months:
+            v = val.get(m, 0) or 0
+            if isinstance(v, (int, float)):
+                total += v
+    return total
 
 def parse_month(s):
     try:
@@ -415,12 +438,19 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
         return None
 
     # Месяцы: 01..12 как строки
-    months = [f"{m:02d}" for m in range(1, 13)]
-    month_labels = {f"{m:02d}": f"{m:02d}.2025" for m in range(1, 13)}
+    analysis_year = int(ext.get('_год', 2025))
+    month_labels = {f"{m:02d}": f"{m:02d}.{analysis_year}" for m in range(1, 13)}
 
     # Помесячная выручка CRM по проектам (в тыс. руб.)
     df_full = df_full.copy()
-    df_full['_month_num'] = df_full.get(COL_MONTH, '').astype(str).str.strip().str.split('.').str[0].str.zfill(2)
+    if COL_MONTH in df_full.columns:
+        _ms = df_full[COL_MONTH].astype(str).str.strip()
+        df_full['_month_num'] = _ms.str.split('.').str[0].str.zfill(2)
+        _yr = pd.to_numeric(_ms.str.split('.').str[1], errors='coerce').fillna(0).astype(int)
+        df_full['_year_num'] = _yr.apply(lambda y: (2000 + y) if (0 < y < 100) else y)
+    else:
+        df_full['_month_num'] = '00'
+        df_full['_year_num'] = 0
 
     # Строим таблицу
     rows = []
@@ -435,9 +465,10 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
 
             # 1. CRM-часть
             if crm_projects:
-                mask = (
+                 mask = (
                     df_full[COL_PROJECT].isin(crm_projects) &
-                    (df_full['_month_num'] == m)
+                    (df_full['_month_num'] == m) &
+                    (df_full['_year_num'] == analysis_year)
                 )
                 val += df_full.loc[mask, revenue_col].sum() / 1000  # в тыс. руб.
 
@@ -782,6 +813,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # Эти цифры добавляются к CRM-выручке в month/quarter/season статистике,
     # чтобы итоги совпадали с бухгалтерией. Клиенты/менеджеры/отрасли не трогаем.
     ext_monthly = None
+    _ext_json_found = None
     json_candidates = [
         os.path.join(os.path.dirname(input_path), EXTERNAL_INCOME_JSON),
         EXTERNAL_INCOME_JSON,
@@ -789,10 +821,14 @@ def run_analytics(input_path: str, output_path: str, log=print,
     ]
     for json_path in json_candidates:
         if os.path.exists(json_path):
-            ext_monthly = get_external_monthly_totals(json_path)
+                        ext_monthly = get_external_monthly_totals(json_path)
+            _ext_json_found = json_path
             if ext_monthly:
                 log(f"Внешние доходы подгружены: {sum(ext_monthly.values())/1000:,.0f} тыс. руб.")
             break
+
+    # Полный итог всех внешних статей (для сверки с бухгалтерией)
+    full_external_k = get_full_external_total(_ext_json_found) / 1000 if _ext_json_found else 0.0
 
     # ── 10. Месячная статистика ──────────────────────────────
     monthly_stats = None
@@ -1509,12 +1545,12 @@ def run_analytics(input_path: str, output_path: str, log=print,
     )
     external_total_k  = sum(ext_monthly.values()) / 1000 if ext_monthly else 0
 
-    # Главный итог — по выбранной дате + внешние
+    # Для сверки с бухгалтерией: CRM + ВСЕ внешние статьи (программатик + бартер + ФФ/АМ + ИРИ + ...)
     if date_by == 'payment' and crm_paydate_total_k > 0:
-        grand_total_k = crm_paydate_total_k + external_total_k
+        grand_total_k = crm_paydate_total_k + full_external_k
     else:
-        grand_total_k = crm_total_k + external_total_k
-
+        grand_total_k = crm_total_k + full_external_k
+        
     verified_total_k = vf_total_with_prog / 1000 if vf_total_with_prog else 0
     deviation_pct = (
         (grand_total_k / verified_total_k - 1) * 100
