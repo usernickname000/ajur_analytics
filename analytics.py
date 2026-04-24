@@ -297,7 +297,6 @@ def classify_industry(row):
 
     return row.get('ОТРАСЛЬ_КЛИЕНТА', '')
 
-
 def categorize_revenue_amount(v):
     if pd.isna(v):
         return 'Нет данных'
@@ -380,6 +379,8 @@ def get_external_monthly_totals(external_json_path):
                 monthly_total[m] += v
 
     return monthly_total
+
+
 def get_full_external_total(external_json_path):
     """
     Суммирует ВСЕ не-служебные строки external_income.json (включая не-программатик:
@@ -404,6 +405,7 @@ def get_full_external_total(external_json_path):
             if isinstance(v, (int, float)):
                 total += v
     return total
+
 
 def parse_month(s):
     try:
@@ -438,6 +440,7 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
         return None
 
     # Месяцы: 01..12 как строки
+    months = [f"{m:02d}" for m in range(1, 13)]
     analysis_year = int(ext.get('_год', 2025))
     month_labels = {f"{m:02d}": f"{m:02d}.{analysis_year}" for m in range(1, 13)}
 
@@ -446,6 +449,7 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
     if COL_MONTH in df_full.columns:
         _ms = df_full[COL_MONTH].astype(str).str.strip()
         df_full['_month_num'] = _ms.str.split('.').str[0].str.zfill(2)
+        # Год: формат 'MM.YY' или 'MM.YYYY'
         _yr = pd.to_numeric(_ms.str.split('.').str[1], errors='coerce').fillna(0).astype(int)
         df_full['_year_num'] = _yr.apply(lambda y: (2000 + y) if (0 < y < 100) else y)
     else:
@@ -463,9 +467,9 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
         for m in months:
             val = 0.0
 
-            # 1. CRM-часть
+            # 1. CRM-часть (только нужный год, чтобы не суммировать несколько лет)
             if crm_projects:
-                 mask = (
+                mask = (
                     df_full[COL_PROJECT].isin(crm_projects) &
                     (df_full['_month_num'] == m) &
                     (df_full['_year_num'] == analysis_year)
@@ -593,6 +597,7 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
                 **kpi_row,
                 'Total': kpi_total,
             })
+
 
     # Собираем DataFrame
     columns = ['Показатель'] + [month_labels[m] for m in months] + ['Total']
@@ -821,7 +826,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     ]
     for json_path in json_candidates:
         if os.path.exists(json_path):
-                        ext_monthly = get_external_monthly_totals(json_path)
+            ext_monthly = get_external_monthly_totals(json_path)
             _ext_json_found = json_path
             if ext_monthly:
                 log(f"Внешние доходы подгружены: {sum(ext_monthly.values())/1000:,.0f} тыс. руб.")
@@ -1192,7 +1197,9 @@ def run_analytics(input_path: str, output_path: str, log=print,
     summary_df = pd.DataFrame(summary_rows, columns=['Метрика', 'Значение'])
 
     df_raw_for_compare = df_raw.copy()
-    if COL_MONTH in df_raw_for_compare.columns:
+    if COL_MONTH in df_raw_for_compare.columns:    
+
+
         df_raw_for_compare = df_raw_for_compare.loc[
             ~df_raw_for_compare[COL_MONTH].astype(str).str.strip().str.lower()
             .isin(['итого', 'nan', 'none'])
@@ -1543,14 +1550,16 @@ def run_analytics(input_path: str, output_path: str, log=print,
         df_full.dropna(subset=['Дата_оплаты'])[revenue_col].sum() / 1000
         if df_full['Дата_оплаты'].notna().any() else 0
     )
-    external_total_k  = sum(ext_monthly.values()) / 1000 if ext_monthly else 0
+    # external_total_k — только программатик (используется в колонках месячной аналитики)
+    external_total_k = sum(ext_monthly.values()) / 1000 if ext_monthly else 0
 
     # Для сверки с бухгалтерией: CRM + ВСЕ внешние статьи (программатик + бартер + ФФ/АМ + ИРИ + ...)
+    # full_external_k вычислен ранее из get_full_external_total()
     if date_by == 'payment' and crm_paydate_total_k > 0:
         grand_total_k = crm_paydate_total_k + full_external_k
     else:
         grand_total_k = crm_total_k + full_external_k
-        
+
     verified_total_k = vf_total_with_prog / 1000 if vf_total_with_prog else 0
     deviation_pct = (
         (grand_total_k / verified_total_k - 1) * 100
@@ -1558,20 +1567,24 @@ def run_analytics(input_path: str, output_path: str, log=print,
     )
 
     report_info = {
-        'output_path':        output_path,
-        'crm_total':          round(crm_total_k, 2),
-        'crm_paydate_total':  round(crm_paydate_total_k, 2),
-        'external_total':     round(external_total_k, 2),
-        'grand_total':        round(grand_total_k, 2),
-        'verified_total':     round(verified_total_k, 2),
-        'deviation_pct':      round(deviation_pct, 2) if deviation_pct is not None else None,
-        'date_by':            date_by,
+        'output_path':           output_path,
+        'crm_total':             round(crm_total_k, 2),
+        'crm_paydate_total':     round(crm_paydate_total_k, 2),
+        'external_total':        round(external_total_k, 2),
+        'full_external_total':   round(full_external_k, 2),
+        'grand_total':           round(grand_total_k, 2),
+        'verified_total':        round(verified_total_k, 2),
+        'deviation_pct':         round(deviation_pct, 2) if deviation_pct is not None else None,
+        'date_by':               date_by,
     }
 
     crm_used_k = crm_paydate_total_k if (date_by == 'payment' and crm_paydate_total_k > 0) else crm_total_k
     date_label = "по дате оплаты" if (date_by == 'payment' and crm_paydate_total_k > 0) else "по дате заказа"
-    log(f"📊 CRM ({date_label}): {crm_used_k:,.0f} тыс. | Внешние: {external_total_k:,.0f} тыс.")
-    log(f"📊 Итого: {grand_total_k:,.0f} тыс. | Цель: {verified_total_k:,.0f} тыс. | "
+    log(f"📊 CRM ({date_label}): {crm_used_k:,.0f} тыс. | "
+        f"Внешние (прогр.): {external_total_k:,.0f} тыс. | "
+        f"Все внешние: {full_external_k:,.0f} тыс.")
+    log(f"📊 Итого (CRM + все внешние): {grand_total_k:,.0f} тыс. | "
+        f"Цель: {verified_total_k:,.0f} тыс. | "
         f"Отклонение: {deviation_pct:+.2f}%" if deviation_pct is not None
         else f"📊 Итого: {grand_total_k:,.0f} тыс.")
 
