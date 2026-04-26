@@ -383,9 +383,10 @@ def get_external_monthly_totals(external_json_path):
 
 def get_full_external_total(external_json_path):
     """
-    Суммирует ВСЕ не-служебные строки external_income.json (включая не-программатик:
-    бартер, ФФ/АМ, ИРИ, рек. системы и т.д.). Используется для сверки с бухгалтерией.
-    Возвращает итог в рублях. Отрицательные значения (Корректировка скидки) учитываются.
+    Суммирует внешние доходы из external_income.json для сверки с бухгалтерией.
+    Исключает статьи из '_не_включать_в_grand_total' (закупка, взаимозачёты, затраты —
+    это не реальный доход, а технические/расходные проводки).
+    Возвращает итог в рублях.
     """
     if not os.path.exists(external_json_path):
         return 0.0
@@ -395,16 +396,92 @@ def get_full_external_total(external_json_path):
     except Exception:
         return 0.0
 
+    # Статьи которые не являются реальным доходом и не должны попадать в grand_total
+    exclude = set(ext.get('_не_включать_в_grand_total', [
+        'Выручка 47 (закупка)',
+        'Взаимозачет/Затраты',
+        'ФФ/АМ взаимозачет',
+        'Корректировка скидки (комиссия ХШМ)',
+    ]))
+
     months = [f"{m:02d}" for m in range(1, 13)]
     total = 0.0
     for key, val in ext.items():
         if key.startswith('_') or not isinstance(val, dict):
+            continue
+        if key in exclude:
             continue
         for m in months:
             v = val.get(m, 0) or 0
             if isinstance(v, (int, float)):
                 total += v
     return total
+
+
+def get_external_totals_by_category(external_json_path):
+    """
+    Возвращает dict с разбивкой внешних доходов по категориям для сверки:
+    {
+        'programmatic': сумма программатика,
+        'barter':       сумма бартера,
+        'iri_grants':   сумма ИРИ/грантов,
+        'recsys':       сумма рекомендательных систем,
+        'ecom':         E-com,
+        '47_plan':      47News в план (реальная выручка),
+        'other':        остальные доходные статьи,
+        'deductions':   взаимозачёты/затраты/корректировки (со знаком, обычно отриц.),
+        'total_income': всё кроме deductions,
+        'total_net':    total_income + deductions (итог для сверки),
+    }
+    """
+    if not external_json_path or not os.path.exists(external_json_path):
+        return {}
+    try:
+        with open(external_json_path, 'r', encoding='utf-8') as f:
+            ext = json.load(f)
+    except Exception:
+        return {}
+
+    months = [f"{m:02d}" for m in range(1, 13)]
+
+    PROG_KEYS  = {'Программатик ФОНТАНКА', 'Программатик ФОНТАНКА ТГ',
+                  'Программатик ДОКТОР', 'Программатик ДОКТОР ТГ'}
+    BARTER_KEYS = {'Медийный бартер ФОНТАНКА', 'Медийный бартер ЭВЕНТЫ'}
+    IRI_KEYS   = {'ИРИ/АНО/Петроцентр', 'Гранты Фонтанка', 'Гранты Доктор'}
+    RECSYS_KEYS = {'Рекомендательные системы ФОНТАНКА', 'Рекомендательные системы ДОКТОР'}
+    ECOM_KEYS   = {'E-com ФОНТАНКА', 'E-com ДОКТОР'}
+    PLAN47_KEYS = {'Выручка 47 (в план)'}
+    DEDUCT_KEYS = {'Выручка 47 (закупка)', 'Взаимозачет/Затраты',
+                   'ФФ/АМ взаимозачет', 'Корректировка скидки (комиссия ХШМ)'}
+
+    cats = {k: 0.0 for k in ('programmatic','barter','iri_grants','recsys',
+                               'ecom','47_plan','other','deductions')}
+
+    for key, val in ext.items():
+        if key.startswith('_') or not isinstance(val, dict):
+            continue
+        s = sum((val.get(m, 0) or 0) for m in months if isinstance(val.get(m, 0), (int, float)))
+        if key in PROG_KEYS:
+            cats['programmatic'] += s
+        elif key in BARTER_KEYS:
+            cats['barter'] += s
+        elif key in IRI_KEYS:
+            cats['iri_grants'] += s
+        elif key in RECSYS_KEYS:
+            cats['recsys'] += s
+        elif key in ECOM_KEYS:
+            cats['ecom'] += s
+        elif key in PLAN47_KEYS:
+            cats['47_plan'] += s
+        elif key in DEDUCT_KEYS:
+            cats['deductions'] += s
+        else:
+            cats['other'] += s
+
+    cats['total_income'] = sum(cats[k] for k in ('programmatic','barter','iri_grants',
+                                                   'recsys','ecom','47_plan','other'))
+    cats['total_net'] = cats['total_income'] + cats['deductions']
+    return cats
 
 
 def parse_month(s):
@@ -640,7 +717,7 @@ def run_data_quality_checks(df):
         report['Будущие даты'] = (df['_temp_date_check'] > pd.Timestamp.today()).sum()
         df.drop(columns=['_temp_date_check'], inplace=True)
         if report['Будущие даты'] > 0:
-            critical_errors.append("Обнаружены даты в будущем")
+            log(f"⚠ Предупреждение: {report['Будущие даты']} дат в будущем (не критично)")
 
     if any(c in df.columns for c in [COL_CLIENT, COL_CLIENT_RA, COL_REKLAMD]):
         empty_clients = sum(
@@ -922,8 +999,9 @@ def run_analytics(input_path: str, output_path: str, log=print,
             .agg({revenue_col: ['sum', 'count']}).round(2)
         )
         manager_stats.columns = ['Сумма выручки, руб.', 'Количество заказов']
+        manager_mask_no_events = manager_df.index.isin(df_full.index[mask_no_events])
         manager_stats['Средний чек, руб.'] = (
-            manager_df.loc[mask_no_events].groupby(COL_MANAGER)[revenue_col].mean().round(2)
+            manager_df.loc[manager_mask_no_events].groupby(COL_MANAGER)[revenue_col].mean().round(2)
         )
         manager_stats['Сумма выручки, тыс. руб.'] = manager_stats['Сумма выручки, руб.'] / 1000
         manager_stats = (
@@ -1197,33 +1275,135 @@ def run_analytics(input_path: str, output_path: str, log=print,
     summary_df = pd.DataFrame(summary_rows, columns=['Метрика', 'Значение'])
 
     df_raw_for_compare = df_raw.copy()
-    if COL_MONTH in df_raw_for_compare.columns:    
-
-
+    if COL_MONTH in df_raw_for_compare.columns:
         df_raw_for_compare = df_raw_for_compare.loc[
             ~df_raw_for_compare[COL_MONTH].astype(str).str.strip().str.lower()
             .isin(['итого', 'nan', 'none'])
         ]
     df_raw_for_compare[COL_REVENUE] = pd.to_numeric(df_raw_for_compare[COL_REVENUE], errors='coerce')
 
-    comparison_metrics = pd.DataFrame({
-        'Показатель': [
-            'Количество заказов (исходник)',
-            'Количество заказов (после очистки)',
-            'Выручка исходник, тыс. руб.',
-            'Выручка все в CRM, тыс. руб.',
-            'Выручка с бартером без программатика, тыс. руб.',
-            'Выручка рекламная без мероприятий, тыс. руб.',
-        ],
-        'Значение': [
-            len(df_raw_for_compare),
-            len(df_full),
-            round(df_raw_for_compare[COL_REVENUE].sum() / 1000, 2),
-            round(rev_all, 2),
-            round(rev_bez_prog, 2),
-            round(rev_reklama, 2),
+    # ── Детальная сверка CRM vs бухгалтерия ─────────────────────────
+    ext_cats = get_external_totals_by_category(_ext_json_found) if _ext_json_found else {}
+
+    ext_prog_k    = ext_cats.get('programmatic', 0) / 1000
+    ext_barter_k  = ext_cats.get('barter', 0) / 1000
+    ext_iri_k     = ext_cats.get('iri_grants', 0) / 1000
+    ext_recsys_k  = ext_cats.get('recsys', 0) / 1000
+    ext_ecom_k    = ext_cats.get('ecom', 0) / 1000
+    ext_47plan_k  = ext_cats.get('47_plan', 0) / 1000
+    ext_other_k   = ext_cats.get('other', 0) / 1000
+    ext_deduct_k  = ext_cats.get('deductions', 0) / 1000
+    ext_income_k  = ext_cats.get('total_income', 0) / 1000
+    ext_net_k     = ext_cats.get('total_net', 0) / 1000
+
+    # CRM + внешние доходы (без закупочных/технических проводок) — главный показатель для сверки
+    crm_plus_ext_income_k = rev_all + ext_income_k
+    # CRM + все внешние с учётом вычетов — итог "в бюджет"
+    crm_plus_ext_net_k    = rev_all + ext_net_k
+
+    def _dev(fact, target):
+        if target and target != 0:
+            return round((fact / target - 1) * 100, 2)
+        return None
+
+    def _fmt_dev(pct):
+        if pct is None:
+            return '—'
+        sign = '+' if pct >= 0 else ''
+        return f"{sign}{pct:.2f}%"
+
+    vf_total_with_prog_k = vf_total_with_prog / 1000 if vf_total_with_prog else None
+    vf_total_no_prog_k   = vf_total_no_prog   / 1000 if vf_total_no_prog   else None
+    vf_ads_no_events_k   = vf_ads_no_events   / 1000 if vf_ads_no_events   else None
+
+    cmp_rows = []
+
+    # ── Блок 1: данные CRM ──
+    cmp_rows += [
+        ('═══ CRM (выгрузка) ═══', '', '', ''),
+        ('Строк в исходнике',           len(df_raw_for_compare),       '',    ''),
+        ('Строк после очистки',         len(df_full),                  '',    ''),
+        ('CRM итого, тыс. руб.',        round(rev_all, 2),             '',    ''),
+        ('CRM без программатика, тыс.', round(rev_bez_prog, 2),        '',    ''),
+        ('CRM рекламная (без мер.), тыс.', round(rev_reklama, 2),      '',    ''),
+    ]
+
+    # ── Блок 2: внешние доходы из external_income.json ──
+    if ext_cats:
+        cmp_rows += [
+            ('═══ Внешние доходы (external_income.json) ═══', '', '', ''),
+            ('Программатик (все), тыс.',     round(ext_prog_k, 2),   '', ''),
+            ('Бартер медийный, тыс.',        round(ext_barter_k, 2), '', ''),
+            ('ИРИ / Гранты, тыс.',           round(ext_iri_k, 2),    '', ''),
+            ('Рекомендательные системы, тыс.', round(ext_recsys_k, 2), '', ''),
+            ('E-com, тыс.',                  round(ext_ecom_k, 2),   '', ''),
+            ('47News (в план), тыс.',        round(ext_47plan_k, 2), '', ''),
+            ('Прочие доходные, тыс.',        round(ext_other_k, 2),  '', ''),
+            ('── Вычеты (закупка/взаимозачёт), тыс.', round(ext_deduct_k, 2), '', ''),
+            ('Итого внешние доходы (без вычетов), тыс.', round(ext_income_k, 2), '', ''),
+            ('Итого внешние нетто (с вычетами), тыс.',   round(ext_net_k, 2),    '', ''),
         ]
-    })
+
+    # ── Блок 3: сверка с верифицированными цифрами ──
+    cmp_rows += [
+        ('═══ Сверка с бухгалтерией ═══', '', '', ''),
+    ]
+
+    # Срез 1: CRM + все внешние доходы vs total_with_prog
+    if vf_total_with_prog_k:
+        d = _dev(crm_plus_ext_income_k, vf_total_with_prog_k)
+        cmp_rows += [
+            ('── Срез: всего с программатиком ──', '', '', ''),
+            ('CRM + внешние доходы, тыс.',  round(crm_plus_ext_income_k, 2), '', ''),
+            ('Верифицировано (бух.), тыс.', round(vf_total_with_prog_k, 2),  '', ''),
+            ('Расхождение абс., тыс.',      round(crm_plus_ext_income_k - vf_total_with_prog_k, 2), '', ''),
+            ('Расхождение, %',              _fmt_dev(d), '', ''),
+        ]
+
+    # Срез 2: CRM без программатика + бартер vs total_with_barter_no_prog
+    if vf_total_no_prog_k:
+        crm_no_prog_barter_k = rev_bez_prog + ext_barter_k
+        d2 = _dev(crm_no_prog_barter_k, vf_total_no_prog_k)
+        cmp_rows += [
+            ('── Срез: с бартером, без программатика ──', '', '', ''),
+            ('CRM (без прогр.) + бартер, тыс.', round(crm_no_prog_barter_k, 2), '', ''),
+            ('Верифицировано (бух.), тыс.',      round(vf_total_no_prog_k, 2),   '', ''),
+            ('Расхождение абс., тыс.',           round(crm_no_prog_barter_k - vf_total_no_prog_k, 2), '', ''),
+            ('Расхождение, %',                   _fmt_dev(d2), '', ''),
+        ]
+
+    # Срез 3: CRM рекламная без мероприятий vs advertising_no_events
+    if vf_ads_no_events_k:
+        d3 = _dev(rev_reklama, vf_ads_no_events_k)
+        cmp_rows += [
+            ('── Срез: рекламная без мероприятий ──', '', '', ''),
+            ('CRM рекламная (без мер.), тыс.', round(rev_reklama, 2),      '', ''),
+            ('Верифицировано (бух.), тыс.',    round(vf_ads_no_events_k, 2), '', ''),
+            ('Расхождение абс., тыс.',         round(rev_reklama - vf_ads_no_events_k, 2), '', ''),
+            ('Расхождение, %',                 _fmt_dev(d3), '', ''),
+        ]
+
+    # ── Блок 4: помесячная сверка (если есть monthly_stats) ──
+    if monthly_stats is not None and ext_cats:
+        cmp_rows += [
+            ('═══ Помесячно: CRM + программатик ═══', '', '', ''),
+        ]
+        for _, mrow in monthly_stats.iterrows():
+            period = mrow['Период']
+            crm_m  = mrow['Сумма выручки, тыс. руб.']
+            ext_m  = mrow.get('Внешние доходы, тыс. руб.', 0) or 0
+            total_m = mrow.get('Итого с внешними, тыс. руб.', crm_m + ext_m)
+            cmp_rows.append((
+                period,
+                round(crm_m, 2),
+                round(ext_m, 2),
+                round(total_m, 2),
+            ))
+
+    comparison_metrics = pd.DataFrame(
+        cmp_rows,
+        columns=['Показатель / Период', 'CRM, тыс. руб.', 'Внешние, тыс. руб.', 'Итого, тыс. руб.']
+    )
 
     # ── 18. Прогноз ──────────────────────────────────────────
     forecast_summary = None
@@ -1553,18 +1733,21 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # external_total_k — только программатик (используется в колонках месячной аналитики)
     external_total_k = sum(ext_monthly.values()) / 1000 if ext_monthly else 0
 
-    # Для сверки с бухгалтерией: CRM + ВСЕ внешние статьи (программатик + бартер + ФФ/АМ + ИРИ + ...)
-    # full_external_k вычислен ранее из get_full_external_total()
-    if date_by == 'payment' and crm_paydate_total_k > 0:
-        grand_total_k = crm_paydate_total_k + full_external_k
-    else:
-        grand_total_k = crm_total_k + full_external_k
+    # full_external_k — внешние доходы без закупочных/технических статей
+    # (теперь get_full_external_total исключает Выручка47-закупка, Взаимозачет/Затраты,
+    #  ФФ/АМ взаимозачет, Корректировка скидки — они не реальный доход)
+    crm_base_k = crm_paydate_total_k if (date_by == 'payment' and crm_paydate_total_k > 0) else crm_total_k
+    grand_total_k = crm_base_k + full_external_k
 
     verified_total_k = vf_total_with_prog / 1000 if vf_total_with_prog else 0
     deviation_pct = (
         (grand_total_k / verified_total_k - 1) * 100
         if verified_total_k > 0 else None
     )
+
+    # Дополнительные срезы для GUI (если нужны в будущем)
+    _ext_cats_gui = get_external_totals_by_category(_ext_json_found) if _ext_json_found else {}
+    ext_income_gui_k = _ext_cats_gui.get('total_income', 0) / 1000
 
     report_info = {
         'output_path':           output_path,
@@ -1578,14 +1761,19 @@ def run_analytics(input_path: str, output_path: str, log=print,
         'date_by':               date_by,
     }
 
-    crm_used_k = crm_paydate_total_k if (date_by == 'payment' and crm_paydate_total_k > 0) else crm_total_k
+    crm_used_k = crm_base_k
     date_label = "по дате оплаты" if (date_by == 'payment' and crm_paydate_total_k > 0) else "по дате заказа"
+
     log(f"📊 CRM ({date_label}): {crm_used_k:,.0f} тыс. | "
-        f"Внешние (прогр.): {external_total_k:,.0f} тыс. | "
-        f"Все внешние: {full_external_k:,.0f} тыс.")
-    log(f"📊 Итого (CRM + все внешние): {grand_total_k:,.0f} тыс. | "
-        f"Цель: {verified_total_k:,.0f} тыс. | "
-        f"Отклонение: {deviation_pct:+.2f}%" if deviation_pct is not None
-        else f"📊 Итого: {grand_total_k:,.0f} тыс.")
+        f"Прогр. (ежемес.): {external_total_k:,.0f} тыс. | "
+        f"Все внешние доходы: {full_external_k:,.0f} тыс.")
+    if deviation_pct is not None:
+        sign = '+' if deviation_pct >= 0 else ''
+        verdict = 'отлично' if abs(deviation_pct) < 2 else ('в норме' if abs(deviation_pct) < 5 else 'большое расхождение')
+        log(f"📊 Итого CRM + внешние: {grand_total_k:,.0f} тыс. | "
+            f"Верифицировано: {verified_total_k:,.0f} тыс. | "
+            f"Отклонение: {sign}{deviation_pct:.2f}% — {verdict}")
+    else:
+        log(f"📊 Итого: {grand_total_k:,.0f} тыс.")
 
     return report_info

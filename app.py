@@ -2,6 +2,12 @@
 # app.py — Аналитика заказов, Фонтанка.ру  v2.1
 # ============================================================
 
+import sys
+import os as _os
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 import threading
