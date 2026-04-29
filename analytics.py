@@ -342,6 +342,39 @@ def load_verified_figures(path):
         return None
 
 
+def validate_analytics_consistency(verified_data, external_json_path, log=print):
+    """
+    Проверяет базовые несоответствия между источниками для аналитики.
+    Сейчас валидирует:
+    - совпадение '_год' в verified_figures.json и external_income.json.
+    """
+    verified_year = None
+    external_year = None
+
+    if isinstance(verified_data, dict):
+        vy = verified_data.get('_год')
+        if isinstance(vy, (int, float)):
+            verified_year = int(vy)
+
+    if external_json_path and os.path.exists(external_json_path):
+        try:
+            with open(external_json_path, 'r', encoding='utf-8') as f:
+                ext = json.load(f)
+            ey = ext.get('_год')
+            if isinstance(ey, (int, float)):
+                external_year = int(ey)
+        except Exception:
+            pass
+
+    if verified_year and external_year and verified_year != external_year:
+        log(
+            "⚠ Несоответствие годов: "
+            f"verified_figures.json={verified_year}, "
+            f"external_income.json={external_year}. "
+            "Проверьте, что оба файла относятся к одному отчетному году."
+        )
+
+
 def get_external_monthly_totals(external_json_path):
     """
     Читает external_income.json и возвращает dict {месяц: сумма_руб} — 
@@ -908,6 +941,8 @@ def run_analytics(input_path: str, output_path: str, log=print,
             if ext_monthly:
                 log(f"Внешние доходы подгружены: {sum(ext_monthly.values())/1000:,.0f} тыс. руб.")
             break
+
+    validate_analytics_consistency(verified, _ext_json_found, log=log)
 
     # Полный итог всех внешних статей (для сверки с бухгалтерией)
     full_external_k = get_full_external_total(_ext_json_found) / 1000 if _ext_json_found else 0.0
