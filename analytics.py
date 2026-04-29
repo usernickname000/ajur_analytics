@@ -1342,6 +1342,8 @@ def run_analytics(input_path: str, output_path: str, log=print,
     crm_47other  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == '47News / Прочее', revenue_col].sum()
     crm_unclass  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'НЕ КЛАССИФИЦИРОВАНО', revenue_col].sum()
     crm_total    = df_full[revenue_col].sum()
+    # rev_reklama нужна уже в group_summary_rows — считаем здесь
+    rev_reklama  = df_full.loc[mask_no_prog & mask_no_events, revenue_col].sum() / 1000
 
     # Факт из external_income.json по категориям
     _ext_cats_gs = get_external_totals_by_category(_ext_json_found) if _ext_json_found else {}
