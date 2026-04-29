@@ -209,6 +209,26 @@ COL_NOMEN       = 'Номенклатура'
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================
 
+def _rev_stats(df, groupby_col, revenue_col, avg_mask=None):
+    """Groupby с суммой/количеством/средним чеком и переводом в тыс. руб."""
+    grp = df.groupby(groupby_col)
+    stats = grp[revenue_col].agg(['sum', 'count']).round(2)
+    stats.columns = ['Сумма выручки, руб.', 'Количество заказов']
+    avg_df = df if avg_mask is None else df.loc[avg_mask]
+    stats['Средний чек, руб.'] = avg_df.groupby(groupby_col)[revenue_col].mean().round(2)
+    stats['Сумма выручки, тыс. руб.'] = (stats['Сумма выручки, руб.'] / 1000).round(2)
+    return stats.reset_index().sort_values('Сумма выручки, тыс. руб.', ascending=False)
+
+
+def _find_rev_col(ws, fallback=2):
+    """Ищет в заголовке листа колонку с выручкой в тыс. руб."""
+    for c in range(1, ws.max_column + 1):
+        val = ws.cell(1, c).value
+        if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
+            return c
+    return fallback
+
+
 def parse_money(x):
     if pd.isna(x):
         return None
@@ -719,7 +739,257 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
     return df_out
 
 
-def run_data_quality_checks(df):
+def build_signals(df_full, revenue_col, monthly_stats, manager_stats, client_stats,
+                  rfm_all, mask_no_events, log=print):
+    """
+    Автоматически находит аномалии и сигналы в данных.
+    Возвращает DataFrame с колонками: Приоритет, Категория, Сигнал, Детали.
+    """
+    signals = []
+
+    def add(priority, category, signal, details=''):
+        signals.append({'Приоритет': priority, 'Категория': category,
+                        'Сигнал': signal, 'Детали': details})
+
+    # ── 1. Аномалии по месяцам ───────────────────────────────
+    if monthly_stats is not None and len(monthly_stats) >= 3:
+        rev = monthly_stats['Сумма выручки, тыс. руб.']
+        mean_rev = rev.mean()
+        std_rev  = rev.std()
+        periods  = monthly_stats['Период'].tolist()
+
+        for i, (period, val) in enumerate(zip(periods, rev)):
+            if std_rev > 0 and abs(val - mean_rev) > 2 * std_rev:
+                direction = '🔺 аномально высокая' if val > mean_rev else '🔻 аномально низкая'
+                add('🔴 Высокий', 'Месячная выручка',
+                    f'{period}: {direction} выручка',
+                    f'{val:,.0f} тыс. vs среднее {mean_rev:,.0f} тыс. (±{std_rev:,.0f})')
+
+        # Падение последних двух месяцев подряд
+        if len(rev) >= 3:
+            last3 = rev.iloc[-3:].tolist()
+            if last3[2] < last3[1] < last3[0]:
+                add('🟡 Средний', 'Тренд',
+                    f'Выручка падает три месяца подряд',
+                    f'{periods[-3]}: {last3[0]:,.0f} → {periods[-2]}: {last3[1]:,.0f} → {periods[-1]}: {last3[2]:,.0f} тыс.')
+
+        # Лучший и худший месяц
+        idx_max = rev.idxmax()
+        idx_min = rev.idxmin()
+        add('🟢 Инфо', 'Месячная выручка',
+            f'Лучший месяц: {monthly_stats.loc[idx_max, "Период"]}',
+            f'{rev[idx_max]:,.0f} тыс. руб.')
+        add('🟢 Инфо', 'Месячная выручка',
+            f'Худший месяц: {monthly_stats.loc[idx_min, "Период"]}',
+            f'{rev[idx_min]:,.0f} тыс. руб.')
+
+    # ── 2. Концентрация выручки (топ-клиенты) ────────────────
+    if client_stats is not None and len(client_stats) > 0:
+        total_rev = client_stats['Сумма выручки, тыс. руб.'].sum()
+        if total_rev > 0:
+            top1_share = client_stats.iloc[0]['Сумма выручки, тыс. руб.'] / total_rev * 100
+            top5_share = client_stats.head(5)['Сумма выручки, тыс. руб.'].sum() / total_rev * 100
+            top1_name  = client_stats.iloc[0]['КОНЕЧНЫЙ_КЛИЕНТ']
+
+            if top1_share > 20:
+                add('🔴 Высокий', 'Концентрация',
+                    f'Один клиент даёт {top1_share:.1f}% выручки — высокий риск',
+                    f'{top1_name}: {client_stats.iloc[0]["Сумма выручки, тыс. руб."]:,.0f} тыс.')
+            elif top1_share > 10:
+                add('🟡 Средний', 'Концентрация',
+                    f'Топ-клиент даёт {top1_share:.1f}% выручки',
+                    f'{top1_name}: {client_stats.iloc[0]["Сумма выручки, тыс. руб."]:,.0f} тыс.')
+
+            if top5_share > 60:
+                add('🟡 Средний', 'Концентрация',
+                    f'Топ-5 клиентов дают {top5_share:.1f}% выручки',
+                    ', '.join(client_stats.head(5)['КОНЕЧНЫЙ_КЛИЕНТ'].tolist()))
+
+    # ── 3. Клиенты с одним заказом (риск оттока) ─────────────
+    if 'КОНЕЧНЫЙ_КЛИЕНТ' in df_full.columns:
+        order_counts = df_full.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[revenue_col].agg(['count', 'sum'])
+        single_order = order_counts[order_counts['count'] == 1]
+        single_rev_share = single_order['sum'].sum() / order_counts['sum'].sum() * 100 if order_counts['sum'].sum() > 0 else 0
+        add('🟡 Средний' if single_rev_share > 30 else '🟢 Инфо', 'Лояльность',
+            f'{len(single_order)} клиентов с единственным заказом ({single_rev_share:.1f}% выручки)',
+            f'Потенциал повторных продаж: {single_order["sum"].sum()/1000:,.0f} тыс. руб.')
+
+    # ── 4. RFM-сигналы ────────────────────────────────────────
+    if rfm_all is not None and len(rfm_all) > 0:
+        at_risk = rfm_all[rfm_all['Segment'] == 'At Risk']
+        hibernating = rfm_all[rfm_all['Segment'] == 'Hibernating']
+
+        if len(at_risk) > 0:
+            at_risk_rev = at_risk['Monetary_thousands'].sum()
+            add('🔴 Высокий', 'RFM / Отток',
+                f'{len(at_risk)} клиентов "At Risk" — давно не покупали',
+                f'Суммарная ценность: {at_risk_rev:,.0f} тыс. руб. | Топ: ' +
+                ', '.join(at_risk.head(3)['КОНЕЧНЫЙ_КЛИЕНТ'].tolist()))
+
+        if len(hibernating) > 0:
+            hib_rev = hibernating['Monetary_thousands'].sum()
+            add('🟡 Средний', 'RFM / Отток',
+                f'{len(hibernating)} клиентов "Hibernating" — неактивны',
+                f'Суммарная ценность: {hib_rev:,.0f} тыс. руб.')
+
+        champions = rfm_all[rfm_all['Segment'] == 'Champions']
+        if len(champions) > 0:
+            add('🟢 Инфо', 'RFM / Рост',
+                f'{len(champions)} клиентов-чемпионов — активно покупают',
+                ', '.join(champions.head(5)['КОНЕЧНЫЙ_КЛИЕНТ'].tolist()))
+
+    # ── 5. Менеджеры ─────────────────────────────────────────
+    if manager_stats is not None and len(manager_stats) >= 2:
+        rev_m = manager_stats['Сумма выручки, тыс. руб.']
+        mean_m = rev_m.mean()
+        top_mgr = manager_stats.iloc[0]
+        bot_mgr = manager_stats.iloc[-1]
+        gap = top_mgr['Сумма выручки, тыс. руб.'] / bot_mgr['Сумма выручки, тыс. руб.'] if bot_mgr['Сумма выручки, тыс. руб.'] > 0 else 0
+
+        if gap > 5:
+            add('🟡 Средний', 'Менеджеры',
+                f'Разрыв между топ и аутсайдером в {gap:.1f}x',
+                f'{top_mgr[COL_MANAGER]}: {top_mgr["Сумма выручки, тыс. руб."]:,.0f} тыс. vs '
+                f'{bot_mgr[COL_MANAGER]}: {bot_mgr["Сумма выручки, тыс. руб."]:,.0f} тыс.')
+
+        add('🟢 Инфо', 'Менеджеры',
+            f'Лучший менеджер: {top_mgr[COL_MANAGER]}',
+            f'{top_mgr["Сумма выручки, тыс. руб."]:,.0f} тыс. руб.')
+
+    # ── 6. Средний чек ────────────────────────────────────────
+    rev_no_events = df_full.loc[mask_no_events, revenue_col].dropna()
+    if len(rev_no_events) > 0:
+        avg_check = rev_no_events.mean() / 1000
+        median_check = rev_no_events.median() / 1000
+        ratio = avg_check / median_check if median_check > 0 else 1
+
+        if ratio > 3:
+            add('🟡 Средний', 'Чеки',
+                f'Средний чек в {ratio:.1f}x выше медианного — влияют крупные сделки',
+                f'Среднее: {avg_check:,.1f} тыс. | Медиана: {median_check:,.1f} тыс.')
+
+    # ── 7. Нулевые и аномальные суммы ────────────────────────
+    zero_rev = (df_full[revenue_col].fillna(0) == 0).sum()
+    if zero_rev > 0:
+        add('🟡 Средний', 'Качество данных',
+            f'{zero_rev} заказов с нулевой выручкой',
+            'Проверь: возможно незакрытые сделки или технические строки')
+
+    if not signals:
+        add('🟢 Инфо', 'Общее', 'Явных аномалий не обнаружено', 'Данные выглядят стабильно')
+
+    df_signals = pd.DataFrame(signals)
+    priority_order = {'🔴 Высокий': 0, '🟡 Средний': 1, '🟢 Инфо': 2}
+    df_signals['_sort'] = df_signals['Приоритет'].map(priority_order).fillna(3)
+    df_signals = df_signals.sort_values('_sort').drop(columns='_sort').reset_index(drop=True)
+    return df_signals
+
+
+def style_workbook(wb, log=print):
+    """
+    Применяет единое оформление ко всем листам книги:
+    - оранжевые заголовки с белым текстом
+    - чередующиеся строки (зебра)
+    - красный фон для отрицательных чисел
+    - жирный шрифт для итоговых строк
+    - заморозка первой строки
+    """
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    ORANGE      = PatternFill('solid', fgColor='F38120')
+    ROW_ALT     = PatternFill('solid', fgColor='FFF4EC')
+    ROW_NORMAL  = PatternFill('solid', fgColor='FFFFFF')
+    RED_FILL    = PatternFill('solid', fgColor='FDECEA')
+    TOTAL_FILL  = PatternFill('solid', fgColor='FDE8D0')
+    SIGNAL_RED  = PatternFill('solid', fgColor='FDECEA')
+    SIGNAL_YEL  = PatternFill('solid', fgColor='FEF9E7')
+    SIGNAL_GRN  = PatternFill('solid', fgColor='EAFAF1')
+
+    HDR_FONT    = Font(name='Segoe UI', bold=True, color='FFFFFF', size=10)
+    BODY_FONT   = Font(name='Segoe UI', size=9)
+    TOTAL_FONT  = Font(name='Segoe UI', bold=True, size=9)
+    THIN        = Side(style='thin', color='E8E8E8')
+    BORDER      = Border(bottom=THIN)
+
+    TOTAL_KEYWORDS = {'итого', 'total', 'план', 'выполнение', 'grand', '═══', '──'}
+    SEPARATOR_CHARS = {'═', '─', '—'}
+
+    try:
+        for ws in wb.worksheets:
+            if ws.title in ('📊 Графики',):
+                continue
+
+            max_row = ws.max_row
+            max_col = ws.max_column
+            if max_row < 2:
+                continue
+
+            # Заголовок
+            for col in range(1, max_col + 1):
+                cell = ws.cell(1, col)
+                cell.fill = ORANGE
+                cell.font = HDR_FONT
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                cell.border = BORDER
+            ws.row_dimensions[1].height = 22
+            ws.freeze_panes = 'A2'
+
+            # Тело
+            is_signals = ws.title.startswith('00_Сигналы')
+
+            for row in range(2, max_row + 1):
+                first_val = str(ws.cell(row, 1).value or '').strip()
+
+                # Строка-разделитель (═══ или ──)
+                is_separator = any(c in first_val for c in SEPARATOR_CHARS)
+                # Итоговая строка
+                is_total = any(k in first_val.lower() for k in TOTAL_KEYWORDS)
+
+                # Фон строки
+                if is_separator:
+                    row_fill = PatternFill('solid', fgColor='F0F0F0')
+                    row_font = Font(name='Segoe UI', bold=True, color='888888', size=8)
+                elif is_total:
+                    row_fill = TOTAL_FILL
+                    row_font = TOTAL_FONT
+                elif is_signals:
+                    priority_val = str(ws.cell(row, 1).value or '')
+                    if '🔴' in priority_val:
+                        row_fill = SIGNAL_RED
+                    elif '🟡' in priority_val:
+                        row_fill = SIGNAL_YEL
+                    else:
+                        row_fill = SIGNAL_GRN
+                    row_font = BODY_FONT
+                else:
+                    row_fill = ROW_ALT if row % 2 == 0 else ROW_NORMAL
+                    row_font = BODY_FONT
+
+                for col in range(1, max_col + 1):
+                    cell = ws.cell(row, col)
+                    cell.fill = row_fill
+                    cell.font = row_font
+                    cell.border = BORDER
+                    cell.alignment = Alignment(vertical='center')
+
+                    # Отрицательные числа — красный фон
+                    if not is_separator and not is_total:
+                        try:
+                            if isinstance(cell.value, (int, float)) and cell.value < 0:
+                                cell.fill = RED_FILL
+                                cell.font = Font(name='Segoe UI', size=9, color='C0392B')
+                        except Exception:
+                            pass
+
+                ws.row_dimensions[row].height = 18
+
+        log("Оформление листов применено ✅")
+    except Exception as e:
+        log(f"⚠ Оформление не применено: {e}")
+
+
+def run_data_quality_checks(df, log=print):
     report = {}
     critical_errors = []
 
@@ -745,26 +1015,24 @@ def run_data_quality_checks(df):
             critical_errors.append("Обнаружена отрицательная выручка")
 
     if COL_DATE in df.columns:
-        df['_temp_date_check'] = pd.to_datetime(df[COL_DATE], errors='coerce')
-        report['Некорректные/пропущенные даты'] = df['_temp_date_check'].isna().sum()
-        report['Будущие даты'] = (df['_temp_date_check'] > pd.Timestamp.today()).sum()
-        df.drop(columns=['_temp_date_check'], inplace=True)
+        temp_dates = pd.to_datetime(df[COL_DATE], errors='coerce')
+        report['Некорректные/пропущенные даты'] = temp_dates.isna().sum()
+        report['Будущие даты'] = (temp_dates > pd.Timestamp.today()).sum()
         if report['Будущие даты'] > 0:
             log(f"⚠ Предупреждение: {report['Будущие даты']} дат в будущем (не критично)")
 
     if any(c in df.columns for c in [COL_CLIENT, COL_CLIENT_RA, COL_REKLAMD]):
-        empty_clients = sum(
+        report['Пустые поля клиентов (суммарно)'] = sum(
             (df[col].astype(str).str.strip() == '').sum()
             for col in [COL_CLIENT_RA, COL_CLIENT, COL_REKLAMD]
             if col in df.columns
         )
-        report['Пустые поля клиентов (суммарно)'] = empty_clients
 
     if COL_REVENUE in df.columns:
         try:
             q99 = df[COL_REVENUE].quantile(0.99)
             report['Аномально большие чеки'] = (df[COL_REVENUE] > q99 * 3).sum()
-        except:
+        except Exception:
             report['Аномально большие чеки'] = "Ошибка расчета"
 
     quality_df = pd.DataFrame(list(report.items()), columns=['Метрика', 'Значение'])
@@ -844,7 +1112,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
 
     # ── 4. Контроль качества ─────────────────────────────────
     log("Проверка качества данных...")
-    quality_report, critical_errors = run_data_quality_checks(df_raw)
+    quality_report, critical_errors = run_data_quality_checks(df_raw, log=log)
 
     if critical_errors:
         error_text = "\n".join(f" - {e}" for e in critical_errors)
@@ -982,6 +1250,32 @@ def run_analytics(input_path: str, output_path: str, log=print,
                 monthly_stats['Период'].map(paydate_sums).fillna(0).round(2)
             )
 
+        # ── YoY (год к году) если в данных > 1 года ──────────
+        if 'Дата_месяц' in df_full.columns:
+            _years = df_full['Дата_месяц'].dt.year.dropna().unique()
+            if len(_years) > 1:
+                _prev_year_map = {}
+                for _, mrow in monthly_stats.iterrows():
+                    try:
+                        _pstr = mrow['Период']  # формат 'MM.YYYY'
+                        _pm, _py = _pstr.split('.')
+                        _prev = f"{_pm}.{int(_py) - 1}"
+                        _prev_year_map[_pstr] = _prev
+                    except Exception:
+                        pass
+                _rev_by_period = monthly_stats.set_index('Период')['Сумма выручки, тыс. руб.'].to_dict()
+                monthly_stats['Пред. год, тыс. руб.'] = (
+                    monthly_stats['Период'].map(lambda p: _rev_by_period.get(_prev_year_map.get(p)))
+                )
+                monthly_stats['YoY, %'] = monthly_stats.apply(
+                    lambda r: round(
+                        (r['Сумма выручки, тыс. руб.'] / r['Пред. год, тыс. руб.'] - 1) * 100, 1
+                    )
+                    if pd.notna(r.get('Пред. год, тыс. руб.')) and r['Пред. год, тыс. руб.'] != 0
+                    else None,
+                    axis=1
+                )
+
         # Добавляем колонки с внешними доходами, если JSON есть
         if ext_monthly is not None:
             def get_ext(period):
@@ -1009,56 +1303,19 @@ def run_analytics(input_path: str, output_path: str, log=print,
     client_df_for_rank = df_full.loc[
         ~(df_full[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS) | df_full['IS_EVENT_CLIENT'])
     ] if COL_PROJECT in df_full.columns else df_full
-
-    client_stats = (
-        client_df_for_rank.groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        .agg({revenue_col: ['sum', 'count']}).round(2)
-    )
-    client_stats.columns = ['Сумма выручки, руб.', 'Количество заказов']
-    client_stats['Средний чек, руб.'] = (
-        client_df_for_rank.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[revenue_col].mean().round(2)
-    )
-    client_stats['Сумма выручки, тыс. руб.'] = client_stats['Сумма выручки, руб.'] / 1000
-    client_stats = (
-        client_stats.reset_index()
-        .sort_values('Сумма выручки, тыс. руб.', ascending=False)
-    )
+    client_stats = _rev_stats(client_df_for_rank, 'КОНЕЧНЫЙ_КЛИЕНТ', revenue_col)
 
     # ── 12. Топ менеджеров ───────────────────────────────────
     manager_stats = None
     if COL_MANAGER in df_full.columns:
         log("Считаю статистику по менеджерам...")
         manager_df = df_full.loc[~df_full[COL_MANAGER].isin(EXCLUDE_MANAGERS)]
-        manager_stats = (
-            manager_df.groupby(COL_MANAGER)
-            .agg({revenue_col: ['sum', 'count']}).round(2)
-        )
-        manager_stats.columns = ['Сумма выручки, руб.', 'Количество заказов']
-        manager_mask_no_events = manager_df.index.isin(df_full.index[mask_no_events])
-        manager_stats['Средний чек, руб.'] = (
-            manager_df.loc[manager_mask_no_events].groupby(COL_MANAGER)[revenue_col].mean().round(2)
-        )
-        manager_stats['Сумма выручки, тыс. руб.'] = manager_stats['Сумма выручки, руб.'] / 1000
-        manager_stats = (
-            manager_stats.reset_index()
-            .sort_values('Сумма выручки, тыс. руб.', ascending=False)
-        )
+        mgr_no_events = manager_df.index.isin(df_full.index[mask_no_events])
+        manager_stats = _rev_stats(manager_df, COL_MANAGER, revenue_col, avg_mask=mgr_no_events)
 
     # ── 13. По отраслям ──────────────────────────────────────
     log("Считаю по отраслям...")
-    industry_stats = (
-        df_full.groupby('ОТРАСЛЬ_КЛИЕНТА_НОРМ')
-        .agg({revenue_col: ['sum', 'count']}).round(2)
-    )
-    industry_stats.columns = ['Сумма выручки, руб.', 'Количество заказов']
-    industry_stats['Средний чек, руб.'] = (
-        df_full.loc[mask_no_events].groupby('ОТРАСЛЬ_КЛИЕНТА_НОРМ')[revenue_col].mean().round(2)
-    )
-    industry_stats['Сумма выручки, тыс. руб.'] = industry_stats['Сумма выручки, руб.'] / 1000
-    industry_stats = (
-        industry_stats.reset_index()
-        .sort_values('Сумма выручки, тыс. руб.', ascending=False)
-    )
+    industry_stats = _rev_stats(df_full, 'ОТРАСЛЬ_КЛИЕНТА_НОРМ', revenue_col, avg_mask=mask_no_events)
 
     # ── 13а. Выручка по бизнес-группам (логика бухгалтерии) ──
     log("Считаю выручку по группам...")
@@ -1086,34 +1343,97 @@ def run_analytics(input_path: str, output_path: str, log=print,
     crm_unclass  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'НЕ КЛАССИФИЦИРОВАНО', revenue_col].sum()
     crm_total    = df_full[revenue_col].sum()
 
+    # Факт из external_income.json по категориям
+    _ext_cats_gs = get_external_totals_by_category(_ext_json_found) if _ext_json_found else {}
+    _gs_prog_k    = _ext_cats_gs.get('programmatic', 0) / 1000
+    _gs_barter_k  = _ext_cats_gs.get('barter', 0) / 1000
+    _gs_iri_k     = _ext_cats_gs.get('iri_grants', 0) / 1000
+    _gs_recsys_k  = _ext_cats_gs.get('recsys', 0) / 1000
+    _gs_ecom_k    = _ext_cats_gs.get('ecom', 0) / 1000
+    _gs_47plan_k  = _ext_cats_gs.get('47_plan', 0) / 1000
+    _gs_deduct_k  = _ext_cats_gs.get('deductions', 0) / 1000
+    _gs_income_k  = _ext_cats_gs.get('total_income', 0) / 1000
+
+    # Итоговые расчётные показатели для сверки
+    _gs_crm_plus_prog_k  = crm_total / 1000 + _gs_prog_k
+    _gs_crm_plus_all_k   = crm_total / 1000 + _gs_income_k
+    _gs_crm_no_prog_bar  = crm_total / 1000 - crm_prog / 1000 + _gs_barter_k
+
+    def _gs_dev(fact, target):
+        if target and target != 0:
+            return f"{round((fact / target - 1) * 100, 2):+.2f}%"
+        return '—'
+
+    vf_prog_k = vf_total_with_prog / 1000 if vf_total_with_prog else None
+    vf_no_prog_k = vf_total_no_prog / 1000 if vf_total_no_prog else None
+    vf_ads_k = vf_ads_no_events / 1000 if vf_ads_no_events else None
+
     group_summary_rows = [
         ('═══ CRM (расчёт по выгрузке) ═══', ''),
-        ('Реклама Фонтанка + Доктор, тыс. руб.', round(crm_ads / 1000, 2)),
-        ('Программатик (CRM-часть), тыс. руб.', round(crm_prog / 1000, 2)),
-        ('Мероприятия, тыс. руб.', round(crm_events / 1000, 2)),
-        ('47News / Прочее, тыс. руб.', round(crm_47other / 1000, 2)),
-        ('НЕ классифицированное, тыс. руб.', round(crm_unclass / 1000, 2)),
-        ('Итого CRM, тыс. руб.', round(crm_total / 1000, 2)),
-        ('═══ Бухгалтерия (внешние цифры) ═══', ''),
-        ('Программатик полный (вне CRM), тыс. руб.',
+        ('Реклама Фонтанка + Доктор, тыс. руб.',  round(crm_ads / 1000, 2)),
+        ('Программатик (CRM-часть), тыс. руб.',   round(crm_prog / 1000, 2)),
+        ('Мероприятия, тыс. руб.',                round(crm_events / 1000, 2)),
+        ('47News / Прочее, тыс. руб.',            round(crm_47other / 1000, 2)),
+        ('НЕ классифицированное, тыс. руб.',      round(crm_unclass / 1000, 2)),
+        ('Итого CRM, тыс. руб.',                  round(crm_total / 1000, 2)),
+        ('═══ Внешние доходы (external_income.json) ═══', ''),
+        ('Программатик (вне CRM), тыс. руб.',     round(_gs_prog_k, 2) if _ext_cats_gs else '—'),
+        ('Медийный бартер, тыс. руб.',            round(_gs_barter_k, 2) if _ext_cats_gs else '—'),
+        ('ИРИ / Гранты, тыс. руб.',               round(_gs_iri_k, 2) if _ext_cats_gs else '—'),
+        ('Рекомендательные системы, тыс. руб.',   round(_gs_recsys_k, 2) if _ext_cats_gs else '—'),
+        ('E-com, тыс. руб.',                      round(_gs_ecom_k, 2) if _ext_cats_gs else '—'),
+        ('47News (в план), тыс. руб.',            round(_gs_47plan_k, 2) if _ext_cats_gs else '—'),
+        ('Вычеты (взаимозачёты/корректировки), тыс. руб.', round(_gs_deduct_k, 2) if _ext_cats_gs else '—'),
+        ('Итого внешних доходов (без вычетов), тыс. руб.', round(_gs_income_k, 2) if _ext_cats_gs else '—'),
+        ('═══ Сверка с верифицированными цифрами ═══', ''),
+        ('CRM + программатик (факт), тыс. руб.',
+            round(_gs_crm_plus_prog_k, 2) if _ext_cats_gs else round(crm_total / 1000, 2)),
+        ('CRM + все внешние доходы (факт), тыс. руб.',
+            round(_gs_crm_plus_all_k, 2) if _ext_cats_gs else round(crm_total / 1000, 2)),
+        ('Верифицировано: всего с прогр. (бух.), тыс. руб.',
+            round(vf_prog_k, 2) if vf_prog_k else '—'),
+        ('Расхождение: всего с прогр., тыс. руб.',
+            round(_gs_crm_plus_all_k - vf_prog_k, 2)
+            if vf_prog_k and _ext_cats_gs else '—'),
+        ('Расхождение: всего с прогр., %',
+            _gs_dev(_gs_crm_plus_all_k, vf_prog_k)
+            if vf_prog_k and _ext_cats_gs else '—'),
+        ('── Без программатика ──', ''),
+        ('CRM (без прогр.) + бартер (факт), тыс. руб.',
+            round(_gs_crm_no_prog_bar, 2) if _ext_cats_gs else '—'),
+        ('Верифицировано: с бартером без прогр. (бух.), тыс. руб.',
+            round(vf_no_prog_k, 2) if vf_no_prog_k else '—'),
+        ('Расхождение: без программатика, тыс. руб.',
+            round(_gs_crm_no_prog_bar - vf_no_prog_k, 2)
+            if vf_no_prog_k and _ext_cats_gs else '—'),
+        ('Расхождение: без программатика, %',
+            _gs_dev(_gs_crm_no_prog_bar, vf_no_prog_k)
+            if vf_no_prog_k and _ext_cats_gs else '—'),
+        ('── Рекламная без мероприятий ──', ''),
+        ('CRM реклама (без мер.), тыс. руб.',     round(rev_reklama, 2)),
+        ('Верифицировано: реклама без мер. (бух.), тыс. руб.',
+            round(vf_ads_k, 2) if vf_ads_k else '—'),
+        ('Расхождение: реклама, тыс. руб.',
+            round(rev_reklama - vf_ads_k, 2) if vf_ads_k else '—'),
+        ('Расхождение: реклама, %',
+            _gs_dev(rev_reklama, vf_ads_k) if vf_ads_k else '—'),
+        ('═══ Справочно ═══', ''),
+        ('Программатик полный (verified_figures), тыс. руб.',
             round(ext_prog_total / 1000, 2) if ext_prog_total else '—'),
-        ('Прочие доходы (ИРИ/гранты/47 закупка), тыс. руб.',
+        ('Прочие доходы (verified_figures), тыс. руб.',
             round(ext_other_total / 1000, 2) if ext_other_total else '—'),
-        ('Итого с программатиком + бартер (верифицировано), тыс. руб.',
-            round(vf_total_with_prog / 1000, 2) if vf_total_with_prog else '—'),
-        ('Итого с бартером без программатика (верифицировано), тыс. руб.',
-            round(vf_total_no_prog / 1000, 2) if vf_total_no_prog else '—'),
-        ('Рекламная без мероприятий (верифицировано), тыс. руб.',
-            round(vf_ads_no_events / 1000, 2) if vf_ads_no_events else '—'),
     ]
     group_summary_df = pd.DataFrame(group_summary_rows, columns=['Показатель', 'Значение'])
+
+    # Разбираем дату заказа один раз — используется в сезонности и RFM
+    if COL_DATE in df_full.columns:
+        df_full['Дата_заказа'] = pd.to_datetime(df_full[COL_DATE], errors='coerce')
 
     # ── 14. Сезонность ───────────────────────────────────────
     seasonal_stats = None
     quarterly_stats = None
-    if COL_DATE in df_full.columns:
+    if 'Дата_заказа' in df_full.columns:
         log("Считаю сезонность...")
-        df_full['Дата_заказа'] = pd.to_datetime(df_full[COL_DATE], errors='coerce')
         df_full['Месяц_число'] = df_full['Дата_заказа'].dt.month
         df_full['Квартал'] = df_full['Дата_заказа'].dt.quarter
         df_full['Сезон'] = df_full['Месяц_число'].apply(
@@ -1179,10 +1499,9 @@ def run_analytics(input_path: str, output_path: str, log=print,
 
     # ── 15. RFM-анализ ───────────────────────────────────────
     rfm_all = rfm_segment_extended = rfm_non_top = None
-    if COL_DATE in df_full.columns and 'КОНЕЧНЫЙ_КЛИЕНТ' in df_full.columns:
+    if 'Дата_заказа' in df_full.columns and 'КОНЕЧНЫЙ_КЛИЕНТ' in df_full.columns:
         try:
             log("Провожу RFM-анализ...")
-            df_full['Дата_заказа'] = pd.to_datetime(df_full[COL_DATE], errors='coerce')
             current_date = df_full['Дата_заказа'].max()
 
             rfm_source = df_full.loc[
@@ -1265,20 +1584,6 @@ def run_analytics(input_path: str, output_path: str, log=print,
     })
 
     # ── 17. Сводки ───────────────────────────────────────────
-    best_month = best_month_revenue = best_manager = best_manager_revenue = best_client = best_client_revenue = None
-
-    if monthly_stats is not None and len(monthly_stats) > 0:
-        row = monthly_stats.loc[monthly_stats['Сумма выручки, тыс. руб.'].idxmax()]
-        best_month, best_month_revenue = row['Период'], row['Сумма выручки, тыс. руб.']
-
-    if manager_stats is not None and len(manager_stats) > 0:
-        row = manager_stats.iloc[0]
-        best_manager, best_manager_revenue = row[COL_MANAGER], row['Сумма выручки, тыс. руб.']
-
-    if len(client_stats) > 0:
-        row = client_stats.iloc[0]
-        best_client, best_client_revenue = row['КОНЕЧНЫЙ_КЛИЕНТ'], row['Сумма выручки, тыс. руб.']
-
     rev_all      = df_full[revenue_col].sum() / 1000
     rev_bez_prog = df_full.loc[mask_no_prog, revenue_col].sum() / 1000
     rev_reklama  = df_full.loc[mask_no_prog & mask_no_events, revenue_col].sum() / 1000
@@ -1527,7 +1832,113 @@ def run_analytics(input_path: str, output_path: str, log=print,
             'Средний чек, тыс. руб.'
         ]].head(50)
 
-    # ── 19в. Бухгалтерская таблица ───────────────────────────
+    # ── 19б_2. Анализ скидок ─────────────────────────────────
+    discount_stats = None
+    if COL_DISCOUNT_PCT in df_full.columns and 'Скидка_%_число' in df_full.columns:
+        log("Считаю анализ скидок...")
+        df_disc = df_full.loc[
+            mask_no_events &
+            df_full['Скидка_%_число'].notna() &
+            (df_full['Скидка_%_число'] > 0)
+        ].copy()
+
+        if len(df_disc) > 0:
+            # По клиентам
+            disc_by_client = (
+                df_disc.groupby('КОНЕЧНЫЙ_КЛИЕНТ')
+                .agg(
+                    Заказов=(COL_ORDER, 'count'),
+                    Выручка_руб=(revenue_col, 'sum'),
+                    Ср_скидка=('Скидка_%_число', 'mean'),
+                    Макс_скидка=('Скидка_%_число', 'max'),
+                )
+                .reset_index()
+                .sort_values('Выручка_руб', ascending=False)
+                .head(30)
+            )
+            disc_by_client['Выручка, тыс. руб.'] = (disc_by_client['Выручка_руб'] / 1000).round(2)
+            disc_by_client['Ср. скидка, %'] = disc_by_client['Ср_скидка'].round(1)
+            disc_by_client['Макс. скидка, %'] = disc_by_client['Макс_скидка'].round(1)
+
+            # По менеджерам
+            disc_by_mgr = None
+            if COL_MANAGER in df_disc.columns:
+                disc_by_mgr = (
+                    df_disc.groupby(COL_MANAGER)
+                    .agg(
+                        Заказов=(COL_ORDER, 'count'),
+                        Выручка_руб=(revenue_col, 'sum'),
+                        Ср_скидка=('Скидка_%_число', 'mean'),
+                        Макс_скидка=('Скидка_%_число', 'max'),
+                        Доля_со_скидкой=(revenue_col, 'count'),
+                    )
+                    .reset_index()
+                    .sort_values('Ср_скидка', ascending=False)
+                )
+                disc_by_mgr['Выручка, тыс. руб.'] = (disc_by_mgr['Выручка_руб'] / 1000).round(2)
+                disc_by_mgr['Ср. скидка, %'] = disc_by_mgr['Ср_скидка'].round(1)
+                disc_by_mgr['Макс. скидка, %'] = disc_by_mgr['Макс_скидка'].round(1)
+
+            # Распределение по бакетам
+            disc_bucket_stats = (
+                df_disc.groupby('Категория_скидки')
+                .agg(
+                    Заказов=(COL_ORDER, 'count'),
+                    Выручка_руб=(revenue_col, 'sum'),
+                )
+                .reset_index()
+                .sort_values('Выручка_руб', ascending=False)
+            )
+            disc_bucket_stats['Выручка, тыс. руб.'] = (disc_bucket_stats['Выручка_руб'] / 1000).round(2)
+            total_disc_rev = disc_bucket_stats['Выручка_руб'].sum()
+            disc_bucket_stats['Доля, %'] = (
+                disc_bucket_stats['Выручка_руб'] / total_disc_rev * 100
+            ).round(1) if total_disc_rev > 0 else 0
+
+            # Итоговая сводка: общий % заказов со скидкой
+            total_orders = len(df_full.loc[mask_no_events])
+            orders_with_disc = len(df_disc)
+            disc_summary_rows = [
+                ('Заказов без мероприятий (всего)', total_orders),
+                ('Заказов со скидкой', orders_with_disc),
+                ('Доля заказов со скидкой, %', round(orders_with_disc / total_orders * 100, 1) if total_orders else 0),
+                ('Средняя скидка по скидочным сделкам, %', round(df_disc['Скидка_%_число'].mean(), 1)),
+                ('Медианная скидка, %', round(df_disc['Скидка_%_число'].median(), 1)),
+                ('Максимальная скидка, %', round(df_disc['Скидка_%_число'].max(), 1)),
+                ('Выручка со скидкой, тыс. руб.', round(df_disc[revenue_col].sum() / 1000, 2)),
+                ('Доля выручки со скидкой, %',
+                    round(df_disc[revenue_col].sum() /
+                          df_full.loc[mask_no_events, revenue_col].sum() * 100, 1)
+                    if df_full.loc[mask_no_events, revenue_col].sum() > 0 else 0),
+            ]
+            disc_summary_df = pd.DataFrame(disc_summary_rows, columns=['Метрика', 'Значение'])
+
+            # Склеиваем в один датафрейм с разделителями
+            sep = pd.DataFrame([['═══ Сводка ═══', '']], columns=['Метрика', 'Значение'])
+            sep2 = pd.DataFrame([['═══ По бакетам скидок ═══', '']], columns=['Метрика', 'Значение'])
+            discount_stats = {
+                'summary': disc_summary_df,
+                'by_client': disc_by_client[[
+                    'КОНЕЧНЫЙ_КЛИЕНТ', 'Выручка, тыс. руб.',
+                    'Заказов', 'Ср. скидка, %', 'Макс. скидка, %'
+                ]],
+                'by_manager': disc_by_mgr[[
+                    COL_MANAGER, 'Выручка, тыс. руб.',
+                    'Заказов', 'Ср. скидка, %', 'Макс. скидка, %'
+                ]] if disc_by_mgr is not None else None,
+                'by_bucket': disc_bucket_stats[[
+                    'Категория_скидки', 'Заказов', 'Выручка, тыс. руб.', 'Доля, %'
+                ]],
+            }
+
+    # ── 19в. Сигналы и аномалии ─────────────────────────────
+    log("Ищу сигналы и аномалии...")
+    signals_df = build_signals(
+        df_full, revenue_col, monthly_stats, manager_stats, client_stats,
+        rfm_all, mask_no_events, log=log
+    )
+
+    # ── 19г. Бухгалтерская таблица ───────────────────────────
     log("Строю бухгалтерскую таблицу...")
     accounting_table = None
     # Ищем JSON рядом со входным файлом, потом в рабочей папке
@@ -1547,6 +1958,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     log("Сохраняю отчёт...")
     export_data = {}
 
+    export_data['00_Сигналы'] = signals_df
     if quality_report is not None:
         export_data['00_Data_Quality'] = quality_report
     if monthly_stats is not None:
@@ -1578,6 +1990,12 @@ def run_analytics(input_path: str, output_path: str, log=print,
     export_data['15_Сводка_по_группам']     = group_summary_df
     if accounting_table is not None:
         export_data['16_Бухгалтерская_таблица'] = accounting_table
+    if discount_stats is not None:
+        export_data['17_Скидки_сводка']     = discount_stats['summary']
+        export_data['17а_Скидки_клиенты']   = discount_stats['by_client']
+        if discount_stats['by_manager'] is not None:
+            export_data['17б_Скидки_менеджеры'] = discount_stats['by_manager']
+        export_data['17в_Скидки_по_бакетам'] = discount_stats['by_bucket']
 
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         for sheet_name, df_sheet in export_data.items():
@@ -1596,16 +2014,15 @@ def run_analytics(input_path: str, output_path: str, log=print,
             except Exception as e:
                 log(f"Ошибка при сохранении листа {safe_name}: {e}")
 
-    # ── Добавляем графики ────────────────────────────────────
+    # ── Оформление + графики ─────────────────────────────────
     log("Строю графики...")
     try:
         from openpyxl import load_workbook
         from openpyxl.chart import BarChart, LineChart, PieChart, Reference
-        from openpyxl.chart.series import DataPoint
-        from openpyxl.styles import Font, PatternFill, Alignment
-        from openpyxl.utils import get_column_letter as gcl
+        from openpyxl.styles import Font
 
         wb = load_workbook(output_path)
+        style_workbook(wb, log=log)
 
         # Создаём лист с графиками
         ws_charts = wb.create_sheet("📊 Графики", 0)
@@ -1635,16 +2052,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
                 chart.grouping = "standard"
                 chart.smooth = True
 
-                # Находим колонку с выручкой тыс.руб.
-                rev_col = None
-                for c in range(1, ws_m.max_column + 1):
-                    val = ws_m.cell(1, c).value
-                    if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
-                        rev_col = c
-                        break
-                if rev_col is None:
-                    rev_col = 2  # fallback
-
+                rev_col = _find_rev_col(ws_m)
                 data = Reference(ws_m, min_col=rev_col, min_row=1, max_row=max_row)
                 cats = Reference(ws_m, min_col=1, min_row=2, max_row=max_row)
                 chart.add_data(data, titles_from_data=True)
@@ -1672,15 +2080,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
                 chart.width = 22
                 chart.height = 14
 
-                rev_col = None
-                for c in range(1, ws_mgr.max_column + 1):
-                    val = ws_mgr.cell(1, c).value
-                    if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
-                        rev_col = c
-                        break
-                if rev_col is None:
-                    rev_col = 2
-
+                rev_col = _find_rev_col(ws_mgr)
                 data = Reference(ws_mgr, min_col=rev_col, min_row=1, max_row=n)
                 cats = Reference(ws_mgr, min_col=1, min_row=2, max_row=n)
                 chart.add_data(data, titles_from_data=True)
@@ -1704,15 +2104,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
                 chart.width = 22
                 chart.height = 14
 
-                rev_col = None
-                for c in range(1, ws_cli.max_column + 1):
-                    val = ws_cli.cell(1, c).value
-                    if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
-                        rev_col = c
-                        break
-                if rev_col is None:
-                    rev_col = 2
-
+                rev_col = _find_rev_col(ws_cli)
                 data = Reference(ws_cli, min_col=rev_col, min_row=1, max_row=n)
                 cats = Reference(ws_cli, min_col=1, min_row=2, max_row=n)
                 chart.add_data(data, titles_from_data=True)
@@ -1735,15 +2127,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
                 chart.width = 18
                 chart.height = 14
 
-                rev_col = None
-                for c in range(1, ws_ind.max_column + 1):
-                    val = ws_ind.cell(1, c).value
-                    if val and 'тыс' in str(val).lower() and 'выруч' in str(val).lower():
-                        rev_col = c
-                        break
-                if rev_col is None:
-                    rev_col = 2
-
+                rev_col = _find_rev_col(ws_ind)
                 data = Reference(ws_ind, min_col=rev_col, min_row=1, max_row=n)
                 cats = Reference(ws_ind, min_col=1, min_row=2, max_row=n)
                 chart.add_data(data, titles_from_data=True)
@@ -1779,10 +2163,6 @@ def run_analytics(input_path: str, output_path: str, log=print,
         (grand_total_k / verified_total_k - 1) * 100
         if verified_total_k > 0 else None
     )
-
-    # Дополнительные срезы для GUI (если нужны в будущем)
-    _ext_cats_gui = get_external_totals_by_category(_ext_json_found) if _ext_json_found else {}
-    ext_income_gui_k = _ext_cats_gui.get('total_income', 0) / 1000
 
     report_info = {
         'output_path':           output_path,
