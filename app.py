@@ -102,6 +102,112 @@ def save_config(cfg):
         pass
 
 
+# ── Toast-уведомление ────────────────────────────────────────
+class Toast(tk.Toplevel):
+    """
+    Всплывающее уведомление снизу-справа с анимацией появления/исчезновения.
+    kind: 'ok' | 'err' | 'warn' | 'info'
+    action_text + action_cmd: необязательная кнопка-действие (например "Открыть").
+    """
+    _BG = {"ok": "#1A2E1A", "err": "#2E1A1A", "warn": "#2E2510", "info": "#0F1E2E"}
+    _BORDER = {"ok": "#22C55E", "err": "#EF4444", "warn": "#F59E0B", "info": "#3B82F6"}
+    _ICON   = {"ok": "✅", "err": "❌", "warn": "⚠", "info": "ℹ"}
+
+    def __init__(self, parent, message, kind="ok",
+                 action_text=None, action_cmd=None, duration=4000):
+        super().__init__(parent)
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", 0.0)
+
+        bg     = self._BG.get(kind, "#1A1A1A")
+        border = self._BORDER.get(kind, "#555555")
+        icon   = self._ICON.get(kind, "")
+
+        self.configure(bg=border)
+
+        inner = tk.Frame(self, bg=bg, padx=14, pady=10)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        top_row = tk.Frame(inner, bg=bg)
+        top_row.pack(fill="x")
+
+        tk.Label(top_row, text=icon, font=("Segoe UI", 13),
+                 bg=bg, fg=border).pack(side="left", padx=(0, 8))
+
+        tk.Label(top_row, text=message,
+                 font=("Segoe UI", 9), bg=bg, fg="#F0F0F0",
+                 justify="left", wraplength=280).pack(side="left", fill="x", expand=True)
+
+        tk.Button(top_row, text="✕", font=("Segoe UI", 8),
+                  bg=bg, fg="#888888", relief="flat", bd=0,
+                  activebackground=bg, activeforeground="#FFFFFF",
+                  cursor="hand2", command=self._dismiss).pack(side="right")
+
+        if action_text and action_cmd:
+            btn_row = tk.Frame(inner, bg=bg)
+            btn_row.pack(fill="x", pady=(6, 0))
+            tk.Button(btn_row, text=action_text,
+                      font=("Segoe UI", 9, "bold"),
+                      bg=border, fg="#FFFFFF",
+                      activebackground="#FFFFFF", activeforeground=border,
+                      relief="flat", bd=0, cursor="hand2",
+                      padx=12, pady=4,
+                      command=lambda: (action_cmd(), self._dismiss())
+                      ).pack(side="left")
+
+        self.update_idletasks()
+        w = self.winfo_reqwidth()
+        h = self.winfo_reqheight()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = sw - w - 24
+        self._y_show = sh - h - 52
+        self._y_hide = sh + 10
+        self.geometry(f"{w}x{h}+{x}+{self._y_hide}")
+
+        self._duration = duration
+        self._alpha = 0.0
+        self._fade_in()
+
+    def _fade_in(self):
+        self._alpha = min(self._alpha + 0.08, 1.0)
+        cur_y = int(self._y_hide + (self._y_show - self._y_hide) * self._alpha)
+        try:
+            self.attributes("-alpha", self._alpha)
+            sw = self.winfo_screenwidth()
+            w = self.winfo_reqwidth()
+            self.geometry(f"+{sw - w - 24}+{cur_y}")
+        except Exception:
+            return
+        if self._alpha < 1.0:
+            self.after(16, self._fade_in)
+        else:
+            self.after(self._duration, self._fade_out)
+
+    def _fade_out(self):
+        self._alpha = max(self._alpha - 0.06, 0.0)
+        cur_y = int(self._y_show + (self._y_hide - self._y_show) * (1 - self._alpha))
+        try:
+            self.attributes("-alpha", self._alpha)
+            sw = self.winfo_screenwidth()
+            w = self.winfo_reqwidth()
+            self.geometry(f"+{sw - w - 24}+{cur_y}")
+        except Exception:
+            return
+        if self._alpha > 0:
+            self.after(16, self._fade_out)
+        else:
+            try:
+                self.destroy()
+            except Exception:
+                pass
+
+    def _dismiss(self):
+        self._duration = 0
+        self._fade_out()
+
+
 # ── Анимированная кнопка ─────────────────────────────────────
 class AnimButton(tk.Button):
     STEPS = 8
@@ -183,6 +289,15 @@ class App(tk.Tk):
         self._build_statusbar()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _toast(self, message, kind="ok", action_text=None, action_cmd=None, duration=4000):
+        """Показать всплывающее уведомление снизу-справа."""
+        try:
+            Toast(self, message, kind=kind,
+                  action_text=action_text, action_cmd=action_cmd,
+                  duration=duration)
+        except Exception:
+            pass
+
     def _on_close(self):
         if self._watcher:
             self._watcher.stop()
@@ -260,6 +375,22 @@ class App(tk.Tk):
         style.configure("F.Horizontal.TProgressbar",
                         troughcolor=T["border"],
                         background=C_ORANGE)
+
+        # KPI-карточки
+        if hasattr(self, '_kpi_cards'):
+            for key, (card, var, color) in self._kpi_cards.items():
+                card.configure(bg=T["surface"], highlightbackground=color)
+                for w in card.winfo_children():
+                    if isinstance(w, tk.Label):
+                        f = str(w.cget("font"))
+                        if "14" in f:
+                            w.configure(bg=T["surface"], fg=T["text"])
+                        elif "7" in f and key == "dev":
+                            pass  # muted — не трогаем цвет отклонения
+                        else:
+                            w.configure(bg=T["surface"])
+            if hasattr(self, '_kpi_frame'):
+                self._kpi_frame.configure(bg=T["bg"])
 
     def _toggle_theme(self):
         self._tn = "dark" if self._tn == "light" else "light"
@@ -545,9 +676,10 @@ class App(tk.Tk):
     STEPS = {
         "загрузк": 1, "качеств": 2, "клиент": 3, "менеджер": 4,
         "отрасл": 5, "сезонн": 6, "rfm": 7, "лояльн": 8,
-        "план": 9, "номенклатур": 10, "сохран": 11,
+        "план": 9, "номенклатур": 10, "сигнал": 11,
+        "бухгалт": 12, "сохран": 13, "граф": 14,
     }
-    TOTAL = 11
+    TOTAL = 14
 
     def _progress_log(self, bar, pct_lbl):
         counter = [0]
@@ -594,8 +726,112 @@ class App(tk.Tk):
         # НОВОЕ: индикатор расхождения с бухгалтерией
         self._build_recon_indicator(p)
 
+        # KPI-карточки (скрыты до первого запуска)
+        self._build_kpi_strip(p)
+
         self.run_btn = self._run_btn(p, "▶   Запустить анализ",
                                       self._start_analysis)
+
+    # ── KPI-полоска ──────────────────────────────────────────
+    def _build_kpi_strip(self, parent):
+        T = self._T
+        self._kpi_frame = tk.Frame(parent, bg=T["bg"])
+        # Не pack — покажем только после запуска через _show_kpi_cards
+
+        # 4 карточки: Выручка CRM / Все внешние / Grand Total / Отклонение
+        self._kpi_cards = {}
+        defs = [
+            ("crm",      "CRM",          "тыс. руб.",  C_ORANGE),
+            ("external", "Внешние",      "тыс. руб.",  "#3B82F6"),
+            ("grand",    "Итого",         "тыс. руб.",  "#8B5CF6"),
+            ("dev",      "Отклонение",    "от плана",   C_GREEN),
+        ]
+        for key, title, unit, color in defs:
+            card = tk.Frame(self._kpi_frame, bg=T["surface"],
+                            highlightbackground=color,
+                            highlightthickness=2)
+            card.pack(side="left", fill="x", expand=True, padx=(0, 6), ipady=6, ipadx=8)
+
+            tk.Label(card, text=title,
+                     font=("Segoe UI", 7, "bold"),
+                     bg=T["surface"], fg=color).pack(anchor="w", padx=8, pady=(6, 0))
+
+            val_var = tk.StringVar(value="—")
+            tk.Label(card, textvariable=val_var,
+                     font=("Segoe UI", 14, "bold"),
+                     bg=T["surface"], fg=T["text"]).pack(anchor="w", padx=8)
+
+            tk.Label(card, text=unit,
+                     font=("Segoe UI", 7),
+                     bg=T["surface"], fg=T["muted"]).pack(anchor="w", padx=8, pady=(0, 4))
+
+            self._kpi_cards[key] = (card, val_var, color)
+
+    def _show_kpi_cards(self, result: dict):
+        """Заполняет и показывает KPI-карточки после завершения анализа."""
+        if not hasattr(self, '_kpi_frame'):
+            return
+        T = self._T
+
+        crm_k   = result.get("crm_total", 0)
+        ext_k   = result.get("full_external_total", result.get("external_total", 0))
+        grand_k = result.get("grand_total", 0)
+        pct     = result.get("deviation_pct")
+
+        def _fmt(v):
+            return f"{v:,.0f}".replace(",", " ")
+
+        # Выручка CRM
+        card, var, _ = self._kpi_cards["crm"]
+        var.set(_fmt(crm_k))
+        card.configure(highlightbackground=C_ORANGE)
+
+        # Внешние
+        card, var, _ = self._kpi_cards["external"]
+        var.set(_fmt(ext_k))
+
+        # Grand Total
+        card, var, _ = self._kpi_cards["grand"]
+        var.set(_fmt(grand_k))
+
+        # Отклонение
+        card, var, _ = self._kpi_cards["dev"]
+        if pct is not None:
+            sign = "+" if pct >= 0 else ""
+            var.set(f"{sign}{pct:.2f}%")
+            dev_color = C_GREEN if abs(pct) < 2 else (C_AMBER if abs(pct) < 5 else C_RED)
+        else:
+            var.set("—")
+            dev_color = T["muted"]
+        card.configure(highlightbackground=dev_color)
+        # Цвет цифры отклонения
+        for w in card.winfo_children():
+            if isinstance(w, tk.Label) and w.cget("font") and "14" in str(w.cget("font")):
+                w.configure(fg=dev_color)
+                break
+
+        # Обновляем цвета surface под текущую тему
+        for key, (card, var, color) in self._kpi_cards.items():
+            card.configure(bg=T["surface"])
+            for w in card.winfo_children():
+                if isinstance(w, tk.Label):
+                    w.configure(bg=T["surface"])
+
+        # Показываем полоску с анимацией (slide-down через after)
+        if not self._kpi_frame.winfo_ismapped():
+            self._kpi_frame.pack(fill="x", padx=16, pady=(0, 6),
+                                 before=self.run_btn)
+            self._animate_kpi_in()
+
+    def _animate_kpi_in(self):
+        """Плавное появление KPI через изменение pady."""
+        steps = [0, 2, 4, 6]
+        delays = [0, 40, 80, 120]
+        for delay, pad in zip(delays, steps):
+            self.after(delay, lambda p=pad: (
+                self._kpi_frame.pack_configure(pady=(p, 6))
+                if self._kpi_frame.winfo_ismapped() else None
+            ))
 
     # ── НОВЫЙ блок: настройки отчёта ─────────────────────────
     def _build_settings_card(self, parent):
@@ -1029,13 +1265,32 @@ class App(tk.Tk):
             if isinstance(result, dict):
                 path = result.get("output_path", out_path)
                 self.after(0, lambda r=result: self._update_recon(r))
+                self.after(0, lambda r=result, p=path: self._show_kpi_cards(r))
+                # Toast с кнопкой "Открыть"
+                folder = os.path.dirname(path)
+                self.after(200, lambda p=path, f=folder: self._toast(
+                    f"Отчёт готов: {os.path.basename(p)}",
+                    kind="ok",
+                    action_text="Открыть папку",
+                    action_cmd=lambda: os.startfile(f),
+                    duration=6000))
             else:
                 path = result or out_path
+                folder = os.path.dirname(path)
+                self.after(200, lambda p=path, f=folder: self._toast(
+                    f"Отчёт готов: {os.path.basename(p)}",
+                    kind="ok",
+                    action_text="Открыть папку",
+                    action_cmd=lambda: os.startfile(f),
+                    duration=6000))
 
             self.after(0, lambda: self._on_success(path))
         except Exception as e:
-            log_fn(f"❌ ОШИБКА: {e}")
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            err_msg = str(e)
+            log_fn(f"❌ ОШИБКА: {err_msg}")
+            self.after(200, lambda m=err_msg: self._toast(
+                f"Ошибка анализа: {m[:80]}", kind="err", duration=7000))
+            self.after(0, lambda: messagebox.showerror("Ошибка", err_msg))
         finally:
             self._stop_anim()
             self.after(0, lambda: self.run_btn.configure(
@@ -1105,10 +1360,20 @@ class App(tk.Tk):
             self._cmp_log(f"Сравниваю «{la}» и «{lb}»")
             run_comparison(pa, pb, out_path, la, lb, log=self._cmp_log)
             self._cmp_log(f"✅ Готово: {out_path}")
+            folder = os.path.dirname(out_path)
+            self.after(200, lambda f=folder: self._toast(
+                f"Сравнение готово: {os.path.basename(out_path)}",
+                kind="ok",
+                action_text="Открыть папку",
+                action_cmd=lambda: os.startfile(f),
+                duration=6000))
             self.after(0, lambda: self._on_success(out_path))
         except Exception as e:
-            self._cmp_log(f"❌ ОШИБКА: {e}")
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            err_msg = str(e)
+            self._cmp_log(f"❌ ОШИБКА: {err_msg}")
+            self.after(200, lambda m=err_msg: self._toast(
+                f"Ошибка сравнения: {m[:80]}", kind="err", duration=7000))
+            self.after(0, lambda: messagebox.showerror("Ошибка", err_msg))
         finally:
             self._stop_anim()
             self.after(0, lambda: self.cmp_run_btn.configure(
@@ -1131,6 +1396,7 @@ class App(tk.Tk):
         self._status_dot.config(fg=C_GREEN)
         self.watch_start_btn.configure(state="disabled")
         self.watch_stop_btn.configure(state="normal")
+        self._toast("Наблюдатель запущен — слежу за папкой", kind="info", duration=3000)
 
     def _stop_watcher(self):
         if self._watcher:
@@ -1229,8 +1495,6 @@ class App(tk.Tk):
 
     def _on_success(self, path):
         self._status_var.set(f"Готово: {os.path.basename(path)}")
-        if messagebox.askyesno("Готово!", f"Отчёт создан:\n{path}\n\nОткрыть папку?"):
-            os.startfile(os.path.dirname(path))
 
 
 if __name__ == "__main__":
