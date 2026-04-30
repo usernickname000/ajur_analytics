@@ -1328,6 +1328,9 @@ class App(tk.Tk):
                 f"CRM+внешние {grand:,.0f} тыс. │ "
                 f"Цель: {verified:,.0f} тыс. │ "
                 f"{pct:+.2f}% — {verdict}").replace(",", " ")
+        diagnostics = result.get("diagnostics") or []
+        if diagnostics:
+            text += " │ проверить: " + "; ".join(diagnostics[:2]).replace(",", " ")
 
         self._recon_label.config(text=text, fg=color)
 
