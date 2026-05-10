@@ -537,6 +537,273 @@ def get_external_totals_by_category(external_json_path):
     return cats
 
 
+def _pct_delta(fact, target):
+    """Возвращает отклонение fact от target в процентах или None."""
+    if target is None or target == 0:
+        return None
+    return (fact / target - 1) * 100
+
+
+def _recon_status(delta_pct, warn=2, bad=5):
+    """Классифицирует качество сверки по процентному отклонению."""
+    if delta_pct is None:
+        return 'нет базы'
+    abs_delta = abs(delta_pct)
+    if abs_delta < warn:
+        return 'OK'
+    if abs_delta < bad:
+        return 'Проверить'
+    return 'Критично'
+
+
+def build_external_income_quality_report(external_json_path, verified_data=None):
+    """
+    Проверяет external_income.json на ошибки, которые чаще всего ломают сверку.
+    Возвращает DataFrame с результатами проверок.
+    """
+    rows = []
+
+    def add(check, status, details):
+        rows.append({'Проверка': check, 'Статус': status, 'Детали': details})
+
+    if not external_json_path or not os.path.exists(external_json_path):
+        add('Файл external_income.json', 'Критично', 'Файл не найден')
+        return pd.DataFrame(rows)
+
+    try:
+        with open(external_json_path, 'r', encoding='utf-8') as f:
+            ext = json.load(f)
+    except Exception as e:
+        add('Чтение external_income.json', 'Критично', str(e))
+        return pd.DataFrame(rows)
+
+    months = [f"{m:02d}" for m in range(1, 13)]
+    data_rows = {
+        key: value for key, value in ext.items()
+        if not str(key).startswith('_') and isinstance(value, dict)
+    }
+
+    add('Строки внешних доходов', 'OK' if data_rows else 'Критично',
+        f'Найдено строк: {len(data_rows)}')
+
+    verified_year = verified_data.get('_год') if isinstance(verified_data, dict) else None
+    external_year = ext.get('_год')
+    if verified_year and external_year and int(verified_year) != int(external_year):
+        add('Год сверки', 'Критично',
+            f'verified_figures.json={verified_year}, external_income.json={external_year}')
+    else:
+        add('Год сверки', 'OK', f'Год: {external_year or verified_year or "не задан"}')
+
+    include_list = ext.get('_включать_в_аналитику', [])
+    missing_include = [row for row in include_list if row not in data_rows]
+    add('Список _включать_в_аналитику',
+        'OK' if not missing_include else 'Критично',
+        'Все строки найдены' if not missing_include else ', '.join(missing_include))
+
+    missing_months = []
+    non_numeric = []
+    for row_name, values in data_rows.items():
+        for month in months:
+            if month not in values:
+                missing_months.append(f'{row_name}: {month}')
+                continue
+            value = values.get(month)
+            if value in ('', None):
+                continue
+            if not isinstance(value, (int, float)):
+                non_numeric.append(f'{row_name}: {month}={value}')
+
+    add('Наличие 12 месяцев',
+        'OK' if not missing_months else 'Проверить',
+        'Все строки имеют 12 месяцев' if not missing_months else '; '.join(missing_months[:20]))
+    add('Числовой формат сумм',
+        'OK' if not non_numeric else 'Критично',
+        'Все суммы числовые или пустые' if not non_numeric else '; '.join(non_numeric[:20]))
+
+    exclude = set(ext.get('_не_включать_в_grand_total', []))
+    negative_income_rows = []
+    for row_name, values in data_rows.items():
+        if row_name in exclude:
+            continue
+        row_sum = sum(
+            (values.get(month, 0) or 0)
+            for month in months
+            if isinstance(values.get(month, 0), (int, float))
+        )
+        if row_sum < 0:
+            negative_income_rows.append(f'{row_name}: {row_sum:,.0f} руб.')
+
+    add('Отрицательные доходные статьи',
+        'OK' if not negative_income_rows else 'Проверить',
+        'Не обнаружены' if not negative_income_rows else '; '.join(negative_income_rows))
+
+    cats = get_external_totals_by_category(external_json_path)
+    if isinstance(verified_data, dict):
+        verified_prog = verified_data.get('programmatic_external')
+        if verified_prog:
+            prog_delta = cats.get('programmatic', 0) - verified_prog
+            prog_pct = _pct_delta(cats.get('programmatic', 0), verified_prog)
+            add('Программатик vs verified_figures',
+                _recon_status(prog_pct, warn=1, bad=3),
+                f'JSON={cats.get("programmatic", 0):,.0f} руб.; '
+                f'verified={verified_prog:,.0f} руб.; delta={prog_delta:,.0f} руб.')
+
+        verified_other = verified_data.get('other_external_income')
+        if verified_other:
+            other_external = cats.get('total_income', 0) - cats.get('programmatic', 0)
+            other_delta = other_external - verified_other
+            other_pct = _pct_delta(other_external, verified_other)
+            other_status = 'OK' if other_pct is not None and abs(other_pct) < 5 else 'Проверить'
+            add('Прочие внешние vs verified_figures',
+                other_status,
+                f'JSON={other_external:,.0f} руб.; '
+                f'verified={verified_other:,.0f} руб.; delta={other_delta:,.0f} руб.; '
+                'проверь состав статей, он может отличаться от бухгалтерской группировки.')
+
+    return pd.DataFrame(rows)
+
+
+def build_unclassified_projects_report(df_full, revenue_col):
+    """Возвращает сводку проектов, которые не попали в PROJECT_GROUP_MAP."""
+    if COL_PROJECT not in df_full.columns or 'БИЗНЕС_ГРУППА' not in df_full.columns:
+        return pd.DataFrame(columns=['Проект CRM', 'Заказов', 'Выручка, тыс. руб.', 'Доля CRM, %'])
+
+    total_revenue = df_full[revenue_col].sum()
+    unclassified = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'НЕ КЛАССИФИЦИРОВАНО']
+    if unclassified.empty:
+        return pd.DataFrame([{
+            'Проект CRM': 'Все проекты классифицированы',
+            'Заказов': 0,
+            'Выручка, тыс. руб.': 0,
+            'Доля CRM, %': 0,
+        }])
+
+    report = (
+        unclassified.groupby(COL_PROJECT, dropna=False)
+        .agg(Заказов=(COL_ORDER, 'count'), Выручка_руб=(revenue_col, 'sum'))
+        .reset_index()
+        .rename(columns={COL_PROJECT: 'Проект CRM'})
+    )
+    report['Проект CRM'] = report['Проект CRM'].fillna('Пустой проект')
+    report['Выручка, тыс. руб.'] = (report['Выручка_руб'] / 1000).round(2)
+    report['Доля CRM, %'] = (
+        report['Выручка_руб'] / total_revenue * 100 if total_revenue else 0
+    ).round(2)
+    return report.drop(columns=['Выручка_руб']).sort_values('Выручка, тыс. руб.', ascending=False)
+
+
+def build_crm_issue_rows(df_full, revenue_col):
+    """Формирует список CRM-строк, которые могут искажать итоговую сверку."""
+    issue_frames = []
+
+    def add_issue(mask, issue):
+        if not mask.any():
+            return
+        cols = [
+            col for col in [
+                COL_ORDER, COL_MONTH, COL_DATE, 'Дата_оплаты', COL_PROJECT,
+                'БИЗНЕС_ГРУППА', COL_MANAGER, 'КОНЕЧНЫЙ_КЛИЕНТ', revenue_col,
+                COL_BARTER, COL_DISCOUNT_PCT
+            ]
+            if col in df_full.columns
+        ]
+        part = df_full.loc[mask, cols].copy()
+        part.insert(0, 'Проблема', issue)
+        issue_frames.append(part)
+
+    add_issue(df_full[revenue_col].isna(), 'Пустая/нечисловая выручка')
+    add_issue(df_full[revenue_col].fillna(0).eq(0), 'Нулевая выручка')
+    add_issue(df_full[revenue_col].fillna(0).lt(0), 'Отрицательная выручка')
+
+    if 'Дата_заказа' in df_full.columns:
+        add_issue(df_full['Дата_заказа'].isna(), 'Некорректная дата заказа')
+    if 'Дата_оплаты' in df_full.columns:
+        add_issue(df_full['Дата_оплаты'].isna(), 'Нет даты оплаты')
+    if COL_PROJECT in df_full.columns:
+        add_issue(df_full[COL_PROJECT].isna() | df_full[COL_PROJECT].astype(str).str.strip().eq(''),
+                  'Пустой проект')
+    if 'БИЗНЕС_ГРУППА' in df_full.columns:
+        add_issue(df_full['БИЗНЕС_ГРУППА'].eq('НЕ КЛАССИФИЦИРОВАНО'),
+                  'Проект не классифицирован')
+    if 'КОНЕЧНЫЙ_КЛИЕНТ' in df_full.columns:
+        add_issue(df_full['КОНЕЧНЫЙ_КЛИЕНТ'].isna() | df_full['КОНЕЧНЫЙ_КЛИЕНТ'].astype(str).str.strip().eq(''),
+                  'Пустой конечный клиент')
+    if COL_ORDER in df_full.columns:
+        add_issue(df_full.duplicated(subset=[COL_ORDER], keep=False), 'Дубликат номера заказа')
+
+    if not issue_frames:
+        return pd.DataFrame([{'Проблема': 'Явных проблемных строк не найдено'}])
+
+    issues = pd.concat(issue_frames, ignore_index=True)
+    if revenue_col in issues.columns:
+        issues = issues.sort_values(revenue_col, ascending=False, na_position='last')
+    return issues.head(500)
+
+
+def build_reconciliation_bridge(
+    rev_all_k,
+    rev_bez_prog_k,
+    rev_reklama_k,
+    crm_prog_k,
+    ext_cats,
+    vf_total_with_prog_k,
+    vf_total_no_prog_k,
+    vf_ads_no_events_k,
+):
+    """Строит понятный мост от CRM-итога к бухгалтерским срезам."""
+    ext_prog_k = ext_cats.get('programmatic', 0) / 1000
+    ext_barter_k = ext_cats.get('barter', 0) / 1000
+    ext_income_k = ext_cats.get('total_income', 0) / 1000
+    ext_deduct_k = ext_cats.get('deductions', 0) / 1000
+
+    rows = [
+        ('CRM: все строки выгрузки', rev_all_k, '', '', ''),
+        ('минус CRM-программатик', -crm_prog_k, '', '', ''),
+        ('CRM без программатика', rev_bez_prog_k, '', '', ''),
+        ('плюс внешний программатик', ext_prog_k, '', '', ''),
+        ('плюс внешний бартер', ext_barter_k, '', '', ''),
+        ('плюс прочие внешние доходы', ext_income_k - ext_prog_k - ext_barter_k, '', '', ''),
+        ('справочно: внешние вычеты не в grand total', ext_deduct_k, '', '', ''),
+    ]
+
+    scenarios = [
+        ('Итого: CRM + все внешние доходы', rev_all_k + ext_income_k, vf_total_with_prog_k),
+        ('Итого: CRM без прогр. + бартер', rev_bez_prog_k + ext_barter_k, vf_total_no_prog_k),
+        ('Итого: реклама без мероприятий', rev_reklama_k, vf_ads_no_events_k),
+    ]
+    for name, fact, target in scenarios:
+        delta = fact - target if target else None
+        pct = _pct_delta(fact, target)
+        rows.append((name, fact, target or '', delta if delta is not None else '', _recon_status(pct)))
+
+    return pd.DataFrame(
+        rows,
+        columns=['Шаг / срез', 'Факт, тыс. руб.', 'Бухгалтерия, тыс. руб.', 'Разница, тыс. руб.', 'Статус']
+    )
+
+
+def build_payment_order_reconciliation(monthly_stats):
+    """Сравнивает месячный факт по дате заказа и по дате оплаты."""
+    if monthly_stats is None or 'Выручка по дате оплаты, тыс. руб.' not in monthly_stats.columns:
+        return None
+
+    result = monthly_stats[['Период', 'Сумма выручки, тыс. руб.', 'Выручка по дате оплаты, тыс. руб.']].copy()
+    result = result.rename(columns={
+        'Сумма выручки, тыс. руб.': 'CRM по дате заказа, тыс. руб.',
+        'Выручка по дате оплаты, тыс. руб.': 'CRM по дате оплаты, тыс. руб.',
+    })
+    result['Разница оплата-заказ, тыс. руб.'] = (
+        result['CRM по дате оплаты, тыс. руб.'] - result['CRM по дате заказа, тыс. руб.']
+    ).round(2)
+    result['Разница, %'] = result.apply(
+        lambda row: round(
+            row['Разница оплата-заказ, тыс. руб.'] / row['CRM по дате заказа, тыс. руб.'] * 100, 2
+        ) if row['CRM по дате заказа, тыс. руб.'] else None,
+        axis=1,
+    )
+    return result
+
+
 def parse_month(s):
     try:
         if pd.isna(s):
@@ -1211,12 +1478,14 @@ def run_analytics(input_path: str, output_path: str, log=print,
             break
 
     validate_analytics_consistency(verified, _ext_json_found, log=log)
+    external_quality_report = build_external_income_quality_report(_ext_json_found, verified)
 
     # Полный итог всех внешних статей (для сверки с бухгалтерией)
     full_external_k = get_full_external_total(_ext_json_found) / 1000 if _ext_json_found else 0.0
 
     # ── 10. Месячная статистика ──────────────────────────────
     monthly_stats = None
+    payment_order_reconciliation = None
     if COL_MONTH in df_full.columns:
         log("Считаю месячную статистику...")
         df_full['Дата_месяц'] = df_full[COL_MONTH].apply(parse_month)
@@ -1298,6 +1567,8 @@ def run_analytics(input_path: str, output_path: str, log=print,
                     monthly_stats['Выручка по дате оплаты, тыс. руб.'] + monthly_stats['Внешние доходы, тыс. руб.']
                 ).round(2)
 
+        payment_order_reconciliation = build_payment_order_reconciliation(monthly_stats)
+
     # ── 11. Топ клиентов ─────────────────────────────────────
     log("Считаю топ клиентов...")
     client_df_for_rank = df_full.loc[
@@ -1334,6 +1605,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
         group_stats.reset_index()
         .sort_values('Выручка CRM, тыс. руб.', ascending=False)
     )
+    unclassified_projects = build_unclassified_projects_report(df_full, revenue_col)
 
     # Сводка по группам — CRM vs бухгалтерия (без попытки сложить, чтобы не дублировать)
     crm_ads      = df_full.loc[df_full['БИЗНЕС_ГРУППА'].isin(['Реклама Фонтанка', 'Реклама Доктор']), revenue_col].sum()
@@ -1430,6 +1702,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # Разбираем дату заказа один раз — используется в сезонности и RFM
     if COL_DATE in df_full.columns:
         df_full['Дата_заказа'] = pd.to_datetime(df_full[COL_DATE], errors='coerce')
+    crm_issue_rows = build_crm_issue_rows(df_full, revenue_col)
 
     # ── 14. Сезонность ───────────────────────────────────────
     seasonal_stats = None
@@ -1657,6 +1930,16 @@ def run_analytics(input_path: str, output_path: str, log=print,
     vf_total_with_prog_k = vf_total_with_prog / 1000 if vf_total_with_prog else None
     vf_total_no_prog_k   = vf_total_no_prog   / 1000 if vf_total_no_prog   else None
     vf_ads_no_events_k   = vf_ads_no_events   / 1000 if vf_ads_no_events   else None
+    reconciliation_bridge = build_reconciliation_bridge(
+        rev_all_k=rev_all,
+        rev_bez_prog_k=rev_bez_prog,
+        rev_reklama_k=rev_reklama,
+        crm_prog_k=crm_prog / 1000,
+        ext_cats=ext_cats,
+        vf_total_with_prog_k=vf_total_with_prog_k,
+        vf_total_no_prog_k=vf_total_no_prog_k,
+        vf_ads_no_events_k=vf_ads_no_events_k,
+    )
 
     cmp_rows = []
 
@@ -1939,6 +2222,43 @@ def run_analytics(input_path: str, output_path: str, log=print,
         df_full, revenue_col, monthly_stats, manager_stats, client_stats,
         rfm_all, mask_no_events, log=log
     )
+    extra_signals = []
+    if unclassified_projects is not None and not unclassified_projects.empty:
+        unclass_total = unclassified_projects['Выручка, тыс. руб.'].sum()
+        if unclass_total > 0:
+            extra_signals.append({
+                'Приоритет': '🔴 Высокий',
+                'Категория': 'Сверка',
+                'Сигнал': f'Есть неклассифицированные проекты: {unclass_total:,.0f} тыс. руб.',
+                'Детали': 'Проверь лист 18_Неклассифицированные: эти проекты не попали в PROJECT_GROUP_MAP.'
+            })
+
+    if external_quality_report is not None and not external_quality_report.empty:
+        bad_checks = external_quality_report[
+            external_quality_report['Статус'].isin(['Критично', 'Проверить'])
+        ]
+        if not bad_checks.empty:
+            extra_signals.append({
+                'Приоритет': '🔴 Высокий' if (bad_checks['Статус'] == 'Критично').any() else '🟡 Средний',
+                'Категория': 'Внешние доходы',
+                'Сигнал': f'Проверки external_income.json: {len(bad_checks)} замечаний',
+                'Детали': '; '.join(bad_checks['Проверка'].head(5).tolist())
+            })
+
+    if payment_order_reconciliation is not None and not payment_order_reconciliation.empty:
+        total_order_k = payment_order_reconciliation['CRM по дате заказа, тыс. руб.'].sum()
+        total_payment_k = payment_order_reconciliation['CRM по дате оплаты, тыс. руб.'].sum()
+        payment_delta_pct = _pct_delta(total_payment_k, total_order_k)
+        if payment_delta_pct is not None and abs(payment_delta_pct) > 2:
+            extra_signals.append({
+                'Приоритет': '🟡 Средний',
+                'Категория': 'Дата оплаты',
+                'Сигнал': f'По оплате и по заказу разные итоги: {payment_delta_pct:+.2f}%',
+                'Детали': 'Проверь лист 19_Заказ_vs_Оплата: бухгалтерия обычно ближе к оплате/закрытию.'
+            })
+
+    if extra_signals:
+        signals_df = pd.concat([pd.DataFrame(extra_signals), signals_df], ignore_index=True)
 
     # ── 19г. Бухгалтерская таблица ───────────────────────────
     log("Строю бухгалтерскую таблицу...")
@@ -1998,6 +2318,12 @@ def run_analytics(input_path: str, output_path: str, log=print,
         if discount_stats['by_manager'] is not None:
             export_data['17б_Скидки_менеджеры'] = discount_stats['by_manager']
         export_data['17в_Скидки_по_бакетам'] = discount_stats['by_bucket']
+    export_data['18_Мост_расхождений'] = reconciliation_bridge
+    export_data['18а_Неклассифицированные'] = unclassified_projects
+    export_data['18б_CRM_проблемные_строки'] = crm_issue_rows
+    export_data['18в_External_QA'] = external_quality_report
+    if payment_order_reconciliation is not None:
+        export_data['19_Заказ_vs_Оплата'] = payment_order_reconciliation
 
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         for sheet_name, df_sheet in export_data.items():
@@ -2165,6 +2491,23 @@ def run_analytics(input_path: str, output_path: str, log=print,
         (grand_total_k / verified_total_k - 1) * 100
         if verified_total_k > 0 else None
     )
+    diagnostics = []
+    if unclassified_projects is not None and not unclassified_projects.empty:
+        unclass_total_k = unclassified_projects['Выручка, тыс. руб.'].sum()
+        if unclass_total_k > 0:
+            diagnostics.append(f"неклассифицированные проекты: {unclass_total_k:,.0f} тыс.")
+    if external_quality_report is not None and not external_quality_report.empty:
+        bad_external = external_quality_report[
+            external_quality_report['Статус'].isin(['Критично', 'Проверить'])
+        ]
+        if not bad_external.empty:
+            diagnostics.append(f"external_income.json: {len(bad_external)} замечаний")
+    if payment_order_reconciliation is not None and not payment_order_reconciliation.empty:
+        order_k = payment_order_reconciliation['CRM по дате заказа, тыс. руб.'].sum()
+        payment_k = payment_order_reconciliation['CRM по дате оплаты, тыс. руб.'].sum()
+        pay_delta_pct = _pct_delta(payment_k, order_k)
+        if pay_delta_pct is not None and abs(pay_delta_pct) > 2:
+            diagnostics.append(f"заказ vs оплата: {pay_delta_pct:+.2f}%")
 
     report_info = {
         'output_path':           output_path,
@@ -2176,6 +2519,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
         'verified_total':        round(verified_total_k, 2),
         'deviation_pct':         round(deviation_pct, 2) if deviation_pct is not None else None,
         'date_by':               date_by,
+        'diagnostics':           diagnostics,
     }
 
     crm_used_k = crm_base_k
@@ -2192,5 +2536,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
             f"Отклонение: {sign}{deviation_pct:.2f}% — {verdict}")
     else:
         log(f"📊 Итого: {grand_total_k:,.0f} тыс.")
+    if diagnostics:
+        log("🔎 Диагностика сверки: " + " | ".join(diagnostics))
 
     return report_info
