@@ -10,6 +10,26 @@ import json
 from datetime import datetime
 from openpyxl.utils import get_column_letter
 
+_ALIASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'client_aliases.json')
+_aliases_cache = None
+
+
+def _load_aliases():
+    global _aliases_cache
+    if _aliases_cache is None:
+        reload_aliases()
+    return _aliases_cache
+
+
+def reload_aliases():
+    global _aliases_cache
+    try:
+        with open(_ALIASES_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        _aliases_cache = [(g['canonical'], g['patterns']) for g in data.get('groups', [])]
+    except Exception:
+        _aliases_cache = []
+
 
 # ==============================
 # ПАРАМЕТРЫ (можно редактировать)
@@ -256,18 +276,9 @@ def normalize_client(name):
     if pd.isna(name):
         return name
     name_clean = str(name).upper()
-    if 'ГАЗПРОМ' in name_clean:
-        return 'ГАЗПРОМ'
-    if 'АЛЬКОР' in name_clean or 'ГЛАВСТРОЙ' in name_clean:
-        return 'АЛЬКОР / ГЛАВСТРОЙ'
-    SBER_PATTERNS = [
-        'СБЕР', 'SBER', 'СБЕРБАНК', 'СБЕР ЛИЗИНГ', 'СБЕРМАРКЕТ',
-        'СБЕР ЗДОРОВЬЕ', 'СБЕРСТРАХ', 'СБЕРЛОГИСТИК',
-        'ГЛОБАЛ МЕДИА ЕВРАЗИЯ', 'GLOBAL MEDIA EURASIA',
-        'С-МАРКЕТИНГ', 'С МАРКЕТИНГ'
-    ]
-    if any(p in name_clean for p in SBER_PATTERNS):
-        return 'ГРУППА СБЕР'
+    for canonical, patterns in _load_aliases():
+        if any(p in name_clean for p in patterns):
+            return canonical
     return name
 
 

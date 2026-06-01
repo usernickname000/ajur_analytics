@@ -32,6 +32,12 @@ try:
 except ImportError:
     HAS_VF_EDITOR = False
 
+try:
+    from client_aliases_editor import ClientAliasesEditor
+    HAS_ALIASES_EDITOR = True
+except ImportError:
+    HAS_ALIASES_EDITOR = False
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 ICON_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
 APP_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -984,6 +990,13 @@ class App(tk.Tk):
                        text="Внешние доходы",
                        font=("Segoe UI", 9), fg=T["text"],
                        command=self._open_external_editor,
+                       padx=10, pady=4).pack(side="left", padx=(0, 6))
+
+        if HAS_ALIASES_EDITOR:
+            AnimButton(row2, T["surface2"], T["border"],
+                       text="Алиасы клиентов",
+                       font=("Segoe UI", 9), fg=T["text"],
+                       command=self._open_aliases_editor,
                        padx=10, pady=4).pack(side="left")
 
     def _build_recon_indicator(self, parent):
@@ -1088,6 +1101,21 @@ class App(tk.Tk):
                 f"Файл external_income.json не найден:\n{path}")
             return
         ExternalIncomeEditor(self, path, theme=self._T)
+
+    def _open_aliases_editor(self):
+        path = os.path.join(APP_DIR, "client_aliases.json")
+        if not os.path.exists(path):
+            default = {
+                "_описание": "Правила нормализации клиентов.",
+                "groups": []
+            }
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(default, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+                return
+        ClientAliasesEditor(self, path, theme=self._T)
 
     def _open_verified_editor(self):
         path = os.path.join(APP_DIR, "verified_figures.json")
