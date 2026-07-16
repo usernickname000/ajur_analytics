@@ -46,16 +46,10 @@ cmd = [
     "--hidden-import=openpyxl.styles.fills",
     "--hidden-import=openpyxl.chart",
     "--hidden-import=openpyxl.utils",
-    # watchdog
-    "--hidden-import=watchdog",
-    "--hidden-import=watchdog.observers",
-    "--hidden-import=watchdog.observers.winapi",
-    "--hidden-import=watchdog.events",
     # модули приложения
     "--hidden-import=analytics",
     "--hidden-import=comparison",
     "--hidden-import=dashboard",
-    "--hidden-import=watcher",
     "--hidden-import=verified_figures_editor",
     "--hidden-import=external_income_editor",
     "--hidden-import=dohody_import",
