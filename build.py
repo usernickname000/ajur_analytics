@@ -58,6 +58,8 @@ cmd = [
     "--hidden-import=watcher",
     "--hidden-import=verified_figures_editor",
     "--hidden-import=external_income_editor",
+    "--hidden-import=dohody_import",
+    "--hidden-import=dohody_import_dialog",
     *icon_args,
     *add_data,
     "app.py",

@@ -38,6 +38,12 @@ try:
 except ImportError:
     HAS_ALIASES_EDITOR = False
 
+try:
+    from dohody_import_dialog import DohodyImportDialog
+    HAS_DOHODY_IMPORT = True
+except ImportError:
+    HAS_DOHODY_IMPORT = False
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 ICON_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
 APP_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -992,6 +998,13 @@ class App(tk.Tk):
                        command=self._open_external_editor,
                        padx=10, pady=4).pack(side="left", padx=(0, 6))
 
+        if HAS_DOHODY_IMPORT:
+            AnimButton(row2, T["surface2"], T["border"],
+                       text="Импорт Доходы.xlsx",
+                       font=("Segoe UI", 9), fg=T["text"],
+                       command=self._open_dohody_import,
+                       padx=10, pady=4).pack(side="left", padx=(0, 6))
+
         if HAS_ALIASES_EDITOR:
             AnimButton(row2, T["surface2"], T["border"],
                        text="Алиасы клиентов",
@@ -1101,6 +1114,10 @@ class App(tk.Tk):
                 f"Файл external_income.json не найден:\n{path}")
             return
         ExternalIncomeEditor(self, path, theme=self._T)
+
+    def _open_dohody_import(self):
+        path = os.path.join(APP_DIR, "external_income.json")
+        DohodyImportDialog(self, path, theme=self._T)
 
     def _open_aliases_editor(self):
         path = os.path.join(APP_DIR, "client_aliases.json")
