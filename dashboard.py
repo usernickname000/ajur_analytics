@@ -19,6 +19,12 @@ from analytics import (
 
 
 def _load_and_prepare(path: str) -> pd.DataFrame:
+    """
+    EXCLUDE_MANAGERS и EXCLUDE_PROJECTS не вырезаются из общего датасета — как и в
+    run_analytics (analytics.py), они влияют только на статистику по менеджерам и
+    на средний чек соответственно (см. README), иначе KPI дашборда (Выручка,
+    Заказов, Клиентов) не совпадают с отчётом "Анализ".
+    """
     df = pd.read_excel(path, dtype=object)
     df.columns = df.columns.map(lambda x: x.strip() if isinstance(x, str) else x)
     if COL_MONTH in df.columns:
@@ -30,10 +36,6 @@ def _load_and_prepare(path: str) -> pd.DataFrame:
     df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1).apply(normalize_client)
     df['ОТРАСЛЬ'] = df.apply(pick_industry, axis=1)
     df['ОТРАСЛЬ_НОРМ'] = df.apply(classify_industry, axis=1)
-    if COL_MANAGER in df.columns:
-        df = df[~df[COL_MANAGER].isin(EXCLUDE_MANAGERS)].reset_index(drop=True)
-    if COL_PROJECT in df.columns:
-        df = df[~df[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS)].reset_index(drop=True)
     if COL_MONTH in df.columns:
         df['_month_dt'] = df[COL_MONTH].apply(parse_month)
     return df
@@ -43,7 +45,13 @@ def _collect_data(df: pd.DataFrame) -> dict:
     rev_total = round(df[COL_REVENUE].sum() / 1000, 1)
     orders    = len(df)
     clients   = df['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
-    avg_check = round(df[COL_REVENUE].mean() / 1000, 1)
+
+    # Средний чек — без мероприятий (см. README), как в run_analytics.
+    mask_no_events = (
+        ~df[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS)
+        if COL_PROJECT in df.columns else pd.Series(True, index=df.index)
+    )
+    avg_check = round(df.loc[mask_no_events, COL_REVENUE].mean() / 1000, 1)
 
     monthly = []
     if '_month_dt' in df.columns:
@@ -63,7 +71,9 @@ def _collect_data(df: pd.DataFrame) -> dict:
 
     top_mgr = pd.DataFrame()
     if COL_MANAGER in df.columns:
-        top_mgr = (df.groupby(COL_MANAGER)[COL_REVENUE]
+        # Менеджеры вне отдела исключаются только здесь (см. README), не из общих итогов.
+        mgr_df = df.loc[~df[COL_MANAGER].isin(EXCLUDE_MANAGERS)]
+        top_mgr = (mgr_df.groupby(COL_MANAGER)[COL_REVENUE]
                      .sum().nlargest(10).reset_index())
         top_mgr.columns = ['name', 'revenue']
         top_mgr['revenue'] = (top_mgr['revenue'] / 1000).round(1)

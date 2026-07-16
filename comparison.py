@@ -24,7 +24,14 @@ from analytics import (
 # ============================================================
 
 def _load_period(path: str, log) -> pd.DataFrame:
-    """Загружает файл, применяет те же фильтры и нормализацию, что и run_analytics."""
+    """
+    Загружает файл, применяет те же фильтры и нормализацию, что и run_analytics.
+
+    EXCLUDE_MANAGERS и EXCLUDE_PROJECTS здесь НЕ вырезаются из общего датасета —
+    как и в run_analytics (analytics.py), они влияют только на конкретные срезы
+    (статистика по менеджерам / средний чек), иначе "Выручка", "Заказов" и
+    "Уникальных клиентов" в сравнении периодов не совпадают с отчётом "Анализ".
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Файл не найден: {path}")
 
@@ -45,16 +52,15 @@ def _load_period(path: str, log) -> pd.DataFrame:
     df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1)
     df['КОНЕЧНЫЙ_КЛИЕНТ'] = df['КОНЕЧНЫЙ_КЛИЕНТ'].apply(normalize_client)
 
-    # Исключаем менеджеров вне отдела
-    if COL_MANAGER in df.columns:
-        df = df.loc[~df[COL_MANAGER].isin(EXCLUDE_MANAGERS)].reset_index(drop=True)
-
-    # Исключаем мероприятия
-    if COL_PROJECT in df.columns:
-        df = df.loc[~df[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS)].reset_index(drop=True)
-
     log(f"  Загружено строк после фильтров: {len(df)}")
     return df
+
+
+def _mask_no_events(df: pd.DataFrame) -> pd.Series:
+    """Маска строк без мероприятий — для среднего/медианного чека (см. README)."""
+    if COL_PROJECT in df.columns:
+        return ~df[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS)
+    return pd.Series(True, index=df.index)
 
 
 # ============================================================
@@ -64,6 +70,8 @@ def _load_period(path: str, log) -> pd.DataFrame:
 def _manager_stats(df: pd.DataFrame) -> pd.DataFrame:
     if COL_MANAGER not in df.columns:
         return pd.DataFrame()
+    # Менеджеры вне отдела исключаются только из этого среза (см. README), а не из общих итогов.
+    df = df.loc[~df[COL_MANAGER].isin(EXCLUDE_MANAGERS)]
     stats = (
         df.groupby(COL_MANAGER)
         .agg(
@@ -153,12 +161,16 @@ def _sheet_summary(wb, df_a, df_b, label_a, label_b):
     ord_b = len(df_b)
     metrics.append(("Количество заказов", ord_a, ord_b))
 
-    avg_a = round(df_a[COL_REVENUE].mean() / 1000, 2)
-    avg_b = round(df_b[COL_REVENUE].mean() / 1000, 2)
+    # Средний/медианный чек считаются без мероприятий (см. README) — как в run_analytics.
+    mask_a = _mask_no_events(df_a)
+    mask_b = _mask_no_events(df_b)
+
+    avg_a = round(df_a.loc[mask_a, COL_REVENUE].mean() / 1000, 2)
+    avg_b = round(df_b.loc[mask_b, COL_REVENUE].mean() / 1000, 2)
     metrics.append(("Средний чек, тыс. руб.", avg_a, avg_b))
 
-    med_a = round(df_a[COL_REVENUE].median() / 1000, 2)
-    med_b = round(df_b[COL_REVENUE].median() / 1000, 2)
+    med_a = round(df_a.loc[mask_a, COL_REVENUE].median() / 1000, 2)
+    med_b = round(df_b.loc[mask_b, COL_REVENUE].median() / 1000, 2)
     metrics.append(("Медианный чек, тыс. руб.", med_a, med_b))
 
     cli_a = df_a['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
