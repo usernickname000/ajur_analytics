@@ -17,7 +17,6 @@ from datetime import datetime, timezone, timedelta
 
 from analytics import run_analytics
 from comparison import run_comparison
-from watcher import FolderWatcher
 from dashboard import generate_dashboard
 
 try:
@@ -292,7 +291,6 @@ class App(tk.Tk):
         ("analysis",    "▸",  "Анализ"),
         ("compare",     "⇄",  "Сравнение"),
         ("plan",        "≡",  "План"),
-        ("watcher",     "◎",  "Наблюдатель"),
         ("dashboard",   "⊞",  "Дашборд"),
     ]
 
@@ -313,7 +311,6 @@ class App(tk.Tk):
         self._tn          = self._cfg.get("theme", "dark")
         self._T           = THEMES[self._tn]
         self._tw          = []
-        self._watcher     = None
         self._plan_vars   = {}
         self._anim_running= False
         self._anim_step   = 0
@@ -335,8 +332,6 @@ class App(tk.Tk):
             pass
 
     def _on_close(self):
-        if self._watcher:
-            self._watcher.stop()
         self._cfg["theme"]  = self._tn
         self._cfg["date_by"]= self._date_by.get()
         save_config(self._cfg)
@@ -634,7 +629,7 @@ class App(tk.Tk):
             pass
 
         # Логи
-        for attr in ["log_box", "cmp_log_box", "watch_log_box", "dash_log_box"]:
+        for attr in ["log_box", "cmp_log_box", "dash_log_box"]:
             box = getattr(self, attr, None)
             if box:
                 try:
@@ -898,7 +893,6 @@ class App(tk.Tk):
         self._build_page_analysis()
         self._build_page_compare()
         self._build_page_plan()
-        self._build_page_watcher()
         self._build_page_dashboard()
 
     # ============================================================
@@ -1344,87 +1338,7 @@ class App(tk.Tk):
         return result or None
 
     # ============================================================
-    # СТРАНИЦА 4: НАБЛЮДАТЕЛЬ
-    # ============================================================
-    def _build_page_watcher(self):
-        p = self._pages["watcher"]
-        T = self._T
-
-        self._page_header(p, "Наблюдатель",
-                          "Авто-анализ через 5 минут после появления нового .xlsx")
-
-        cw = self._card(p, "Папка для наблюдения", "👁")
-        self.watch_dir_var = tk.StringVar(
-            value=self._cfg.get("watch_dir", ""))
-        self._file_row(cw, self.watch_dir_var, self._browse_watch_dir)
-
-        co = self._card(p, "Папка для отчётов", "📁")
-        self.watch_out_var = tk.StringVar(
-            value=self._cfg.get("watch_output_dir", ""))
-        self._file_row(co, self.watch_out_var, self._browse_watch_out)
-
-        # Статус-блок
-        sf = self._r(tk.Frame(p, bg=T["bg"]), "bg")
-        sf.pack(fill="x", padx=32, pady=(20, 8))
-
-        status_card = self._r(
-            tk.Frame(sf, bg=T["surface"],
-                     highlightbackground=T["border"],
-                     highlightthickness=1), "surface")
-        status_card.pack(fill="x")
-
-        status_inner = self._r(
-            tk.Frame(status_card, bg=T["surface"], padx=16, pady=12), "surface")
-        status_inner.pack(fill="x")
-
-        self._status_dot = tk.Label(
-            status_inner, text="●",
-            font=("Segoe UI", 16),
-            bg=T["surface"], fg=T["muted"])
-        self._r(self._status_dot, "surface")
-        self._status_dot.pack(side="left", padx=(0, 12))
-
-        status_text = self._r(tk.Frame(status_inner, bg=T["surface"]), "surface")
-        status_text.pack(side="left")
-
-        self.watch_status_var = tk.StringVar(value="Остановлен")
-        self.watch_status_lbl = tk.Label(
-            status_text, textvariable=self.watch_status_var,
-            font=("Segoe UI", 12, "bold"),
-            bg=T["surface"], fg=T["muted"])
-        self._r(self.watch_status_lbl, "surface")
-        self.watch_status_lbl.pack(anchor="w")
-
-        tk.Label(status_text, text="Нажмите «Запустить» для начала слежения",
-                 font=("Segoe UI", 8),
-                 bg=T["surface"], fg=T["muted"]).pack(anchor="w")
-        self._r(status_text.winfo_children()[-1], "muted_sf")
-
-        self._section_lbl(p, "ЖУРНАЛ")
-        self.watch_log_box = self._log_box(p, height=8)
-
-        # Кнопки
-        bf = self._r(tk.Frame(p, bg=T["bg"]), "bg")
-        bf.pack(fill="x", padx=32, pady=(8, 20))
-
-        self.watch_start_btn = AnimButton(
-            bf, C_GREEN, C_GREEN_D,
-            text="  ▶  Запустить",
-            font=("Segoe UI", 10, "bold"),
-            fg="#FFFFFF", command=self._start_watcher,
-            padx=20, pady=11)
-        self.watch_start_btn.pack(side="left", padx=(0, 10))
-
-        self.watch_stop_btn = AnimButton(
-            bf, C_RED, C_RED_D,
-            text="  ⏹  Остановить",
-            font=("Segoe UI", 10, "bold"),
-            fg="#FFFFFF", command=self._stop_watcher,
-            padx=20, pady=11, state="disabled")
-        self.watch_stop_btn.pack(side="left")
-
-    # ============================================================
-    # СТРАНИЦА 5: ДАШБОРД
+    # СТРАНИЦА 4: ДАШБОРД
     # ============================================================
     def _build_page_dashboard(self):
         p = self._pages["dashboard"]
@@ -1512,23 +1426,6 @@ class App(tk.Tk):
         if path:
             self.cmp_output_dir.set(path)
 
-    def _browse_watch_dir(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.watch_dir_var.set(path)
-            self._cfg["watch_dir"] = path
-            if not self.watch_out_var.get():
-                self.watch_out_var.set(path)
-                self._cfg["watch_output_dir"] = path
-            save_config(self._cfg)
-
-    def _browse_watch_out(self):
-        path = filedialog.askdirectory()
-        if path:
-            self.watch_out_var.set(path)
-            self._cfg["watch_output_dir"] = path
-            save_config(self._cfg)
-
     def _browse_dash_input(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
         if path:
@@ -1542,9 +1439,6 @@ class App(tk.Tk):
 
     def _cmp_log(self, msg):
         self._write_log(self.cmp_log_box, msg)
-
-    def _watch_log(self, msg):
-        self.after(0, lambda: self._write_log(self.watch_log_box, msg))
 
     def _dash_log(self, msg):
         self._write_log(self.dash_log_box, msg)
@@ -1695,38 +1589,6 @@ class App(tk.Tk):
             self._stop_anim()
             self.after(0, lambda: self.cmp_run_btn.configure(
                 state="normal", text="  Сравнить периоды  "))
-
-    # ============================================================
-    # НАБЛЮДАТЕЛЬ
-    # ============================================================
-    def _start_watcher(self):
-        wd = self.watch_dir_var.get().strip()
-        wo = self.watch_out_var.get().strip()
-        if not wd or not wo:
-            messagebox.showwarning("", "Укажите обе папки.")
-            return
-        if not os.path.isdir(wd):
-            messagebox.showerror("", f"Папка не существует:\n{wd}")
-            return
-        self._watcher = FolderWatcher(wd, wo, self._watch_log)
-        self._watcher.start()
-        self.watch_status_var.set("Наблюдатель активен")
-        self.watch_status_lbl.config(fg=C_GREEN)
-        self._status_dot.config(fg=C_GREEN)
-        self.watch_start_btn.configure(state="disabled")
-        self.watch_stop_btn.configure(state="normal")
-        self._toast("Наблюдатель запущен", kind="info", duration=3000)
-
-    def _stop_watcher(self):
-        if self._watcher:
-            self._watcher.stop()
-            self._watcher = None
-        T = self._T
-        self.watch_status_var.set("Остановлен")
-        self.watch_status_lbl.config(fg=T["muted"])
-        self._status_dot.config(fg=T["muted"])
-        self.watch_start_btn.configure(state="normal")
-        self.watch_stop_btn.configure(state="disabled")
 
     # ============================================================
     # ДАШБОРД
