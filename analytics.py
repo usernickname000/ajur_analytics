@@ -752,9 +752,9 @@ def build_crm_issue_rows(df_full, revenue_col):
         add_issue(df_full['КОНЕЧНЫЙ_КЛИЕНТ'].isna() | df_full['КОНЕЧНЫЙ_КЛИЕНТ'].astype(str).str.strip().eq(''),
                   'Пустой конечный клиент')
     if COL_ORDER in df_full.columns:
-        dup_col = _order_dup_key(df_full)
+        dup_mask, dup_col = _order_dup_mask(df_full, keep=False)
         dup_issue = 'Дубликат позиции заказа' if dup_col == COL_POS_ORDER else 'Дубликат номера заказа'
-        add_issue(df_full.duplicated(subset=[dup_col], keep=False), dup_issue)
+        add_issue(dup_mask, dup_issue)
 
     if not issue_frames:
         return pd.DataFrame([{'Проблема': 'Явных проблемных строк не найдено'}])
@@ -1294,6 +1294,23 @@ def _order_dup_key(df):
     return COL_ORDER
 
 
+def _order_dup_mask(df, keep):
+    """
+    Маска дублей по _order_dup_key(df). Пустое/пробельное значение ключа
+    считается уникальным само по себе (не дублем других пустых значений) —
+    иначе при частично заполненной 'Позиция заказа' все строки с пустым
+    значением ложно попадали бы в дубли друг к другу.
+    """
+    dup_col = _order_dup_key(df)
+    raw = df[dup_col]
+    key = raw.astype(str).str.strip()
+    # raw.isna() — а не сравнение строки с 'nan' — потому что astype(str) в
+    # некоторых версиях pandas оставляет NaN/None настоящим NaN, а не строкой.
+    is_blank = raw.isna() | key.eq('')
+    key = key.mask(is_blank, pd.Series(df.index.astype(str), index=df.index))
+    return key.duplicated(keep=keep), dup_col
+
+
 def run_data_quality_checks(df, log=print):
     report = {}
     critical_errors = []
@@ -1308,9 +1325,9 @@ def run_data_quality_checks(df, log=print):
         critical_errors.append(f"Отсутствуют обязательные колонки: {missing_cols}")
 
     if COL_ORDER in df.columns:
-        dup_col = _order_dup_key(df)
+        dup_mask, dup_col = _order_dup_mask(df, keep='first')
         dup_label = 'Дубликатов позиций заказа' if dup_col == COL_POS_ORDER else 'Дубликатов заказов'
-        report[dup_label] = df.duplicated(subset=[dup_col]).sum()
+        report[dup_label] = dup_mask.sum()
     else:
         report['Дубликатов заказов'] = "Колонка отсутствует"
 
@@ -1461,33 +1478,47 @@ def run_analytics(input_path: str, output_path: str, log=print,
     _date_pat = _re.compile(r'(\d{2}\.\d{2}\.\d{4})')
 
     def _parse_pay_lines(s):
-        """Возвращает список (дата, сумма|None) — по одной паре на строку ячейки."""
+        """
+        Возвращает (pairs, ok). pairs — список (дата, сумма) по строкам ячейки,
+        где дата распозналась (сумма может быть None). ok=False, если хотя бы
+        одна непустая строка НЕ разобралась целиком (нет даты или не распозналась
+        сумма) — сигнал не доверять разбивке по траншам и откатиться на резерв.
+        Строка с нераспознанной датой не должна молча выпадать из ячейки: иначе
+        её сумма тихо теряется вместо того, чтобы попасть в резервный вариант.
+        """
         if pd.isna(s):
-            return []
+            return [], True
         pairs = []
+        ok = True
         for line in str(s).split('\n'):
             line = line.strip()
             if not line:
                 continue
             m = _date_pat.match(line)
             if not m:
+                ok = False
                 continue
             try:
                 dt = pd.to_datetime(m.group(1), format='%d.%m.%Y')
             except Exception:
+                ok = False
                 continue
             rest = line[m.end():].strip()
-            pairs.append((dt, parse_money(rest) if rest else None))
-        return pairs
+            amount = parse_money(rest) if rest else None
+            if amount is None:
+                ok = False
+            pairs.append((dt, amount))
+        return pairs, ok
 
     if 'ДатаСуммаОплаты_' in df_full.columns:
-        _pay_lines = df_full['ДатаСуммаОплаты_'].apply(_parse_pay_lines)
+        _pay_parsed = df_full['ДатаСуммаОплаты_'].apply(_parse_pay_lines)
     else:
-        _pay_lines = pd.Series([[]] * len(df_full), index=df_full.index)
+        _pay_parsed = pd.Series([([], True)] * len(df_full), index=df_full.index)
 
-    # 'Дата_оплаты' — дата ПЕРВОГО платежа (для проверок качества данных и колонок
-    # уровня заказа); фактическая помесячная разбивка считается через payments_df.
-    df_full['Дата_оплаты'] = _pay_lines.apply(lambda ps: ps[0][0] if ps else pd.NaT)
+    # 'Дата_оплаты' — дата ПЕРВОГО распознанного платежа (для проверок качества
+    # данных и колонок уровня заказа); фактическая помесячная разбивка считается
+    # через payments_df.
+    df_full['Дата_оплаты'] = _pay_parsed.apply(lambda r: r[0][0][0] if r[0] else pd.NaT)
 
     # Разворачиваем платежи по траншам: если у заказа несколько строк-платежей —
     # каждая идёт в СВОЙ месяц со своей суммой, а не вся сумма заказа в месяц
@@ -1497,18 +1528,18 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # выручку заказа на дату первого платежа, как при отсутствии транша вовсе.
     _pay_rows = []
     _fallback_rows = 0
-    for idx, pairs in _pay_lines.items():
+    for idx, (pairs, ok) in _pay_parsed.items():
         if not pairs:
             continue
-        if any(amt is None for _, amt in pairs):
+        if ok:
+            _pay_rows.extend(pairs)
+        else:
             _pay_rows.append((pairs[0][0], df_full.at[idx, revenue_col]))
             _fallback_rows += 1
-        else:
-            _pay_rows.extend(pairs)
     payments_df = pd.DataFrame(_pay_rows, columns=['Дата_оплаты', 'Сумма_оплаты'])
     if _fallback_rows:
-        log(f"⚠ {_fallback_rows} строк(и) 'ДатаСуммаОплаты_' с нераспознанной суммой "
-            f"платежа — вся выручка заказа отнесена на дату первого платежа")
+        log(f"⚠ {_fallback_rows} строк(и) 'ДатаСуммаОплаты_' с нераспознанной строкой/суммой "
+            f"платежа — вся выручка заказа отнесена на дату первого распознанного платежа")
 
     # ── 8. Категории выручки и скидок ────────────────────────
     df_full['Категория выручки'] = df_full[revenue_col].apply(categorize_revenue_amount)
