@@ -1300,6 +1300,11 @@ def _order_dup_mask(df, keep):
     считается уникальным само по себе (не дублем других пустых значений) —
     иначе при частично заполненной 'Позиция заказа' все строки с пустым
     значением ложно попадали бы в дубли друг к другу.
+
+    Пустые строки просто исключаются из сравнения (а не заменяются на
+    синтетический ключ вроде индекса строки) — синтетический ключ мог бы
+    случайно совпасть с настоящим значением 'Позиция заказа' (напр. если
+    там встречаются короткие числовые id) и создать новый ложный дубль.
     """
     dup_col = _order_dup_key(df)
     raw = df[dup_col]
@@ -1307,8 +1312,10 @@ def _order_dup_mask(df, keep):
     # raw.isna() — а не сравнение строки с 'nan' — потому что astype(str) в
     # некоторых версиях pandas оставляет NaN/None настоящим NaN, а не строкой.
     is_blank = raw.isna() | key.eq('')
-    key = key.mask(is_blank, pd.Series(df.index.astype(str), index=df.index))
-    return key.duplicated(keep=keep), dup_col
+    dup = pd.Series(False, index=df.index)
+    non_blank = key.index[~is_blank]
+    dup.loc[non_blank] = key.loc[non_blank].duplicated(keep=keep)
+    return dup, dup_col
 
 
 def run_data_quality_checks(df, log=print):
