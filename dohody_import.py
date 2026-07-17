@@ -198,6 +198,11 @@ def parse_workbook(path, sheet_name=None):
     merge_accum = {name: {'months': {m: None for m in MONTHS}, 'rows': 0, 'sheet_row': None}
                    for name in MERGE_GROUPS}
     merge_source_of = {src: group for group, sources in MERGE_GROUPS.items() for src in sources}
+    # RAW_LABEL_MAP намеренно мапит несколько написаний на один canonical
+    # (опечатки, переименования). Если обе строки встретятся в одном файле —
+    # складываем их месяцы вместо того, чтобы одна тихо перезаписала другую
+    # (rows_by_canon/build_external_update ниже строят словарь по canonical).
+    rows_by_canonical = {}
 
     while r <= ws.max_row and not seen_commercial_sales:
         label = _norm(ws.cell(r, 1).value)
@@ -266,7 +271,22 @@ def parse_workbook(path, sheet_name=None):
         if canonical is None:
             pw.unmatched.append(prow)
         else:
-            pw.rows.append(prow)
+            existing = rows_by_canonical.get(canonical)
+            if existing is None:
+                pw.rows.append(prow)
+                rows_by_canonical[canonical] = prow
+            else:
+                for m, v in months.items():
+                    if v is not None:
+                        existing.months[m] = (existing.months[m] or 0) + v
+                if effective_total is not None:
+                    existing.total = (existing.total or 0) + effective_total
+                pw.warnings.append(
+                    f"Строка {r} «{label}» смэтчилась на уже встретившуюся статью "
+                    f"«{canonical}» (первая — «{existing.raw_label}») — суммы сложены, "
+                    f"а не перезаписаны."
+                )
+                existing.raw_label = f"{existing.raw_label} + {label}"
 
         r += 1
 
@@ -279,7 +299,20 @@ def parse_workbook(path, sheet_name=None):
             acc['months'], months_sum, acc['sheet_row'],
         )
         if group in EXTERNAL_ROW_KEYS or group in CRM_ROW_KEYS:
-            pw.rows.append(prow)
+            existing = rows_by_canonical.get(group)
+            if existing is None:
+                pw.rows.append(prow)
+                rows_by_canonical[group] = prow
+            else:
+                for m, v in acc['months'].items():
+                    if v is not None:
+                        existing.months[m] = (existing.months[m] or 0) + v
+                existing.total = (existing.total or 0) + months_sum
+                pw.warnings.append(
+                    f"Группа «{prow.raw_label}» смэтчилась на уже встретившуюся статью "
+                    f"«{group}» (первая — «{existing.raw_label}») — суммы сложены, а не перезаписаны."
+                )
+                existing.raw_label = f"{existing.raw_label} + {prow.raw_label}"
         else:
             pw.unmatched.append(prow)
 

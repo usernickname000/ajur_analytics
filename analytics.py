@@ -257,13 +257,23 @@ def parse_money(x):
     x = str(x).strip()
     x = x.replace("руб", "").replace("Руб", "")
     x = x.replace(" ", "").replace("'", "")
-    if "," in x and x.count(",") == 1 and x.count(".") >= 1:
-        x = x.replace(".", "").replace(",", ".")
-    else:
-        x = x.replace(",", ".")
+    has_comma = "," in x
+    has_dot = "." in x
+    if has_comma and has_dot:
+        # Оба разделителя встретились — дробная часть там, где разделитель стоит
+        # ПОСЛЕДНИМ в строке: '1.234,56' → ',' дробная (европ.), '1,234.56' → '.'
+        # дробная (амер./英). Раньше любой такой случай трактовался как европейский
+        # формат, что портило американские числа вида '1,234.56' на два порядка.
+        if x.rfind(",") > x.rfind("."):
+            x = x.replace(".", "").replace(",", ".")
+        else:
+            x = x.replace(",", "")
+    elif has_comma:
+        # Одна запятая — дробная часть (рус. формат); несколько — разделители тысяч
+        x = x.replace(",", ".") if x.count(",") == 1 else x.replace(",", "")
     try:
         return float(x)
-    except:
+    except Exception:
         return None
 
 
@@ -1291,8 +1301,13 @@ def run_data_quality_checks(df, log=print):
         report['Отрицательная выручка'] = (df[COL_REVENUE] < 0).sum()
         report['Нулевая выручка']       = (df[COL_REVENUE] == 0).sum()
         report['Пропущенная выручка']   = df[COL_REVENUE].isna().sum()
+        # Не критично: отрицательная выручка — обычно легитимные сторно/корректировки.
+        # Раньше это останавливало весь отчёт; теперь просто предупреждаем и продолжаем,
+        # как и с нулевой выручкой — строки остаются в расчётах (см. лист 00_Data_Quality
+        # и 18б_CRM_проблемные_строки для деталей).
         if report['Отрицательная выручка'] > 0:
-            critical_errors.append("Обнаружена отрицательная выручка")
+            log(f"⚠ Предупреждение: {report['Отрицательная выручка']} строк с отрицательной "
+                f"выручкой (сторно/корректировки?) — включены в расчёты, не критично")
 
     if COL_DATE in df.columns:
         temp_dates = pd.to_datetime(df[COL_DATE], errors='coerce')
@@ -1408,18 +1423,21 @@ def run_analytics(input_path: str, output_path: str, log=print,
     df_full['КОНЕЧНЫЙ_КЛИЕНТ'] = df_full.apply(pick_client, axis=1)
     df_full['КОНЕЧНЫЙ_КЛИЕНТ'] = df_full['КОНЕЧНЫЙ_КЛИЕНТ'].apply(normalize_client)
 
+    # \b — граница слова: без неё подстрока 'ФЕСТ' ложно ловила бы клиентов вроде
+    # «Манифест групп» или «Инфест», у которых 'ФЕСТ' — часть другого слова.
     df_full['IS_EVENT_CLIENT'] = (
         df_full['КОНЕЧНЫЙ_КЛИЕНТ'].str.upper()
-        .str.contains('ФЕСТ|ФЕСТИВАЛ|МЕРОПРИЯТИ', na=False)
+        .str.contains(r'\b(?:ФЕСТ|МЕРОПРИЯТИ)', na=False, regex=True)
     )
 
     # ── 7. Отрасли ───────────────────────────────────────────
     df_full['ОТРАСЛЬ_КЛИЕНТА'] = df_full.apply(pick_industry, axis=1)
     df_full['ОТРАСЛЬ_КЛИЕНТА_НОРМ'] = df_full.apply(classify_industry, axis=1)
 
-    # ── 7.5. Парсинг даты оплаты ─────────────────────────────
-    # Колонка "ДатаСуммаОплаты_" имеет формат "25.02.2025 135000"
-    # Используется как опциональный источник месячной разбивки (бьётся с бухгалтерией)
+    # ── 7.5. Парсинг даты и суммы оплаты ──────────────────────
+    # Колонка "ДатаСуммаОплаты_" имеет формат "25.02.2025 135000" — дата и
+    # ФАКТИЧЕСКИ ОПЛАЧЕННАЯ в эту дату сумма (заказ может гаситься частями
+    # в разные месяцы). Используется для сверки помесячной выручки с бухгалтерией.
     if 'ДатаСуммаОплаты_' in df_full.columns:
         import re as _re
         _date_pat = _re.compile(r'(\d{2}\.\d{2}\.\d{4})')
@@ -1433,9 +1451,25 @@ def run_analytics(input_path: str, output_path: str, log=print,
                 except Exception:
                     return None
             return None
+        def _parse_pay_amount(s):
+            if pd.isna(s):
+                return None
+            text = str(s).strip()
+            m = _date_pat.match(text)
+            if not m:
+                return None
+            rest = text[m.end():].strip()
+            return parse_money(rest) if rest else None
         df_full['Дата_оплаты'] = df_full['ДатаСуммаОплаты_'].apply(_parse_paydate)
+        df_full['Сумма_оплаты'] = df_full['ДатаСуммаОплаты_'].apply(_parse_pay_amount)
     else:
         df_full['Дата_оплаты'] = pd.NaT
+        df_full['Сумма_оплаты'] = np.nan
+
+    # Сумма для сверки по дате оплаты: фактический платёж из 'ДатаСуммаОплаты_',
+    # если он распознался, иначе — полная сумма заказа (чтобы не терять выручку
+    # молча, если формат поля не совпал с ожидаемым).
+    df_full['Оплачено_руб'] = df_full['Сумма_оплаты'].fillna(df_full[revenue_col])
 
     # ── 8. Категории выручки и скидок ────────────────────────
     df_full['Категория выручки'] = df_full[revenue_col].apply(categorize_revenue_amount)
@@ -1502,11 +1536,10 @@ def run_analytics(input_path: str, output_path: str, log=print,
     if COL_MONTH in df_full.columns:
         log("Считаю месячную статистику...")
         df_full['Дата_месяц'] = df_full[COL_MONTH].apply(parse_month)
-        grp_key = df_full['Дата_месяц'].dt.strftime('%m.%Y')
 
         monthly_stats = (
             df_full.dropna(subset=['Дата_месяц'])
-            .groupby(grp_key)
+            .groupby('Дата_месяц')
             .agg({revenue_col: ['sum', 'count']})
             .round(2)
         )
@@ -1514,18 +1547,33 @@ def run_analytics(input_path: str, output_path: str, log=print,
 
         monthly_mean = (
             df_full.loc[mask_no_events].dropna(subset=['Дата_месяц'])
-            .groupby(df_full.loc[mask_no_events, 'Дата_месяц'].dt.strftime('%m.%Y'))[revenue_col]
+            .groupby('Дата_месяц')[revenue_col]
             .mean().round(2)
         )
         monthly_stats['Средний чек, руб.'] = monthly_mean
         monthly_stats['Сумма выручки, тыс. руб.'] = monthly_stats['Сумма выручки, руб.'] / 1000
-        monthly_stats = monthly_stats.reset_index().rename(columns={'Дата_месяц': 'Период'})
+
+        # Сортируем по реальной дате, а не по строке 'MM.YYYY' — иначе на границе года
+        # (напр. 11.2025..02.2026) строки идут не по хронологии, что ломает прогноз,
+        # тренд-сигналы ("падает 3 месяца подряд") и порядок точек на графике.
+        monthly_stats = monthly_stats.reset_index().sort_values('Дата_месяц').reset_index(drop=True)
+        monthly_stats['Период'] = monthly_stats['Дата_месяц'].dt.strftime('%m.%Y')
+        monthly_stats = monthly_stats.drop(columns=['Дата_месяц'])
+        monthly_stats = monthly_stats[['Период'] + [c for c in monthly_stats.columns if c != 'Период']]
 
         # ── Выручка по дате оплаты (для сверки с бухгалтерией) ──
+        # Суммируем фактически оплаченную сумму (Оплачено_руб), а не полную сумму
+        # заказа — иначе заказ, оплаченный частями в разные месяцы, задваивал бы
+        # свою полную стоимость в каждом месяце, где встретилась дата платежа.
         if df_full['Дата_оплаты'].notna().any():
+            paydate_rows = df_full.dropna(subset=['Дата_оплаты'])
+            missing_amount = paydate_rows['Сумма_оплаты'].isna().sum()
+            if missing_amount:
+                log(f"⚠ Дата оплаты есть, но сумма платежа не распознана в {missing_amount} "
+                    f"строк(ах) 'ДатаСуммаОплаты_' — использована полная сумма заказа")
             paydate_sums = (
-                df_full.dropna(subset=['Дата_оплаты'])
-                .groupby(df_full['Дата_оплаты'].dt.strftime('%m.%Y'))[revenue_col]
+                paydate_rows
+                .groupby(paydate_rows['Дата_оплаты'].dt.strftime('%m.%Y'))['Оплачено_руб']
                 .sum() / 1000
             ).round(2).to_dict()
             monthly_stats['Выручка по дате оплаты, тыс. руб.'] = (
@@ -1627,8 +1675,14 @@ def run_analytics(input_path: str, output_path: str, log=print,
     crm_47other  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == '47News / Прочее', revenue_col].sum()
     crm_unclass  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'НЕ КЛАССИФИЦИРОВАНО', revenue_col].sum()
     crm_total    = df_full[revenue_col].sum()
-    # rev_reklama нужна уже в group_summary_rows — считаем здесь
+    # rev_reklama/rev_bez_prog нужны уже в group_summary_rows — считаем здесь.
+    # rev_bez_prog обязательно строим через mask_no_prog (regex по названию проекта),
+    # а не через БИЗНЕС_ГРУППА=='Программатик' (crm_prog выше) — это разные фильтры
+    # (crm_prog требует точного совпадения имени проекта из PROJECT_GROUP_MAP), и их
+    # смешение в одном расчёте делало "CRM минус программатик" не равным "CRM без
+    # программатика" в мосте сверки при малейшем расхождении в написании проекта.
     rev_reklama  = df_full.loc[mask_no_prog & mask_no_events, revenue_col].sum() / 1000
+    rev_bez_prog = df_full.loc[mask_no_prog, revenue_col].sum() / 1000
 
     # Факт из external_income.json по категориям
     _ext_cats_gs = get_external_totals_by_category(_ext_json_found) if _ext_json_found else {}
@@ -1644,7 +1698,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # Итоговые расчётные показатели для сверки
     _gs_crm_plus_prog_k  = crm_total / 1000 + _gs_prog_k
     _gs_crm_plus_all_k   = crm_total / 1000 + _gs_income_k
-    _gs_crm_no_prog_bar  = crm_total / 1000 - crm_prog / 1000 + _gs_barter_k
+    _gs_crm_no_prog_bar  = rev_bez_prog + _gs_barter_k
 
     def _gs_dev(fact, target):
         if target and target != 0:
@@ -1872,9 +1926,9 @@ def run_analytics(input_path: str, output_path: str, log=print,
     })
 
     # ── 17. Сводки ───────────────────────────────────────────
-    rev_all      = df_full[revenue_col].sum() / 1000
-    rev_bez_prog = df_full.loc[mask_no_prog, revenue_col].sum() / 1000
-    rev_reklama  = df_full.loc[mask_no_prog & mask_no_events, revenue_col].sum() / 1000
+    # rev_bez_prog и rev_reklama уже посчитаны выше (нужны были в group_summary_rows) —
+    # переиспользуем, чтобы не задублировать вычисление.
+    rev_all = crm_total / 1000
 
     # Собираем сводку — CRM-расчёт и верифицированные цифры бухгалтерии
     summary_rows = [
@@ -1947,7 +2001,10 @@ def run_analytics(input_path: str, output_path: str, log=print,
         rev_all_k=rev_all,
         rev_bez_prog_k=rev_bez_prog,
         rev_reklama_k=rev_reklama,
-        crm_prog_k=crm_prog / 1000,
+        # rev_all - rev_bez_prog (не crm_prog!) — чтобы шаг "минус CRM-программатик"
+        # в мосте был согласован по построению с "CRM без программатика" на строке ниже
+        # (оба посчитаны через один и тот же mask_no_prog).
+        crm_prog_k=rev_all - rev_bez_prog,
         ext_cats=ext_cats,
         vf_total_with_prog_k=vf_total_with_prog_k,
         vf_total_no_prog_k=vf_total_no_prog_k,
@@ -2487,7 +2544,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # ── Сводка расхождения для GUI ───────────────────────────
     crm_total_k       = df_full[revenue_col].sum() / 1000
     crm_paydate_total_k = (
-        df_full.dropna(subset=['Дата_оплаты'])[revenue_col].sum() / 1000
+        df_full.dropna(subset=['Дата_оплаты'])['Оплачено_руб'].sum() / 1000
         if df_full['Дата_оплаты'].notna().any() else 0
     )
     # external_total_k — только программатик (используется в колонках месячной аналитики)
