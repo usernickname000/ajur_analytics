@@ -1435,41 +1435,63 @@ def run_analytics(input_path: str, output_path: str, log=print,
     df_full['ОТРАСЛЬ_КЛИЕНТА_НОРМ'] = df_full.apply(classify_industry, axis=1)
 
     # ── 7.5. Парсинг даты и суммы оплаты ──────────────────────
-    # Колонка "ДатаСуммаОплаты_" имеет формат "25.02.2025 135000" — дата и
-    # ФАКТИЧЕСКИ ОПЛАЧЕННАЯ в эту дату сумма (заказ может гаситься частями
-    # в разные месяцы). Используется для сверки помесячной выручки с бухгалтерией.
-    if 'ДатаСуммаОплаты_' in df_full.columns:
-        import re as _re
-        _date_pat = _re.compile(r'(\d{2}\.\d{2}\.\d{4})')
-        def _parse_paydate(s):
-            if pd.isna(s):
-                return None
-            m = _date_pat.match(str(s).strip())
-            if m:
-                try:
-                    return pd.to_datetime(m.group(1), format='%d.%m.%Y')
-                except Exception:
-                    return None
-            return None
-        def _parse_pay_amount(s):
-            if pd.isna(s):
-                return None
-            text = str(s).strip()
-            m = _date_pat.match(text)
-            if not m:
-                return None
-            rest = text[m.end():].strip()
-            return parse_money(rest) if rest else None
-        df_full['Дата_оплаты'] = df_full['ДатаСуммаОплаты_'].apply(_parse_paydate)
-        df_full['Сумма_оплаты'] = df_full['ДатаСуммаОплаты_'].apply(_parse_pay_amount)
-    else:
-        df_full['Дата_оплаты'] = pd.NaT
-        df_full['Сумма_оплаты'] = np.nan
+    # Колонка "ДатаСуммаОплаты_" — одна или НЕСКОЛЬКО строк вида
+    # "25.02.2025 135000" (по одному платежу на строку, через перенос строки),
+    # если заказ гасится траншами в разные месяцы, напр.:
+    #   "19.03.2025 23618,75\n06.10.2025 190618,75"
+    # Используется для сверки помесячной выручки с бухгалтерией по факту оплаты.
+    import re as _re
+    _date_pat = _re.compile(r'(\d{2}\.\d{2}\.\d{4})')
 
-    # Сумма для сверки по дате оплаты: фактический платёж из 'ДатаСуммаОплаты_',
-    # если он распознался, иначе — полная сумма заказа (чтобы не терять выручку
-    # молча, если формат поля не совпал с ожидаемым).
-    df_full['Оплачено_руб'] = df_full['Сумма_оплаты'].fillna(df_full[revenue_col])
+    def _parse_pay_lines(s):
+        """Возвращает список (дата, сумма|None) — по одной паре на строку ячейки."""
+        if pd.isna(s):
+            return []
+        pairs = []
+        for line in str(s).split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            m = _date_pat.match(line)
+            if not m:
+                continue
+            try:
+                dt = pd.to_datetime(m.group(1), format='%d.%m.%Y')
+            except Exception:
+                continue
+            rest = line[m.end():].strip()
+            pairs.append((dt, parse_money(rest) if rest else None))
+        return pairs
+
+    if 'ДатаСуммаОплаты_' in df_full.columns:
+        _pay_lines = df_full['ДатаСуммаОплаты_'].apply(_parse_pay_lines)
+    else:
+        _pay_lines = pd.Series([[]] * len(df_full), index=df_full.index)
+
+    # 'Дата_оплаты' — дата ПЕРВОГО платежа (для проверок качества данных и колонок
+    # уровня заказа); фактическая помесячная разбивка считается через payments_df.
+    df_full['Дата_оплаты'] = _pay_lines.apply(lambda ps: ps[0][0] if ps else pd.NaT)
+
+    # Разворачиваем платежи по траншам: если у заказа несколько строк-платежей —
+    # каждая идёт в СВОЙ месяц со своей суммой, а не вся сумма заказа в месяц
+    # первого платежа (иначе задваивалась бы часть выручки в одном месяце и
+    # терялась в другом). Если хоть одна сумма в ячейке не распозналась — не
+    # рискуем разбивкой (можно потерять контроль над итогом) и относим ВСЮ
+    # выручку заказа на дату первого платежа, как при отсутствии транша вовсе.
+    _pay_rows = []
+    _fallback_rows = 0
+    for idx, pairs in _pay_lines.items():
+        if not pairs:
+            continue
+        if any(amt is None for _, amt in pairs):
+            _pay_rows.append((pairs[0][0], df_full.at[idx, revenue_col]))
+            _fallback_rows += 1
+        else:
+            _pay_rows.extend(pairs)
+    payments_df = pd.DataFrame(_pay_rows, columns=['Дата_оплаты', 'Сумма_оплаты'])
+    if _fallback_rows:
+        log(f"⚠ {_fallback_rows} строк(и) 'ДатаСуммаОплаты_' с нераспознанной суммой "
+            f"платежа — вся выручка заказа отнесена на дату первого платежа")
 
     # ── 8. Категории выручки и скидок ────────────────────────
     df_full['Категория выручки'] = df_full[revenue_col].apply(categorize_revenue_amount)
@@ -1562,18 +1584,13 @@ def run_analytics(input_path: str, output_path: str, log=print,
         monthly_stats = monthly_stats[['Период'] + [c for c in monthly_stats.columns if c != 'Период']]
 
         # ── Выручка по дате оплаты (для сверки с бухгалтерией) ──
-        # Суммируем фактически оплаченную сумму (Оплачено_руб), а не полную сумму
+        # Суммируем фактически оплаченные транши (payments_df), а не полную сумму
         # заказа — иначе заказ, оплаченный частями в разные месяцы, задваивал бы
         # свою полную стоимость в каждом месяце, где встретилась дата платежа.
-        if df_full['Дата_оплаты'].notna().any():
-            paydate_rows = df_full.dropna(subset=['Дата_оплаты'])
-            missing_amount = paydate_rows['Сумма_оплаты'].isna().sum()
-            if missing_amount:
-                log(f"⚠ Дата оплаты есть, но сумма платежа не распознана в {missing_amount} "
-                    f"строк(ах) 'ДатаСуммаОплаты_' — использована полная сумма заказа")
+        if not payments_df.empty:
             paydate_sums = (
-                paydate_rows
-                .groupby(paydate_rows['Дата_оплаты'].dt.strftime('%m.%Y'))['Оплачено_руб']
+                payments_df
+                .groupby(payments_df['Дата_оплаты'].dt.strftime('%m.%Y'))['Сумма_оплаты']
                 .sum() / 1000
             ).round(2).to_dict()
             monthly_stats['Выручка по дате оплаты, тыс. руб.'] = (
@@ -2544,8 +2561,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # ── Сводка расхождения для GUI ───────────────────────────
     crm_total_k       = df_full[revenue_col].sum() / 1000
     crm_paydate_total_k = (
-        df_full.dropna(subset=['Дата_оплаты'])['Оплачено_руб'].sum() / 1000
-        if df_full['Дата_оплаты'].notna().any() else 0
+        payments_df['Сумма_оплаты'].sum() / 1000 if not payments_df.empty else 0
     )
     # external_total_k — только программатик (используется в колонках месячной аналитики)
     external_total_k = sum(ext_monthly.values()) / 1000 if ext_monthly else 0
