@@ -43,10 +43,11 @@ def _load_period(path: str, log) -> pd.DataFrame:
         df = df.loc[~df[COL_MONTH].astype(str).str.strip().str.lower().eq("итого")]
     df = df.dropna(how="all").reset_index(drop=True)
 
-    # Парсим выручку
+    # Парсим выручку. Нулевую/отрицательную выручку не выбрасываем (сторно,
+    # корректировки) — иначе "Выручка"/"Заказов" здесь не совпадут с отчётом
+    # "Анализ", где run_analytics такие строки оставляет в расчётах.
     df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
-    df = df.dropna(subset=[COL_REVENUE])
-    df = df[df[COL_REVENUE] > 0].reset_index(drop=True)
+    df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
 
     # Клиент
     df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1)

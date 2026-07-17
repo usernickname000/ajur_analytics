@@ -30,11 +30,17 @@ def _load_and_prepare(path: str) -> pd.DataFrame:
     if COL_MONTH in df.columns:
         df = df[~df[COL_MONTH].astype(str).str.strip().str.lower().eq('итого')]
     df = df.dropna(how='all').reset_index(drop=True)
+    # Нулевую/отрицательную выручку не выбрасываем (сторно, корректировки) —
+    # иначе KPI дашборда не совпадают с отчётом "Анализ", где run_analytics
+    # такие строки оставляет в расчётах.
     df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
-    df = df.dropna(subset=[COL_REVENUE])
-    df = df[df[COL_REVENUE] > 0].reset_index(drop=True)
+    df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
     df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1).apply(normalize_client)
-    df['ОТРАСЛЬ'] = df.apply(pick_industry, axis=1)
+    # Колонка должна называться именно 'ОТРАСЛЬ_КЛИЕНТА' — classify_industry() в
+    # analytics.py читает row['ОТРАСЛЬ_КЛИЕНТА']; при другом имени она получает
+    # пустую строку для каждой строки, и 'ОТРАСЛЬ_НОРМ' всегда выходит пустой,
+    # из-за чего график "Отрасли" на дашборде всегда был пуст.
+    df['ОТРАСЛЬ_КЛИЕНТА'] = df.apply(pick_industry, axis=1)
     df['ОТРАСЛЬ_НОРМ'] = df.apply(classify_industry, axis=1)
     if COL_MONTH in df.columns:
         df['_month_dt'] = df[COL_MONTH].apply(parse_month)
@@ -55,13 +61,16 @@ def _collect_data(df: pd.DataFrame) -> dict:
 
     monthly = []
     if '_month_dt' in df.columns:
+        # Группируем и сортируем по реальной дате, а не по строке 'MM.YYYY' —
+        # иначе на границе года (напр. 11.2025..02.2026) месяцы идут не по
+        # порядку, что ломает график и KPI "изменение к пред. месяцу".
         grp = (df.dropna(subset=['_month_dt'])
-                 .groupby(df['_month_dt'].dt.strftime('%m.%Y'))
-                 [COL_REVENUE].sum()
-                 .reset_index())
-        grp.columns = ['month', 'revenue']
-        grp['revenue'] = (grp['revenue'] / 1000).round(1)
-        monthly = grp.to_dict('records')
+                 .groupby('_month_dt')[COL_REVENUE].sum()
+                 .reset_index()
+                 .sort_values('_month_dt'))
+        grp['month'] = grp['_month_dt'].dt.strftime('%m.%Y')
+        grp['revenue'] = (grp[COL_REVENUE] / 1000).round(1)
+        monthly = grp[['month', 'revenue']].to_dict('records')
 
     top_cli = (df.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[COL_REVENUE]
                  .sum().nlargest(10).reset_index())
@@ -78,11 +87,14 @@ def _collect_data(df: pd.DataFrame) -> dict:
         top_mgr.columns = ['name', 'revenue']
         top_mgr['revenue'] = (top_mgr['revenue'] / 1000).round(1)
 
-    industries = (df.groupby('ОТРАСЛЬ_НОРМ')[COL_REVENUE]
-                    .sum().nlargest(8).reset_index())
+    industries_full = df.groupby('ОТРАСЛЬ_НОРМ')[COL_REVENUE].sum()
+    industries_full = industries_full[industries_full.index.astype(str).str.strip() != '']
+    # Общая сумма по ВСЕМ отраслям (не только показанным топ-8) — используется как
+    # знаменатель для % на графике, иначе при >8 отраслях проценты завышаются.
+    industries_total_k = round(industries_full.sum() / 1000, 1)
+    industries = industries_full.nlargest(8).reset_index()
     industries.columns = ['name', 'revenue']
     industries['revenue'] = (industries['revenue'] / 1000).round(1)
-    industries = industries[industries['name'].astype(str).str.strip() != '']
 
     # Тренд: изменение к предыдущему месяцу
     trend_pct = None
@@ -108,6 +120,7 @@ def _collect_data(df: pd.DataFrame) -> dict:
         'top_clients':  top_cli.to_dict('records'),
         'top_managers': top_mgr.to_dict('records') if not top_mgr.empty else [],
         'industries':   industries.to_dict('records'),
+        'industries_total': industries_total_k,
     }
 
 
@@ -759,7 +772,9 @@ if (DATA.top_managers.length > 0) {
 
 // ── 4. Отрасли (горизонтальный bar) ─────────────────────
 if (DATA.industries.length > 0) {
-  const total = DATA.industries.reduce((s, r) => s + r.revenue, 0);
+  // Знаменатель для % — выручка по ВСЕМ отраслям (industries_total), а не только
+  // по показанным на графике топ-8, иначе при >8 отраслях % завышается.
+  const total = DATA.industries_total ?? DATA.industries.reduce((s, r) => s + r.revenue, 0);
   const sorted = [...DATA.industries].sort((a,b) => a.revenue - b.revenue);
   new Chart(document.getElementById('chartIndustries'), {
     type: 'bar',
