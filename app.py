@@ -57,51 +57,25 @@ C_RED_D    = "#DC2626"
 C_AMBER    = "#F59E0B"
 C_BLUE     = "#3B82F6"
 
-THEMES = {
-    "dark": {
-        "bg":          "#0D0D0D",
-        "sidebar":     "#111111",
-        "surface":     "#181818",
-        "surface2":    "#222222",
-        "surface3":    "#2A2A2A",
-        "border":      "#2E2E2E",
-        "border2":     "#3A3A3A",
-        "text":        "#F5F5F5",
-        "text2":       "#AAAAAA",
-        "muted":       "#555555",
-        "log_bg":      "#0A0A0A",
-        "log_fg":      "#CCCCCC",
-        "entry_bg":    "#1E1E1E",
-        "entry_fg":    "#F5F5F5",
-        "tag_ok":      "#22C55E",
-        "tag_err":     "#EF4444",
-        "tag_warn":    "#F59E0B",
-        "nav_active":  "#1E1E1E",
-        "nav_hover":   "#161616",
-        "accent_line": "#F38120",
-    },
-    "light": {
-        "bg":          "#F4F4F5",
-        "sidebar":     "#FAFAFA",
-        "surface":     "#FFFFFF",
-        "surface2":    "#F0F0F0",
-        "surface3":    "#E8E8E8",
-        "border":      "#E2E2E2",
-        "border2":     "#CDCDCD",
-        "text":        "#0A0A0A",
-        "text2":       "#555555",
-        "muted":       "#999999",
-        "log_bg":      "#111111",
-        "log_fg":      "#E8E8E8",
-        "entry_bg":    "#FFFFFF",
-        "entry_fg":    "#0A0A0A",
-        "tag_ok":      "#16A34A",
-        "tag_err":     "#DC2626",
-        "tag_warn":    "#D97706",
-        "nav_active":  "#FFF5EB",
-        "nav_hover":   "#FFF8F2",
-        "accent_line": "#F38120",
-    },
+THEME = {
+    "bg":          "#F7F7F8",
+    "sidebar":     "#FFFFFF",
+    "surface":     "#FFFFFF",
+    "surface2":    "#F2F2F4",
+    "border":      "#E4E4E7",
+    "text":        "#18181B",
+    "text2":       "#52525B",
+    "muted":       "#8A8A93",
+    "log_bg":      "#FAFAFA",
+    "log_fg":      "#27272A",
+    "entry_bg":    "#FFFFFF",
+    "entry_fg":    "#18181B",
+    "tag_ok":      "#16A34A",
+    "tag_err":     "#DC2626",
+    "tag_warn":    "#D97706",
+    "nav_active":  "#FFF1E4",
+    "nav_hover":   "#F7F7F8",
+    "accent_line": "#F38120",
 }
 
 
@@ -127,7 +101,7 @@ def save_config(cfg):
 # TOAST
 # ============================================================
 class Toast(tk.Toplevel):
-    _BG     = {"ok": "#0F2A1A", "err": "#2A0F0F", "warn": "#2A200A", "info": "#0A1830"}
+    _BG     = {"ok": "#EAFAF1", "err": "#FDECEA", "warn": "#FEF9E7", "info": "#EBF2FF"}
     _BORDER = {"ok": "#22C55E", "err": "#EF4444", "warn": "#F59E0B", "info": "#3B82F6"}
     _ICON   = {"ok": "✓", "err": "✕", "warn": "!", "info": "i"}
 
@@ -138,8 +112,8 @@ class Toast(tk.Toplevel):
         self.attributes("-topmost", True)
         self.attributes("-alpha", 0.0)
 
-        bg     = self._BG.get(kind, "#181818")
-        border = self._BORDER.get(kind, "#444")
+        bg     = self._BG.get(kind, "#FFFFFF")
+        border = self._BORDER.get(kind, "#999")
         icon   = self._ICON.get(kind, "·")
 
         self.configure(bg=border)
@@ -164,12 +138,12 @@ class Toast(tk.Toplevel):
                  bg=border, fg="#FFFFFF").place(relx=.5, rely=.5, anchor="center")
 
         tk.Label(top, text=message,
-                 font=("Segoe UI", 9), bg=bg, fg="#F0F0F0",
+                 font=("Segoe UI", 9), bg=bg, fg="#18181B",
                  justify="left", wraplength=260).pack(side="left", fill="x", expand=True)
 
         tk.Button(top, text="×", font=("Segoe UI", 11),
-                  bg=bg, fg="#666", relief="flat", bd=0,
-                  activebackground=bg, activeforeground="#FFF",
+                  bg=bg, fg="#71717A", relief="flat", bd=0,
+                  activebackground=bg, activeforeground="#18181B",
                   cursor="hand2", command=self._dismiss).pack(side="right", padx=(8, 0))
 
         if action_text and action_cmd:
@@ -234,52 +208,18 @@ class Toast(tk.Toplevel):
 
 
 # ============================================================
-# КНОПКА С АНИМАЦИЕЙ HOVER
+# КНОПКА С ПОДСВЕТКОЙ ПРИ НАВЕДЕНИИ
 # ============================================================
 class AnimButton(tk.Button):
-    STEPS = 6
-    DELAY = 10
+    """Кнопка с плоской заливкой и мгновенной сменой цвета при наведении."""
 
     def __init__(self, master, bg_n, bg_h, **kw):
-        self._bg_n = bg_n
-        self._bg_h = bg_h
-        self._cur  = list(self._hex(bg_n))
-        self._tgt  = list(self._hex(bg_n))
-        self._job  = None
         super().__init__(master, bg=bg_n, relief="flat",
                          cursor="hand2", bd=0,
                          activebackground=bg_h,
                          activeforeground=kw.get("fg", "#FFFFFF"), **kw)
-        self.bind("<Enter>", lambda e: self._go(self._hex(bg_h)))
-        self.bind("<Leave>", lambda e: self._go(self._hex(bg_n)))
-
-    def _hex(self, c):
-        c = c.lstrip("#")
-        return [int(c[i:i+2], 16) for i in (0, 2, 4)]
-
-    def _go(self, tgt):
-        self._tgt = tgt
-        if self._job:
-            try:
-                self.after_cancel(self._job)
-            except Exception:
-                pass
-        self._tick()
-
-    def _tick(self):
-        done = True
-        for i in range(3):
-            d = self._tgt[i] - self._cur[i]
-            if d:
-                done = False
-                self._cur[i] += max(1, abs(d) // self.STEPS) * (1 if d > 0 else -1)
-                self._cur[i] = max(0, min(255, self._cur[i]))
-        try:
-            self.config(bg="#{:02x}{:02x}{:02x}".format(*[int(x) for x in self._cur]))
-        except Exception:
-            return
-        if not done:
-            self._job = self.after(self.DELAY, self._tick)
+        self.bind("<Enter>", lambda e: self.config(bg=bg_h))
+        self.bind("<Leave>", lambda e: self.config(bg=bg_n))
 
 
 # ============================================================
@@ -308,9 +248,7 @@ class App(tk.Tk):
                 pass
 
         self._cfg         = load_config()
-        self._tn          = self._cfg.get("theme", "dark")
-        self._T           = THEMES[self._tn]
-        self._tw          = []
+        self._T           = THEME
         self._plan_vars   = {}
         self._anim_running= False
         self._anim_step   = 0
@@ -332,14 +270,12 @@ class App(tk.Tk):
             pass
 
     def _on_close(self):
-        self._cfg["theme"]  = self._tn
-        self._cfg["date_by"]= self._date_by.get()
+        self._cfg["date_by"] = self._date_by.get()
         save_config(self._cfg)
         self.destroy()
 
-    # ── Регистрация виджетов ─────────────────────────────────
+    # ── Регистрация виджетов (совместимость со старыми вызовами) ──
     def _r(self, w, role):
-        self._tw.append((w, role))
         return w
 
     # ============================================================
@@ -389,7 +325,7 @@ class App(tk.Tk):
                  font=("Georgia", 16, "bold italic"),
                  bg=T["sidebar"], fg=C_ORANGE).pack(anchor="w", pady=(20, 0))
         tk.Label(logo_inner, text="КОММЕРЧЕСКИЙ ОТДЕЛ",
-                 font=("Segoe UI", 7, "bold"),
+                 font=("Segoe UI", 9, "bold"),
                  bg=T["sidebar"], fg=T["muted"]).pack(anchor="w")
 
         # Тонкий разделитель
@@ -422,19 +358,6 @@ class App(tk.Tk):
                  font=("Segoe UI", 8),
                  bg=T["sidebar"], fg=T["muted"]).pack(anchor="w")
         self._update_clock()
-
-        # Кнопка темы
-        self._theme_btn = tk.Button(
-            bottom,
-            text="☀  Светлая тема" if self._tn == "dark" else "◑  Тёмная тема",
-            font=("Segoe UI", 9),
-            bg=T["surface2"], fg=T["text2"],
-            activebackground=T["surface3"],
-            activeforeground=T["text"],
-            relief="flat", bd=0, cursor="hand2",
-            pady=7, anchor="w", padx=12,
-            command=self._toggle_theme)
-        self._theme_btn.pack(fill="x")
 
         # Версия
         tk.Label(bottom, text="v 3.0",
@@ -582,119 +505,6 @@ class App(tk.Tk):
         self.after(100, self._tick_anim)
 
     # ============================================================
-    # ТЕМА
-    # ============================================================
-    def _toggle_theme(self):
-        self._tn = "light" if self._tn == "dark" else "dark"
-        self._T  = THEMES[self._tn]
-        self._cfg["theme"] = self._tn
-        save_config(self._cfg)
-        self._apply_theme()
-
-    def _apply_theme(self):
-        T = self._T
-
-        # Обновляем базовые цвета окна
-        self.configure(bg=T["bg"])
-
-        role_map = {
-            "bg":       lambda w: w.configure(bg=T["bg"]),
-            "sidebar":  lambda w: w.configure(bg=T["sidebar"]),
-            "surface":  lambda w: w.configure(bg=T["surface"]),
-            "surface2": lambda w: w.configure(bg=T["surface2"]),
-            "border":   lambda w: w.configure(bg=T["border"]),
-            "text_bg":  lambda w: w.configure(bg=T["bg"],      fg=T["text"]),
-            "text2_bg": lambda w: w.configure(bg=T["bg"],      fg=T["text2"]),
-            "muted_bg": lambda w: w.configure(bg=T["bg"],      fg=T["muted"]),
-            "text_sf":  lambda w: w.configure(bg=T["surface"], fg=T["text"]),
-            "muted_sf": lambda w: w.configure(bg=T["surface"], fg=T["muted"]),
-            "text2_sf": lambda w: w.configure(bg=T["surface"], fg=T["text2"]),
-            "entry":    lambda w: w.configure(
-                bg=T["entry_bg"], fg=T["entry_fg"],
-                readonlybackground=T["entry_bg"],
-                insertbackground=T["entry_fg"],
-                disabledbackground=T["entry_bg"]),
-        }
-        for (w, role) in self._tw:
-            try:
-                if role in role_map:
-                    role_map[role](w)
-            except Exception:
-                pass
-
-        # Статус-бар
-        try:
-            self._anim_lbl.configure(bg=T["surface"])
-        except Exception:
-            pass
-
-        # Логи
-        for attr in ["log_box", "cmp_log_box", "dash_log_box"]:
-            box = getattr(self, attr, None)
-            if box:
-                try:
-                    box.configure(bg=T["log_bg"], fg=T["log_fg"])
-                    box.tag_config("ok",   foreground=T["tag_ok"])
-                    box.tag_config("err",  foreground=T["tag_err"])
-                    box.tag_config("warn", foreground=T["tag_warn"])
-                except Exception:
-                    pass
-
-        # KPI-карточки
-        if hasattr(self, "_kpi_cards"):
-            for key, (card, var, color) in self._kpi_cards.items():
-                card.configure(bg=T["surface"])
-                for w in card.winfo_children():
-                    if isinstance(w, tk.Label):
-                        w.configure(bg=T["surface"])
-
-        # Навигация
-        active = self._active_page.get()
-        for pid, btn in self._nav_btns.items():
-            if pid == active:
-                btn["frame"].configure(bg=T["nav_active"])
-                btn["inner"].configure(bg=T["nav_active"])
-                btn["icon"].configure(bg=T["nav_active"])
-                btn["text"].configure(bg=T["nav_active"])
-            else:
-                btn["frame"].configure(bg=T["sidebar"])
-                btn["inner"].configure(bg=T["sidebar"])
-                btn["icon"].configure(bg=T["sidebar"])
-                btn["text"].configure(bg=T["sidebar"])
-
-        # Сайдбар и его дочерние элементы
-        try:
-            self._sidebar.configure(bg=T["sidebar"])
-            self._theme_btn.configure(
-                bg=T["surface2"], fg=T["text2"],
-                activebackground=T["surface3"],
-                text="☀  Светлая тема" if self._tn == "dark" else "◑  Тёмная тема")
-        except Exception:
-            pass
-
-        # Перестраиваем лого-блок
-        self._refresh_sidebar_labels(T)
-
-        # ttk прогресс
-        style = ttk.Style()
-        style.configure("F.Horizontal.TProgressbar",
-                        troughcolor=T["border"], background=C_ORANGE)
-
-        # Progressbar в плане
-        if hasattr(self, "_plan_inner"):
-            self._plan_inner.configure(bg=T["surface"])
-
-    def _refresh_sidebar_labels(self, T):
-        try:
-            self._clock_frame.configure(bg=T["sidebar"])
-            for w in self._clock_frame.winfo_children():
-                if isinstance(w, tk.Label):
-                    fg = T["text"] if w.cget("font") and "20" in str(w.cget("font")) else T["muted"]
-                    w.configure(bg=T["sidebar"], fg=fg)
-        except Exception:
-            pass
-
-    # ============================================================
     # СТРОИТЕЛИ UI-КОМПОНЕНТОВ
     # ============================================================
 
@@ -732,7 +542,7 @@ class App(tk.Tk):
             tk.Label(hdr, text=icon, font=("Segoe UI", 10),
                      bg=T["bg"], fg=C_ORANGE).pack(side="left", padx=(0, 6))
         lbl = tk.Label(hdr, text=title.upper(),
-                       font=("Segoe UI", 7, "bold"),
+                       font=("Segoe UI", 9, "bold"),
                        bg=T["bg"], fg=T["muted"])
         self._r(lbl, "muted_bg")
         lbl.pack(side="left")
@@ -838,7 +648,7 @@ class App(tk.Tk):
         f.pack(fill="x", padx=32, pady=(16, 6))
         tk.Frame(f, bg=C_ORANGE, width=2, height=12).pack(side="left", padx=(0, 8))
         lbl = tk.Label(f, text=text,
-                       font=("Segoe UI", 7, "bold"),
+                       font=("Segoe UI", 9, "bold"),
                        bg=T["bg"], fg=T["muted"])
         self._r(lbl, "muted_bg")
         lbl.pack(side="left")
@@ -1041,7 +851,7 @@ class App(tk.Tk):
             tk.Frame(card, bg=color, height=2).pack(fill="x")
 
             tk.Label(card, text=title,
-                     font=("Segoe UI", 7, "bold"),
+                     font=("Segoe UI", 9, "bold"),
                      bg=T["surface"], fg=color).pack(anchor="w", padx=10, pady=(8, 0))
 
             val_var = tk.StringVar(value="—")
@@ -1050,7 +860,7 @@ class App(tk.Tk):
                      bg=T["surface"], fg=T["text"]).pack(anchor="w", padx=10)
 
             tk.Label(card, text=unit,
-                     font=("Segoe UI", 7),
+                     font=("Segoe UI", 9),
                      bg=T["surface"], fg=T["muted"]).pack(anchor="w", padx=10, pady=(0, 8))
 
             self._kpi_cards[key] = (card, val_var, color)
