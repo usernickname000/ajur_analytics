@@ -724,7 +724,7 @@ def build_crm_issue_rows(df_full, revenue_col):
             return
         cols = [
             col for col in [
-                COL_ORDER, COL_MONTH, COL_DATE, 'Дата_оплаты', COL_PROJECT,
+                COL_ORDER, COL_POS_ORDER, COL_MONTH, COL_DATE, 'Дата_оплаты', COL_PROJECT,
                 'БИЗНЕС_ГРУППА', COL_MANAGER, 'КОНЕЧНЫЙ_КЛИЕНТ', revenue_col,
                 COL_BARTER, COL_DISCOUNT_PCT
             ]
@@ -752,7 +752,9 @@ def build_crm_issue_rows(df_full, revenue_col):
         add_issue(df_full['КОНЕЧНЫЙ_КЛИЕНТ'].isna() | df_full['КОНЕЧНЫЙ_КЛИЕНТ'].astype(str).str.strip().eq(''),
                   'Пустой конечный клиент')
     if COL_ORDER in df_full.columns:
-        add_issue(df_full.duplicated(subset=[COL_ORDER], keep=False), 'Дубликат номера заказа')
+        dup_col = _order_dup_key(df_full)
+        dup_issue = 'Дубликат позиции заказа' if dup_col == COL_POS_ORDER else 'Дубликат номера заказа'
+        add_issue(df_full.duplicated(subset=[dup_col], keep=False), dup_issue)
 
     if not issue_frames:
         return pd.DataFrame([{'Проблема': 'Явных проблемных строк не найдено'}])
@@ -1279,6 +1281,19 @@ def style_workbook(wb, log=print):
         log(f"⚠ Оформление не применено: {e}")
 
 
+def _order_dup_key(df):
+    """
+    Колонка для проверки дублей строк. 'Заказ' — идентификатор родительского
+    договора и ЗАКОНОМЕРНО повторяется на много строк выгрузки (по одной строке
+    на месяц/позицию контракта) — дедуп по нему на реальных данных даёт огромный
+    процент ложных "дубликатов". 'Позиция заказа' — уникальный ключ строки
+    (одна позиция = одна услуга за период), используем её, если она есть.
+    """
+    if COL_POS_ORDER in df.columns and df[COL_POS_ORDER].notna().any():
+        return COL_POS_ORDER
+    return COL_ORDER
+
+
 def run_data_quality_checks(df, log=print):
     report = {}
     critical_errors = []
@@ -1293,7 +1308,9 @@ def run_data_quality_checks(df, log=print):
         critical_errors.append(f"Отсутствуют обязательные колонки: {missing_cols}")
 
     if COL_ORDER in df.columns:
-        report['Дубликатов заказов'] = df.duplicated(subset=[COL_ORDER]).sum()
+        dup_col = _order_dup_key(df)
+        dup_label = 'Дубликатов позиций заказа' if dup_col == COL_POS_ORDER else 'Дубликатов заказов'
+        report[dup_label] = df.duplicated(subset=[dup_col]).sum()
     else:
         report['Дубликатов заказов'] = "Колонка отсутствует"
 
