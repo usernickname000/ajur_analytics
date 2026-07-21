@@ -133,7 +133,7 @@ def _generate_html(data: dict, filename: str) -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Аналитика — Фонтанка.ру</title>
+<title>AJUR Analytics — Дашборд</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -573,7 +573,7 @@ def _generate_html(data: dict, filename: str) -> str:
 </main>
 
 <footer>
-  Фонтанка.ру &nbsp;·&nbsp; Коммерческий отдел &nbsp;·&nbsp; Аналитика заказов
+  AJUR Analytics &nbsp;·&nbsp; Фонтанка.ру &nbsp;·&nbsp; Коммерческий отдел
 </footer>
 
 <script>

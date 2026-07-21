@@ -1,5 +1,5 @@
 # ============================================================
-# app.py — Аналитика заказов, Фонтанка.ру  v3.0
+# app.py — AJUR Analytics (Фонтанка.ру, коммерческий отдел)  v3.0
 # ============================================================
 
 import sys
@@ -95,6 +95,117 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# ============================================================
+# ГРАФИЧЕСКИЕ ПРИМИТИВЫ (скруглённые формы, градиенты)
+# Всё — векторная отрисовка на Canvas, без PIL/растровых операций,
+# поэтому дёшево по CPU/памяти и не тянет новых зависимостей.
+# ============================================================
+
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(*(max(0, min(255, int(c))) for c in rgb))
+
+
+def mix_color(c1, c2, t):
+    """Линейная интерполяция между двумя HEX-цветами (t=0 → c1, t=1 → c2)."""
+    a, b = _hex_to_rgb(c1), _hex_to_rgb(c2)
+    return _rgb_to_hex([a[i] + (b[i] - a[i]) * t for i in range(3)])
+
+
+def _round_rect_points(x1, y1, x2, y2, r):
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    return [
+        x1 + r, y1,  x2 - r, y1,  x2, y1,      x2, y1 + r,
+        x2, y2 - r,  x2, y2,      x2 - r, y2,  x1 + r, y2,
+        x1, y2,      x1, y2 - r,  x1, y1 + r,  x1, y1,
+    ]
+
+
+def draw_round_rect(canvas, x1, y1, x2, y2, r=12, **kw):
+    """Скруглённый прямоугольник на Canvas (сглаженный полигон)."""
+    return canvas.create_polygon(_round_rect_points(x1, y1, x2, y2, r),
+                                  smooth=True, **kw)
+
+
+def draw_v_gradient(canvas, x1, y1, x2, y2, c_top, c_bottom, steps=24, tags=()):
+    """Дешёвый вертикальный градиент — N узких полос вместо честного blur."""
+    h = max(1, y2 - y1)
+    band = max(1, h / steps)
+    for i in range(steps):
+        t = i / max(1, steps - 1)
+        yy1 = y1 + i * band
+        yy2 = y1 + (i + 1) * band + 1
+        canvas.create_rectangle(x1, yy1, x2, yy2,
+                                 fill=mix_color(c_top, c_bottom, t),
+                                 outline="", tags=tags)
+
+
+class GlassCard(tk.Frame):
+    """
+    Карточка с мягко скруглёнными углами и лёгкой тенью — "приподнятая" над
+    фоном страницы. Дочерние виджеты пакуются в .body (обычный Frame), который
+    растягивается по ширине карточки; высота карточки сама следует за
+    естественной высотой содержимого.
+    """
+
+    def __init__(self, parent, bg, parent_bg, radius=14, pad=14, shadow=True):
+        super().__init__(parent, bg=parent_bg, highlightthickness=0, bd=0)
+        self._bg           = bg
+        self._radius       = radius
+        self._pad          = pad
+        self._shadow       = shadow
+        self._shadow_color = mix_color(parent_bg, "#7C8798", 0.45)
+        self._pending      = None
+
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=parent_bg)
+        self._canvas.pack(fill="both", expand=True)
+
+        self.body = tk.Frame(self._canvas, bg=bg)
+        self._win = self._canvas.create_window(0, 0, anchor="nw", window=self.body)
+
+        self.body.bind("<Configure>", lambda e: self._request_redraw())
+        self._canvas.bind("<Configure>", lambda e: self._request_redraw())
+
+    def _request_redraw(self):
+        if self._pending is None:
+            self._pending = self.after_idle(self._redraw)
+
+    def _redraw(self):
+        self._pending = None
+        c = self._canvas
+
+        # Высота не зависит от ширины (контент карточек не переносится по
+        # словам) — выставляем её СРАЗУ, даже до первого layout-прохода
+        # pack(), когда winfo_width() ещё вернёт временную заглушку (1px).
+        # Иначе pack() у ряда из нескольких карточек (напр. KPI-плашки)
+        # получает противоречивые запросы высоты в разных проходах и часть
+        # карточек схлопывается/не размещается вовсе.
+        self.body.update_idletasks()
+        body_h = self.body.winfo_reqheight()
+        h = body_h + self._pad * 2
+        c.configure(height=h)
+
+        cw = c.winfo_width()
+        if cw <= 2:
+            return
+        body_w = max(0, cw - self._pad * 2)
+        c.coords(self._win, self._pad, self._pad)
+        c.itemconfig(self._win, width=body_w)
+
+        c.delete("shape")
+        sh = 3 if self._shadow else 0
+        if self._shadow:
+            draw_round_rect(c, 3, 3 + sh, cw - 3, h - 3 + sh, self._radius,
+                             fill=self._shadow_color, outline="", tags="shape")
+        draw_round_rect(c, 2, 2, cw - 2 - sh, h - 2 - sh, self._radius,
+                         fill=self._bg, outline="", tags="shape")
+        c.tag_lower("shape")
 
 
 # ============================================================
@@ -236,7 +347,7 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Аналитика — Фонтанка.ру")
+        self.title("AJUR Analytics")
         self.geometry("1040x720")
         self.minsize(900, 640)
         self.resizable(True, True)
@@ -286,10 +397,16 @@ class App(tk.Tk):
         root = tk.Frame(self, bg=self._T["bg"])
         root.pack(fill="both", expand=True)
 
-        # Боковая панель
-        self._sidebar = tk.Frame(root, bg=self._T["sidebar"], width=220)
-        self._sidebar.pack(side="left", fill="y")
-        self._sidebar.pack_propagate(False)
+        # Боковая панель — Canvas с лёгким вертикальным градиентом-подложкой,
+        # содержимое (лого/навигация/часы) размещено внутри как обычный Frame.
+        self._sidebar_canvas = tk.Canvas(root, width=220, highlightthickness=0,
+                                         bd=0, bg=self._T["sidebar"])
+        self._sidebar_canvas.pack(side="left", fill="y")
+
+        self._sidebar = tk.Frame(self._sidebar_canvas, bg=self._T["sidebar"])
+        self._sidebar_win = self._sidebar_canvas.create_window(
+            0, 0, anchor="nw", window=self._sidebar, width=220)
+        self._sidebar_canvas.bind("<Configure>", self._redraw_sidebar_bg)
 
         # Разделитель
         tk.Frame(root, bg=self._T["border"], width=1).pack(side="left", fill="y")
@@ -302,6 +419,18 @@ class App(tk.Tk):
         self._build_pages()
         self._build_statusbar()
         self._show_page("analysis")
+
+    def _redraw_sidebar_bg(self, event=None):
+        c = self._sidebar_canvas
+        w, h = c.winfo_width(), c.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        c.delete("grad")
+        top    = self._T["sidebar"]
+        bottom = mix_color(self._T["sidebar"], C_ORANGE, 0.05)
+        draw_v_gradient(c, 0, 0, w, h, top, bottom, steps=28, tags="grad")
+        c.tag_lower("grad")
+        c.itemconfig(self._sidebar_win, height=h)
 
     # ============================================================
     # САЙДБАР
@@ -321,11 +450,11 @@ class App(tk.Tk):
         logo_inner = tk.Frame(logo_frame, bg=T["sidebar"])
         logo_inner.pack(side="left", fill="both", expand=True, padx=18)
 
-        tk.Label(logo_inner, text="фонтанка.ру",
-                 font=("Georgia", 16, "bold italic"),
+        tk.Label(logo_inner, text="AJUR Analytics",
+                 font=("Segoe UI", 15, "bold"),
                  bg=T["sidebar"], fg=C_ORANGE).pack(anchor="w", pady=(20, 0))
-        tk.Label(logo_inner, text="КОММЕРЧЕСКИЙ ОТДЕЛ",
-                 font=("Segoe UI", 9, "bold"),
+        tk.Label(logo_inner, text="ФОНТАНКА.РУ",
+                 font=("Segoe UI", 8, "bold"),
                  bg=T["sidebar"], fg=T["muted"]).pack(anchor="w")
 
         # Тонкий разделитель
@@ -547,16 +676,10 @@ class App(tk.Tk):
         self._r(lbl, "muted_bg")
         lbl.pack(side="left")
 
-        # Тело карточки
-        body = tk.Frame(wrapper, bg=T["surface"],
-                        highlightbackground=T["border"],
-                        highlightthickness=1)
-        self._r(body, "surface")
+        # Тело карточки — скруглённое, с мягкой тенью
+        body = GlassCard(wrapper, bg=T["surface"], parent_bg=T["bg"], radius=14, pad=16)
         body.pack(fill="x")
-
-        pad = self._r(tk.Frame(body, bg=T["surface"]), "surface")
-        pad.pack(fill="x", padx=16, pady=12)
-        return pad
+        return body.body
 
     def _file_row(self, parent, var, cmd, placeholder="Выберите файл..."):
         T = self._T
@@ -841,34 +964,36 @@ class App(tk.Tk):
             ("dev",      "Отклонение","от плана",   C_GREEN),
         ]
         self._kpi_cards = {}
-        for key, title, unit, color in defs:
-            card = tk.Frame(self._kpi_frame, bg=T["surface"],
-                            highlightbackground=T["border"],
-                            highlightthickness=1)
-            card.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=8, ipadx=12)
+        for i, (key, title, unit, color) in enumerate(defs):
+            card = GlassCard(self._kpi_frame, bg=T["surface"], parent_bg=T["bg"],
+                             radius=14, pad=12)
+            card.grid(row=0, column=i, sticky="nsew",
+                      padx=(0, 8) if i < len(defs) - 1 else 0)
+            self._kpi_frame.columnconfigure(i, weight=1, uniform="kpi")
 
-            # Верхняя цветная полоска
-            tk.Frame(card, bg=color, height=2).pack(fill="x")
-
-            tk.Label(card, text=title,
-                     font=("Segoe UI", 9, "bold"),
-                     bg=T["surface"], fg=color).pack(anchor="w", padx=10, pady=(8, 0))
+            title_lbl = tk.Label(card.body, text=title,
+                                 font=("Segoe UI", 9, "bold"),
+                                 bg=T["surface"], fg=color)
+            title_lbl.pack(anchor="w")
 
             val_var = tk.StringVar(value="—")
-            tk.Label(card, textvariable=val_var,
-                     font=("Segoe UI", 16, "bold"),
-                     bg=T["surface"], fg=T["text"]).pack(anchor="w", padx=10)
+            val_lbl = tk.Label(card.body, textvariable=val_var,
+                               font=("Segoe UI", 18, "bold"),
+                               bg=T["surface"], fg=T["text"])
+            val_lbl.pack(anchor="w")
 
-            tk.Label(card, text=unit,
+            tk.Label(card.body, text=unit,
                      font=("Segoe UI", 9),
-                     bg=T["surface"], fg=T["muted"]).pack(anchor="w", padx=10, pady=(0, 8))
+                     bg=T["surface"], fg=T["muted"]).pack(anchor="w")
 
-            self._kpi_cards[key] = (card, val_var, color)
+            self._kpi_cards[key] = {
+                "var": val_var, "title_lbl": title_lbl,
+                "val_lbl": val_lbl, "color": color,
+            }
 
     def _show_kpi_cards(self, result: dict):
         if not hasattr(self, "_kpi_frame"):
             return
-        T = self._T
 
         crm_k   = result.get("crm_total", 0)
         ext_k   = result.get("full_external_total", result.get("external_total", 0))
@@ -878,34 +1003,20 @@ class App(tk.Tk):
         def _fmt(v):
             return f"{v:,.0f}".replace(",", " ")
 
-        card, var, _ = self._kpi_cards["crm"]
-        var.set(_fmt(crm_k))
+        self._kpi_cards["crm"]["var"].set(_fmt(crm_k))
+        self._kpi_cards["external"]["var"].set(_fmt(ext_k))
+        self._kpi_cards["grand"]["var"].set(_fmt(grand_k))
 
-        card, var, _ = self._kpi_cards["external"]
-        var.set(_fmt(ext_k))
-
-        card, var, _ = self._kpi_cards["grand"]
-        var.set(_fmt(grand_k))
-
-        card, var, _ = self._kpi_cards["dev"]
+        dev = self._kpi_cards["dev"]
         if pct is not None:
             sign = "+" if pct >= 0 else ""
-            var.set(f"{sign}{pct:.2f}%")
+            dev["var"].set(f"{sign}{pct:.2f}%")
             dev_color = C_GREEN if abs(pct) < 2 else (C_AMBER if abs(pct) < 5 else C_RED)
         else:
-            var.set("—")
-            dev_color = T["muted"]
-        card.configure(highlightbackground=dev_color)
-        for w in card.winfo_children():
-            if isinstance(w, tk.Label) and "16" in str(w.cget("font")):
-                w.configure(fg=dev_color)
-                break
-
-        for key, (c, v, color) in self._kpi_cards.items():
-            c.configure(bg=T["surface"])
-            for w in c.winfo_children():
-                if isinstance(w, tk.Label):
-                    w.configure(bg=T["surface"])
+            dev["var"].set("—")
+            dev_color = self._T["muted"]
+        dev["title_lbl"].configure(fg=dev_color)
+        dev["val_lbl"].configure(fg=dev_color)
 
         if not self._kpi_frame.winfo_ismapped():
             self._kpi_frame.pack(fill="x", padx=32, pady=(0, 4),
@@ -1178,22 +1289,19 @@ class App(tk.Tk):
             ("🍩", "Выручка по отраслям", "Doughnut-диаграмма",     "#8B5CF6"),
         ]
         for i, (icon, title, desc, color) in enumerate(items):
-            card = tk.Frame(grid, bg=T["surface"],
-                            highlightbackground=T["border"],
-                            highlightthickness=1)
+            card = GlassCard(grid, bg=T["surface"], parent_bg=T["bg"], radius=14, pad=12)
             card.grid(row=0, column=i, sticky="nsew",
-                      padx=(0, 8) if i < 3 else 0, pady=4, ipady=12)
+                      padx=(0, 8) if i < 3 else 0, pady=4)
             grid.columnconfigure(i, weight=1)
 
-            tk.Frame(card, bg=color, height=2).pack(fill="x")
-            tk.Label(card, text=icon, font=("Segoe UI", 24),
-                     bg=T["surface"]).pack(pady=(12, 4))
-            tk.Label(card, text=title,
+            tk.Label(card.body, text=icon, font=("Segoe UI", 24),
+                     bg=T["surface"]).pack(pady=(0, 4))
+            tk.Label(card.body, text=title,
                      font=("Segoe UI", 9, "bold"),
-                     bg=T["surface"], fg=T["text"]).pack()
-            tk.Label(card, text=desc,
+                     bg=T["surface"], fg=color).pack()
+            tk.Label(card.body, text=desc,
                      font=("Segoe UI", 8),
-                     bg=T["surface"], fg=T["muted"]).pack(pady=(2, 8))
+                     bg=T["surface"], fg=T["muted"]).pack(pady=(2, 0))
 
         self._section_lbl(p, "ЖУРНАЛ")
         self.dash_log_box = self._log_box(p, height=5)
