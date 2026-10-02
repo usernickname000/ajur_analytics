@@ -11,7 +11,9 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 data_files = [
     ("external_income.json", "."),
     ("verified_figures.json", "."),
-    ("config.json", ".") if os.path.exists(os.path.join(APP_DIR, "config.json")) else None,
+    ("client_aliases.json", "."),
+    # config.json в сборку не кладём: в нём личные пути и планы; программа
+    # создаёт его сама рядом с .exe (см. paths.py).
 ]
 
 add_data = []
@@ -47,7 +49,9 @@ cmd = [
     "--hidden-import=openpyxl.chart",
     "--hidden-import=openpyxl.utils",
     # модули приложения
+    "--hidden-import=paths",
     "--hidden-import=analytics",
+    "--hidden-import=client_aliases_editor",
     "--hidden-import=comparison",
     "--hidden-import=dashboard",
     "--hidden-import=verified_figures_editor",

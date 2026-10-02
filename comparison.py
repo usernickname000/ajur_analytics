@@ -11,7 +11,7 @@ from openpyxl.chart import BarChart, Reference
 from openpyxl.utils import get_column_letter
 
 from analytics import (
-    parse_money, pick_client, normalize_client,
+    parse_money, load_crm_export, prepare_crm, count_orders, order_totals,
     EXCLUDE_MANAGERS, EXCLUDE_PROJECTS,
     COL_MONTH, COL_ORDER, COL_DATE, COL_MANAGER,
     COL_REVENUE, COL_PROJECT,
@@ -35,25 +35,23 @@ def _load_period(path: str, log) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Файл не найден: {path}")
 
-    df = pd.read_excel(path, dtype=object)
-    df.columns = df.columns.map(lambda x: x.strip() if isinstance(x, str) else x)
-
-    # Убираем строку "Итого"
-    if COL_MONTH in df.columns:
-        df = df.loc[~df[COL_MONTH].astype(str).str.strip().str.lower().eq("итого")]
-    df = df.dropna(how="all").reset_index(drop=True)
+    # Общий загрузчик: двухстрочная шапка, строка "Итого"
+    df = load_crm_export(path)
+    if COL_REVENUE not in df.columns or COL_ORDER not in df.columns:
+        raise ValueError(f"В файле нет обязательных колонок '{COL_ORDER}' / '{COL_REVENUE}': "
+                         f"{os.path.basename(path)}")
 
     # Парсим выручку. Нулевую/отрицательную выручку не выбрасываем (сторно,
     # корректировки) — иначе "Выручка"/"Заказов" здесь не совпадут с отчётом
     # "Анализ", где run_analytics такие строки оставляет в расчётах.
     df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
+
+    # Клиент + периметр аналитики (без ФОНТАНКА ФЕСТ, АНО Медиа ДОМ, бартера) —
+    # тот же, что в отчёте "Анализ", иначе цифры двух отчётов расходятся.
+    df, _ = prepare_crm(df, log=lambda m: log(f"  {m}"))
     df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
 
-    # Клиент
-    df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1)
-    df['КОНЕЧНЫЙ_КЛИЕНТ'] = df['КОНЕЧНЫЙ_КЛИЕНТ'].apply(normalize_client)
-
-    log(f"  Загружено строк после фильтров: {len(df)}")
+    log(f"  Позиций с выручкой в периметре: {len(df)}")
     return df
 
 
@@ -77,7 +75,7 @@ def _manager_stats(df: pd.DataFrame) -> pd.DataFrame:
         df.groupby(COL_MANAGER)
         .agg(
             Выручка_руб=(COL_REVENUE, 'sum'),
-            Заказов=(COL_ORDER, 'count')
+            Заказов=(COL_ORDER, 'nunique')
         )
         .reset_index()
         .sort_values('Выручка_руб', ascending=False)
@@ -91,7 +89,7 @@ def _client_stats(df: pd.DataFrame) -> pd.DataFrame:
         df.groupby('КОНЕЧНЫЙ_КЛИЕНТ')
         .agg(
             Выручка_руб=(COL_REVENUE, 'sum'),
-            Заказов=(COL_ORDER, 'count')
+            Заказов=(COL_ORDER, 'nunique')
         )
         .reset_index()
         .sort_values('Выручка_руб', ascending=False)
@@ -158,21 +156,25 @@ def _sheet_summary(wb, df_a, df_b, label_a, label_b):
     rev_b = round(df_b[COL_REVENUE].sum() / 1000, 2)
     metrics.append(("Выручка, тыс. руб.", rev_a, rev_b))
 
-    ord_a = len(df_a)
-    ord_b = len(df_b)
+    # Заказы — уникальные значения 'Заказ'; строка выгрузки — это позиция заказа.
+    ord_a = count_orders(df_a)
+    ord_b = count_orders(df_b)
     metrics.append(("Количество заказов", ord_a, ord_b))
+    metrics.append(("Количество позиций", len(df_a), len(df_b)))
 
     # Средний/медианный чек считаются без мероприятий (см. README) — как в run_analytics.
     mask_a = _mask_no_events(df_a)
     mask_b = _mask_no_events(df_b)
 
-    avg_a = round(df_a.loc[mask_a, COL_REVENUE].mean() / 1000, 2)
-    avg_b = round(df_b.loc[mask_b, COL_REVENUE].mean() / 1000, 2)
-    metrics.append(("Средний чек, тыс. руб.", avg_a, avg_b))
+    sums_a = order_totals(df_a.loc[mask_a])
+    sums_b = order_totals(df_b.loc[mask_b])
+    avg_a = round(sums_a.mean() / 1000, 2)
+    avg_b = round(sums_b.mean() / 1000, 2)
+    metrics.append(("Средний чек (на заказ, без мероприятий), тыс. руб.", avg_a, avg_b))
 
-    med_a = round(df_a.loc[mask_a, COL_REVENUE].median() / 1000, 2)
-    med_b = round(df_b.loc[mask_b, COL_REVENUE].median() / 1000, 2)
-    metrics.append(("Медианный чек, тыс. руб.", med_a, med_b))
+    med_a = round(sums_a.median() / 1000, 2)
+    med_b = round(sums_b.median() / 1000, 2)
+    metrics.append(("Медианный чек (на заказ, без мероприятий), тыс. руб.", med_a, med_b))
 
     cli_a = df_a['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
     cli_b = df_b['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
@@ -357,7 +359,7 @@ def _sheet_movement(wb, df_a, df_b, label_a, label_b):
     new_detail = (
         df_b[df_b['КОНЕЧНЫЙ_КЛИЕНТ'].isin(new_clients)]
         .groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'count'))
+        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'nunique'))
         .reset_index()
         .sort_values('Выручка', ascending=False)
     )
@@ -381,7 +383,7 @@ def _sheet_movement(wb, df_a, df_b, label_a, label_b):
     lost_detail = (
         df_a[df_a['КОНЕЧНЫЙ_КЛИЕНТ'].isin(lost_clients)]
         .groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'count'))
+        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'nunique'))
         .reset_index()
         .sort_values('Выручка', ascending=False)
     )

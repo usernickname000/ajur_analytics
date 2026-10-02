@@ -297,10 +297,24 @@ class ExternalIncomeEditor(tk.Toplevel):
             self._plan_total_var.set(self._fmt(total))
 
     # ── Парсинг/форматирование ──────────────────────────────
+    def _bad_number(self, s):
+        """True, если поле непустое, но числом не является (иначе оно молча сохранилось бы как 0)."""
+        s = (str(s or '').strip().replace(' ', '').replace('\xa0', '').replace('\u202f', '')
+             .replace('−', '-').replace(',', '.'))
+        if not s:
+            return False
+        try:
+            float(s)
+            return False
+        except Exception:
+            return True
+
     def _parse(self, s):
         if not s:
             return 0.0
-        s = str(s).strip().replace(' ', '').replace(',', '.')
+        # Убираем и неразрывные пробелы: так Excel разделяет тысячи при копировании
+        s = (str(s).strip().replace(' ', '').replace('\xa0', '').replace('\u202f', '')
+             .replace('−', '-').replace(',', '.'))
         try:
             return float(s)
         except Exception:
@@ -320,6 +334,14 @@ class ExternalIncomeEditor(tk.Toplevel):
     # ── Сохранение ───────────────────────────────────────────
     def _save(self):
         # Пересобираем данные
+        bad = [f"{name}, месяц {m}" for (name, m), var in self.entries.items()
+               if m != '_total_var' and self._bad_number(var.get())]
+        bad += [f"План группы, месяц {m}" for m, var in self.plan_entries.items()
+                if self._bad_number(var.get())]
+        if bad:
+            messagebox.showerror("Не число",
+                "Эти ячейки не распознаны как числа, файл не сохранён:\n" + "\n".join(bad[:15]))
+            return
         new_data = dict(self.data)  # копия с _описание, _год, служебными
 
         # Обновляем месячные суммы

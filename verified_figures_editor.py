@@ -156,10 +156,24 @@ class VerifiedFiguresEditor(tk.Toplevel):
         self.bind('<Return>', lambda e: self._save())
         self.bind('<Escape>', lambda e: self.destroy())
 
+    def _bad_number(self, s):
+        """True, если поле непустое, но числом не является (иначе оно молча сохранилось бы как 0)."""
+        s = (str(s or '').strip().replace(' ', '').replace('\xa0', '').replace('\u202f', '')
+             .replace('−', '-').replace(',', '.'))
+        if not s:
+            return False
+        try:
+            float(s)
+            return False
+        except Exception:
+            return True
+
     def _parse(self, s):
         if not s:
             return 0
-        s = str(s).strip().replace(' ', '').replace(',', '.')
+        # Убираем и неразрывные пробелы: так Excel разделяет тысячи при копировании
+        s = (str(s).strip().replace(' ', '').replace('\xa0', '').replace('\u202f', '')
+             .replace('−', '-').replace(',', '.'))
         try:
             return int(float(s))
         except Exception:
@@ -181,6 +195,11 @@ class VerifiedFiguresEditor(tk.Toplevel):
         new_data.setdefault('_описание',
             "Верифицированные годовые итоги из бухгалтерии.")
 
+        bad = [key for key, var in self.entries.items() if self._bad_number(var.get())]
+        if bad:
+            messagebox.showerror("Не число",
+                "Эти поля не распознаны как числа, файл не сохранён:\n" + "\n".join(bad))
+            return
         for key, var in self.entries.items():
             new_data[key] = self._parse(var.get())
 

@@ -478,6 +478,25 @@ def apply_to_external_income(json_path, pw, backup=True):
 
     data['_год'] = pw.year
 
+    if year_switch:
+        # При смене года обнуляем ВСЕ месячные статьи и планы, а не только те,
+        # что нашлись в новом файле: иначе статья, которой в новом файле нет,
+        # и планы прошлого года остались бы под меткой нового года.
+        for key, val in list(data.items()):
+            if not key.startswith('_') and isinstance(val, dict):
+                data[key] = {m: 0 for m in MONTHS}
+        if isinstance(data.get('_план_группы_по_месяцам_руб'), dict):
+            data['_план_группы_по_месяцам_руб'] = {m: 0 for m in MONTHS}
+        if isinstance(data.get('_план_KPI_по_месяцам_руб'), dict):
+            data['_план_KPI_по_месяцам_руб'] = {
+                k: ({m: 0 for m in MONTHS} if isinstance(v, dict) else v)
+                for k, v in data['_план_KPI_по_месяцам_руб'].items()
+            }
+        report_lines.append(
+            f"Отчётный год сменён с {old_year} на {pw.year}: все статьи и планы "
+            f"обнулены перед загрузкой. KPI-планы на {pw.year} год нужно ввести заново."
+        )
+
     for canonical, months in update.items():
         # При смене отчётного года не переносим цифры прошлого года на
         # месяцы, которых ещё нет в источнике — иначе под меткой 2026-го
@@ -495,6 +514,8 @@ def apply_to_external_income(json_path, pw, backup=True):
             if v is None:
                 continue
             old_v = existing.get(m, 0) or 0
+            if not isinstance(old_v, (int, float)):
+                old_v = 0
             if round(float(old_v), 2) != round(float(v), 2):
                 changed_months.append(f"{m}: {old_v:,.0f} → {v:,.0f}")
             existing[m] = round(float(v), 2)

@@ -10,7 +10,8 @@ from datetime import datetime
 import pandas as pd
 
 from analytics import (
-    parse_money, pick_client, normalize_client, pick_industry, classify_industry,
+    parse_money, pick_industry, classify_industry,
+    load_crm_export, prepare_crm, count_orders, order_totals,
     EXCLUDE_MANAGERS, EXCLUDE_PROJECTS,
     COL_REVENUE, COL_MONTH, COL_MANAGER, COL_PROJECT,
     COL_ORDER, COL_DATE, COL_CLIENT, COL_CLIENT_RA, COL_REKLAMD,
@@ -25,17 +26,16 @@ def _load_and_prepare(path: str) -> pd.DataFrame:
     на средний чек соответственно (см. README), иначе KPI дашборда (Выручка,
     Заказов, Клиентов) не совпадают с отчётом "Анализ".
     """
-    df = pd.read_excel(path, dtype=object)
-    df.columns = df.columns.map(lambda x: x.strip() if isinstance(x, str) else x)
-    if COL_MONTH in df.columns:
-        df = df[~df[COL_MONTH].astype(str).str.strip().str.lower().eq('итого')]
-    df = df.dropna(how='all').reset_index(drop=True)
+    df = load_crm_export(path)
+    if COL_REVENUE not in df.columns or COL_ORDER not in df.columns:
+        raise ValueError(f"В файле нет обязательных колонок '{COL_ORDER}' / '{COL_REVENUE}'")
     # Нулевую/отрицательную выручку не выбрасываем (сторно, корректировки) —
     # иначе KPI дашборда не совпадают с отчётом "Анализ", где run_analytics
     # такие строки оставляет в расчётах.
     df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
+    # Клиент + периметр аналитики (без ФОНТАНКА ФЕСТ, АНО Медиа ДОМ, бартера) — как в "Анализе"
+    df, _ = prepare_crm(df)
     df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
-    df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1).apply(normalize_client)
     # Колонка должна называться именно 'ОТРАСЛЬ_КЛИЕНТА' — classify_industry() в
     # analytics.py читает row['ОТРАСЛЬ_КЛИЕНТА']; при другом имени она получает
     # пустую строку для каждой строки, и 'ОТРАСЛЬ_НОРМ' всегда выходит пустой,
@@ -49,7 +49,7 @@ def _load_and_prepare(path: str) -> pd.DataFrame:
 
 def _collect_data(df: pd.DataFrame) -> dict:
     rev_total = round(df[COL_REVENUE].sum() / 1000, 1)
-    orders    = len(df)
+    orders    = count_orders(df)   # уникальные заказы, а не строки-позиции
     clients   = df['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
 
     # Средний чек — без мероприятий (см. README), как в run_analytics.
@@ -57,7 +57,7 @@ def _collect_data(df: pd.DataFrame) -> dict:
         ~df[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS)
         if COL_PROJECT in df.columns else pd.Series(True, index=df.index)
     )
-    avg_check = round(df.loc[mask_no_events, COL_REVENUE].mean() / 1000, 1)
+    avg_check = round(order_totals(df.loc[mask_no_events]).mean() / 1000, 1)
 
     monthly = []
     if '_month_dt' in df.columns:
@@ -72,7 +72,13 @@ def _collect_data(df: pd.DataFrame) -> dict:
         grp['revenue'] = (grp[COL_REVENUE] / 1000).round(1)
         monthly = grp[['month', 'revenue']].to_dict('records')
 
-    top_cli = (df.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[COL_REVENUE]
+    # Топ клиентов — без мероприятий и клиентов-мероприятий, как лист 02 в "Анализе"
+    is_event_client = (
+        df['КОНЕЧНЫЙ_КЛИЕНТ'].astype(str).str.upper()
+        .str.contains(r'\b(?:ФЕСТ|МЕРОПРИЯТИ)', na=False, regex=True)
+    )
+    top_cli = (df.loc[mask_no_events & ~is_event_client]
+                 .groupby('КОНЕЧНЫЙ_КЛИЕНТ')[COL_REVENUE]
                  .sum().nlargest(10).reset_index())
     top_cli.columns = ['name', 'revenue']
     top_cli['revenue'] = (top_cli['revenue'] / 1000).round(1)
@@ -126,7 +132,8 @@ def _collect_data(df: pd.DataFrame) -> dict:
 
 def _generate_html(data: dict, filename: str) -> str:
     data['meta']['filename'] = os.path.basename(filename)
-    d = json.dumps(data, ensure_ascii=False)
+    # '</' экранируется, чтобы имя клиента с '</script>' не обрывало блок скрипта
+    d = json.dumps(data, ensure_ascii=False, default=float).replace('</', '<\\/')
 
     html = r"""<!DOCTYPE html>
 <html lang="ru">
