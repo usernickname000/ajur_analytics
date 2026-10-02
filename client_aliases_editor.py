@@ -58,7 +58,8 @@ class ClientAliasesEditor(tk.Toplevel):
         for row in self._rows:
             canonical = row['canonical_var'].get().strip()
             raw = row['patterns_var'].get().strip()
-            patterns = [p.strip() for p in raw.split(',') if p.strip()]
+            # В верхний регистр: поиск идёт по имени клиента в верхнем регистре
+            patterns = [p.strip().upper() for p in raw.split(',') if p.strip()]
             if not canonical:
                 continue
             groups.append({'canonical': canonical, 'patterns': patterns})

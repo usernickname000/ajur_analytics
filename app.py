@@ -15,6 +15,7 @@ import json
 import os
 from datetime import datetime, timezone, timedelta
 
+from paths import app_dir, data_path
 from analytics import run_analytics
 from comparison import run_comparison
 from dashboard import generate_dashboard
@@ -43,9 +44,12 @@ try:
 except ImportError:
     HAS_DOHODY_IMPORT = False
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# Настройки и JSON-файлы лежат в app_dir(): при запуске из исходников это папка
+# проекта, в собранном .exe — папка рядом с .exe (а не временная папка распаковки,
+# которая удаляется при закрытии программы вместе со всеми сохранёнными правками).
+APP_DIR     = app_dir()
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 ICON_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-APP_DIR     = os.path.dirname(os.path.abspath(__file__))
 
 # ── Палитра ──────────────────────────────────────────────────
 C_ORANGE   = "#F38120"
@@ -888,7 +892,7 @@ class App(tk.Tk):
         row1 = self._r(tk.Frame(parent, bg=T["surface"]), "surface")
         row1.pack(fill="x", pady=(0, 8))
 
-        lbl = tk.Label(row1, text="Дата для группировки:",
+        lbl = tk.Label(row1, text="База итога для сверки:",
                        font=("Segoe UI", 9), bg=T["surface"], fg=T["text2"])
         self._r(lbl, "text2_sf")
         lbl.pack(side="left")
@@ -961,7 +965,7 @@ class App(tk.Tk):
             ("crm",      "CRM",       "тыс. руб.",  C_ORANGE),
             ("external", "Внешние",   "тыс. руб.",  C_BLUE),
             ("grand",    "Итого",     "тыс. руб.",  "#8B5CF6"),
-            ("dev",      "Отклонение","от плана",   C_GREEN),
+            ("dev",      "Отклонение","от бухгалтерии", C_GREEN),
         ]
         self._kpi_cards = {}
         for i, (key, title, unit, color) in enumerate(defs):
@@ -1023,7 +1027,7 @@ class App(tk.Tk):
                                  before=self.run_btn.master)
 
     def _open_external_editor(self):
-        path = os.path.join(APP_DIR, "external_income.json")
+        path = data_path("external_income.json")
         if not os.path.exists(path):
             messagebox.showerror("Нет файла",
                 f"Файл external_income.json не найден:\n{path}")
@@ -1031,11 +1035,11 @@ class App(tk.Tk):
         ExternalIncomeEditor(self, path, theme=self._T)
 
     def _open_dohody_import(self):
-        path = os.path.join(APP_DIR, "external_income.json")
+        path = data_path("external_income.json")
         DohodyImportDialog(self, path, theme=self._T)
 
     def _open_aliases_editor(self):
-        path = os.path.join(APP_DIR, "client_aliases.json")
+        path = data_path("client_aliases.json")
         if not os.path.exists(path):
             default = {
                 "_описание": "Правила нормализации клиентов.",
@@ -1050,7 +1054,7 @@ class App(tk.Tk):
         ClientAliasesEditor(self, path, theme=self._T)
 
     def _open_verified_editor(self):
-        path = os.path.join(APP_DIR, "verified_figures.json")
+        path = data_path("verified_figures.json")
         if not os.path.exists(path):
             default = {
                 "_описание": "Верифицированные годовые итоги из бухгалтерии.",
@@ -1171,7 +1175,7 @@ class App(tk.Tk):
             "Петрова Э.", "Егорова И.", "Демахина Е.",
             "Дубровская Т.", "Долгополова Н.", "Демидова Г.",
             "Сосновик А.", "Киселёва Е.", "Лея К.",
-            "Борисенко Е.", "Сорокина Т.", "Шевчук Е.", "Карпус О.",
+            "[УВ] Борисенко Е.", "Сорокина Т.", "Шевчук Е.", "Карпусь О.",
         ] + list(saved.keys())))
         for i, name in enumerate(managers, 1):
             self._add_plan_row(name, str(saved.get(name, "")), i)
@@ -1250,7 +1254,8 @@ class App(tk.Tk):
     def _get_plan_rub(self):
         result = {}
         for name, var in self._plan_vars.items():
-            val = var.get().strip().replace(",", ".")
+            val = (var.get().strip().replace(" ", "").replace("\xa0", "")
+                   .replace(",", "."))
             if val:
                 try:
                     result[name] = float(val) * 1000
@@ -1352,14 +1357,16 @@ class App(tk.Tk):
             self.input_var.set(path)
             save_config(self._cfg)
 
+    # Логи вызываются из рабочих потоков, а виджеты tkinter можно менять только
+    # из главного потока — поэтому запись в журнал ставится в очередь через after().
     def _log(self, msg):
-        self._write_log(self.log_box, msg)
+        self.after(0, lambda m=msg: self._write_log(self.log_box, m))
 
     def _cmp_log(self, msg):
-        self._write_log(self.cmp_log_box, msg)
+        self.after(0, lambda m=msg: self._write_log(self.cmp_log_box, m))
 
     def _dash_log(self, msg):
-        self._write_log(self.dash_log_box, msg)
+        self.after(0, lambda m=msg: self._write_log(self.dash_log_box, m))
 
     # ============================================================
     # АНАЛИЗ
@@ -1382,14 +1389,14 @@ class App(tk.Tk):
         self._start_anim()
         self._recon_label.config(text="  Считаю...", fg=self._T["muted"])
         log_fn = self._progress_log(self.main_bar, self.main_pct)
+        date_by = self._date_by.get()
         threading.Thread(target=self._thread_analysis,
-                         args=(inp, out_path, plan, log_fn),
+                         args=(inp, out_path, plan, log_fn, date_by),
                          daemon=True).start()
 
-    def _thread_analysis(self, inp, out_path, plan, log_fn):
+    def _thread_analysis(self, inp, out_path, plan, log_fn, date_by):
         try:
             log_fn(f"Файл: {os.path.basename(inp)}")
-            date_by = self._date_by.get()
             result = run_analytics(inp, out_path,
                                    log=log_fn,
                                    manager_plan=plan,
@@ -1426,9 +1433,9 @@ class App(tk.Tk):
             log_fn(f"❌ ОШИБКА: {err}")
             self.after(200, lambda m=err: self._toast(
                 f"Ошибка: {m[:80]}", kind="err", duration=7000))
-            self.after(0, lambda: messagebox.showerror("Ошибка", err))
+            self.after(0, lambda m=err: messagebox.showerror("Ошибка", m))
         finally:
-            self._stop_anim()
+            self.after(0, self._stop_anim)
             self.after(0, lambda: self.run_btn.configure(
                 state="normal", text="  Запустить анализ  "))
 
@@ -1453,7 +1460,7 @@ class App(tk.Tk):
 
         date_label = "дата оплаты" if date_by == "payment" else "дата заказа"
         text = (f"  {icon}  {date_label.capitalize()}: "
-                f"CRM+внешние {grand:,.0f} тыс.  │  "
+                f"сопоставимо с бухгалтерией {grand:,.0f} тыс.  │  "
                 f"Цель {verified:,.0f} тыс.  │  "
                 f"{pct:+.2f}% — {verdict}").replace(",", " ")
         self._recon_label.config(text=text, fg=color)
@@ -1502,9 +1509,9 @@ class App(tk.Tk):
             self._cmp_log(f"❌ ОШИБКА: {err}")
             self.after(200, lambda m=err: self._toast(
                 f"Ошибка: {m[:80]}", kind="err", duration=7000))
-            self.after(0, lambda: messagebox.showerror("Ошибка", err))
+            self.after(0, lambda m=err: messagebox.showerror("Ошибка", m))
         finally:
-            self._stop_anim()
+            self.after(0, self._stop_anim)
             self.after(0, lambda: self.cmp_run_btn.configure(
                 state="normal", text="  Сравнить периоды  "))
 
@@ -1525,10 +1532,11 @@ class App(tk.Tk):
         try:
             generate_dashboard(inp, log=self._dash_log)
         except Exception as e:
-            self._dash_log(f"❌ ОШИБКА: {e}")
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            err = str(e)
+            self._dash_log(f"❌ ОШИБКА: {err}")
+            self.after(0, lambda m=err: messagebox.showerror("Ошибка", m))
         finally:
-            self._stop_anim()
+            self.after(0, self._stop_anim)
             self.after(0, lambda: self.dash_btn.configure(
                 state="normal", text="  Открыть дашборд в браузере  "))
 
