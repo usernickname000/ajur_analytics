@@ -12,6 +12,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from paths import data_path
 
 
 # ==============================
@@ -26,6 +27,8 @@ COL_REVENUE     = 'Выручка без НДС'
 COL_DISCOUNT_PCT = 'Скидка, %'
 COL_PROJECT     = 'Проект'
 COL_BARTER = 'Бартер'
+COL_IS_REVENUE = 'Это выручка'
+COL_REVENUE_PAID = 'Выручка без НДС опл'
 
 COL_CLIENT      = 'Клиент'
 COL_CLIENT_RA   = 'Клиент РА'
@@ -55,6 +58,20 @@ EXCLUDE_PROJECTS = [
     'Мероприятия (городские)'
 ]
 
+# ── Периметр аналитики ─────────────────────────────────────
+# Клиенты, которые целиком исключаются из расчётов (подстроки в верхнем
+# регистре, ищутся в КОНЕЧНЫЙ_КЛИЕНТ):
+#   ФОНТАНКА ФЕСТ — внутригрупповой оборот (взаимозачёт ФФ/АМ), включая мероприятия;
+#   АНО МЕДИА ДОМ — вне расчёта (в бухгалтерии идёт строкой ИРИ/АНО).
+# Строки с 'Бартер' = 'Да' тоже исключаются: это те же сделки, что и
+# 'Медийный бартер' в бухгалтерии, и в сравнениях бартер не участвует.
+EXCLUDE_CLIENTS_PERIMETER = {
+    'ФОНТАНКА ФЕСТ': 'ФОНТАНКА ФЕСТ (взаимозачёт)',
+    'АНО МЕДИА ДОМ': 'АНО Медиа ДОМ (вне расчёта)',
+}
+EXCLUDE_REASON_BARTER = 'Бартер'
+COL_EXCLUDED = 'ИСКЛЮЧЕНО'
+
 DISCOUNT_BUCKETS = [0, 5, 10, 15, 20, 25, 50]
 
 REVENUE_BUCKETS = [
@@ -71,7 +88,8 @@ REVENUE_BUCKETS = [
 # АЛИАСЫ КЛИЕНТОВ
 # ==============================
 
-_ALIASES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'client_aliases.json')
+# Рядом с .exe в собранной программе (см. paths.py)
+_ALIASES_PATH = data_path('client_aliases.json')
 _aliases_cache = None
 
 
@@ -99,7 +117,7 @@ def reload_aliases():
         _aliases_cache = [
             (g['canonical'],
              [re.compile(r'(?<!\w)' + re.escape(str(p).strip().upper()))
-              for p in g['patterns'] if str(p).strip()])
+              for p in g.get('patterns', []) if str(p).strip()])
             for g in data.get('groups', [])
         ]
     except FileNotFoundError:
@@ -122,6 +140,7 @@ def parse_money(x):
     # Раньше точка из 'руб.' оставалась и '1 234,56 руб.' читалось как 123456.
     x = re.sub(r'(?i)(руб\.?|р\.|₽)', '', x)
     x = re.sub(r"[\s']", '', x)
+    x = x.replace("−", "-").replace("–", "-")  # типографский минус
     has_comma = "," in x
     has_dot = "." in x
     if has_comma and has_dot:
@@ -325,25 +344,123 @@ def client_rank_mask(df):
     return ~is_event_client
 
 
-def load_crm(path, with_clients=True):
+# Подписи второй строки шапки выгрузки → имя колонки, под которым она нужна в коде
+_SUBHEADER_NAMES = {'Рекламодатель', 'Отрасли Рекламодателя'}
+
+
+def load_crm(path, with_clients=True, required=(COL_ORDER, COL_REVENUE)):
     """
-    Читает выгрузку CRM и делает общую для всех отчётов очистку: заголовки
-    без пробелов, без строки «Итого» и полностью пустых строк, выручка —
-    числом. Строки с нулевой/отрицательной/пустой выручкой остаются (сторно,
-    корректировки) — иначе «Заказов»/«Клиентов» расходятся между отчётами.
+    Читает выгрузку «Заказы за период» с общей для всех отчётов очисткой:
+    заголовки без пробелов, без строки «Итого» и пустых строк, выручка — числом.
     with_clients — добавить КОНЕЧНЫЙ_КЛИЕНТ (выбор поля + алиасы).
+
+    Шапка выгрузки двухстрочная: под 'Договор РА' во второй строке стоят
+    'Рекламодатель' и 'Отрасли Рекламодателя'. pandas читает только первую
+    строку шапки, поэтому колонки получали бы имена 'Договор РА' и 'Unnamed: N',
+    а сама вторая строка оставалась бы в данных как фиктивный заказ.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Файл не найден: {path}")
     df = pd.read_excel(path, dtype=object)
     df.columns = df.columns.map(lambda x: x.strip() if isinstance(x, str) else x)
+
+    for i in range(min(3, len(df))):
+        row = df.iloc[i]
+        vals = {col: str(v).strip() for col, v in row.items() if pd.notna(v)}
+        if not any(v in _SUBHEADER_NAMES for v in vals.values()):
+            continue
+        if COL_ORDER in df.columns and pd.notna(row.get(COL_ORDER)):
+            continue  # это обычная строка данных, а не подзаголовок
+        rename = {col: v for col, v in vals.items() if v in _SUBHEADER_NAMES and v not in df.columns}
+        df = df.rename(columns=rename).drop(index=df.index[i])
+        break
+
     if COL_MONTH in df.columns:
         df = df.loc[~df[COL_MONTH].astype(str).str.strip().str.lower().eq("итого")]
     df = df.dropna(how="all").reset_index(drop=True)
+
+    # Обязательные колонки проверяем ДО разбора — иначе вместо понятного
+    # сообщения был бы KeyError
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Критические ошибки в данных:\n - Отсутствуют обязательные колонки: "
+                         f"{missing} ({os.path.basename(path)})")
     df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
     if with_clients:
         df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1).apply(normalize_client)
     return df
+
+
+def mark_perimeter(df):
+    """
+    Колонка COL_EXCLUDED: причина исключения строки из периметра аналитики
+    ('' — в периметре). Сначала клиенты вне периметра, затем бартер
+    остальных клиентов — чтобы сумма по причинам не задваивалась.
+    """
+    reason = pd.Series('', index=df.index, dtype=object)
+    client = df['КОНЕЧНЫЙ_КЛИЕНТ'].astype(str).str.upper().str.replace(r'\s+', ' ', regex=True).str.strip()
+    for pattern, label in EXCLUDE_CLIENTS_PERIMETER.items():
+        reason.loc[client.str.contains(pattern, regex=False) & reason.eq('')] = label
+    if COL_BARTER in df.columns:
+        barter = df[COL_BARTER].astype(str).str.strip().str.lower().eq('да') & reason.eq('')
+        reason.loc[barter] = EXCLUDE_REASON_BARTER
+    df[COL_EXCLUDED] = reason
+    return df
+
+
+def excluded_summary(excluded):
+    """Сводка исключённых строк по причинам: Причина / Строк / Выручка, тыс. руб."""
+    rows = []
+    for label in list(EXCLUDE_CLIENTS_PERIMETER.values()) + [EXCLUDE_REASON_BARTER]:
+        part = excluded.loc[excluded[COL_EXCLUDED] == label]
+        rows.append({'Причина исключения': label, 'Строк': len(part),
+                     'Выручка, тыс. руб.': round(part[COL_REVENUE].sum() / 1000, 2)})
+    return pd.DataFrame(rows)
+
+
+def prepare_crm(df, log=None):
+    """
+    Конечный клиент + периметр аналитики. Возвращает (в периметре, исключённые):
+      в периметре — без ФОНТАНКА ФЕСТ, АНО Медиа ДОМ, бартера и позиций
+                    'Это выручка' = 'Нет' с пустой выручкой (это не заказы
+                    с нулевой суммой, а нерекламные/технические позиции);
+      исключённые — строки вне периметра с колонкой COL_EXCLUDED (причина).
+    df[COL_REVENUE] уже должен быть числом.
+    """
+    df = df.copy()
+    if 'КОНЕЧНЫЙ_КЛИЕНТ' not in df.columns:
+        df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1).apply(normalize_client)
+    df = mark_perimeter(df)
+    excluded = df.loc[df[COL_EXCLUDED] != ''].reset_index(drop=True)
+
+    keep = df[COL_EXCLUDED].eq('')
+    if COL_IS_REVENUE in df.columns:
+        keep &= ~(df[COL_REVENUE].isna()
+                  & df[COL_IS_REVENUE].astype(str).str.strip().str.lower().eq('нет'))
+    if log is not None:
+        for _, r in excluded_summary(excluded).iterrows():
+            if r['Строк']:
+                log(f"Вне периметра: {r['Причина исключения']} — {r['Строк']} строк, "
+                    f"{r['Выручка, тыс. руб.']:,.0f} тыс. руб.")
+    return df.loc[keep].reset_index(drop=True), excluded
+
+
+def count_orders(df, revenue_col=COL_REVENUE):
+    """
+    Число заказов = уникальные 'Заказ' среди строк с выручкой. Строка выгрузки —
+    позиция заказа за месяц, один заказ занимает много строк.
+    """
+    if COL_ORDER not in df.columns:
+        return int(df[revenue_col].notna().sum())
+    return int(df.loc[df[revenue_col].notna(), COL_ORDER].nunique())
+
+
+def order_totals(df, revenue_col=COL_REVENUE):
+    """Выручка по каждому заказу (заказ → сумма) — база для среднего/медианного чека."""
+    d = df.loc[df[revenue_col].notna()]
+    if COL_ORDER not in d.columns:
+        return d[revenue_col].astype(float)
+    return d.groupby(COL_ORDER)[revenue_col].sum()
 
 
 # ==============================
@@ -410,7 +527,12 @@ def run_data_quality_checks(df, log=print):
     if COL_REVENUE in df.columns:
         report['Отрицательная выручка'] = (df[COL_REVENUE] < 0).sum()
         report['Нулевая выручка']       = (df[COL_REVENUE] == 0).sum()
-        report['Пропущенная выручка']   = df[COL_REVENUE].isna().sum()
+        missing = df[COL_REVENUE].isna()
+        if COL_IS_REVENUE in df.columns:
+            not_rev = df[COL_IS_REVENUE].astype(str).str.strip().str.lower().eq('нет')
+            report["Позиций 'Это выручка' = 'Нет' (не участвуют)"] = int((missing & not_rev).sum())
+            missing = missing & ~not_rev
+        report['Пропущенная выручка']   = int(missing.sum())
         # Не критично: отрицательная выручка — обычно легитимные сторно/корректировки.
         # Раньше это останавливало весь отчёт; теперь просто предупреждаем и продолжаем,
         # как и с нулевой выручкой — строки остаются в расчётах (см. лист 00_Data_Quality

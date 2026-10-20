@@ -11,7 +11,8 @@ import pandas as pd
 
 from crm_data import (
     COL_MANAGER, COL_MONTH, COL_REVENUE, EXCLUDE_MANAGERS,
-    classify_industry, client_rank_mask, load_crm, mask_no_events, parse_month, pick_industry,
+    classify_industry, client_rank_mask, count_orders, load_crm, mask_no_events, order_totals,
+    parse_month, pick_industry, prepare_crm,
 )
 
 # Шаблон рядом с модулем (в собранном exe — в папке распаковки, см. build.py)
@@ -21,10 +22,11 @@ DASHBOARD_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 def _load_and_prepare(path: str) -> pd.DataFrame:
     """
-    Та же загрузка и очистка, что у отчёта «Анализ» (crm_data.load_crm) —
-    иначе KPI дашборда (Выручка, Заказов, Клиентов) с ним не совпадают.
+    Та же загрузка, очистка и периметр (без ФОНТАНКА ФЕСТ, АНО Медиа ДОМ,
+    бартера), что у отчёта «Анализ» — иначе KPI дашборда с ним не совпадают.
     """
-    df = load_crm(path)
+    df, _ = prepare_crm(load_crm(path))
+    df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
     # Колонка должна называться именно 'ОТРАСЛЬ_КЛИЕНТА' — её читает classify_industry()
     df['ОТРАСЛЬ_КЛИЕНТА'] = df.apply(pick_industry, axis=1)
     df['ОТРАСЛЬ_НОРМ'] = df.apply(classify_industry, axis=1)
@@ -35,11 +37,11 @@ def _load_and_prepare(path: str) -> pd.DataFrame:
 
 def _collect_data(df: pd.DataFrame) -> dict:
     rev_total = round(df[COL_REVENUE].sum() / 1000, 1)
-    orders    = len(df)
+    orders    = count_orders(df)   # уникальные заказы, а не строки-позиции
     clients   = df['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
 
     # Средний чек — без мероприятий (см. README), как в run_analytics.
-    avg_check = round(df.loc[mask_no_events(df), COL_REVENUE].mean() / 1000, 1)
+    avg_check = round(order_totals(df.loc[mask_no_events(df)]).mean() / 1000, 1)  # чек на заказ
 
     monthly = []
     if '_month_dt' in df.columns:
@@ -110,7 +112,7 @@ def _collect_data(df: pd.DataFrame) -> dict:
 def _generate_html(data: dict, filename: str) -> str:
     data['meta']['filename'] = os.path.basename(filename)
     # '</' экранируем: клиент с '</script>' в названии иначе ломал страницу
-    d = json.dumps(data, ensure_ascii=False).replace('</', '<\\/')
+    d = json.dumps(data, ensure_ascii=False, default=float).replace('</', '<\\/')
 
     with open(DASHBOARD_TEMPLATE, encoding='utf-8') as f:
         html = f.read()

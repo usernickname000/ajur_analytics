@@ -13,13 +13,16 @@ import pandas as pd
 
 import external_income as ext_income
 from crm_data import (
-    COL_BARTER, COL_DATE, COL_DISCOUNT_PCT, COL_MANAGER, COL_MONTH, COL_NOMEN, COL_ORDER,
-    COL_POS_ORDER, COL_PROJECT, COL_REVENUE, EXCLUDE_MANAGERS,
+    COL_BARTER, COL_DATE, COL_DISCOUNT_PCT, COL_MANAGER, COL_MONTH, COL_NOMEN,
+    COL_ORDER, COL_POS_ORDER, COL_PROJECT, COL_REVENUE, COL_REVENUE_PAID, EXCLUDE_MANAGERS,
+    EXCLUDE_REASON_BARTER,
     _order_dup_mask, bucket_discount, categorize_revenue_amount, classify_industry,
-    client_rank_mask, load_crm, mask_no_events as _mask_no_events, mask_no_prog as _mask_no_prog,
-    normalize_client, parse_dates, parse_money, parse_month, pick_client, pick_industry,
+    client_rank_mask, count_orders, excluded_summary, load_crm,
+    mask_no_events as _mask_no_events, mask_no_prog as _mask_no_prog, order_totals,
+    parse_dates, parse_money, parse_month, pick_industry, prepare_crm as apply_perimeter,
     run_data_quality_checks,
 )
+from paths import data_path
 from excel_style import add_report_charts, autosize_columns, style_workbook
 
 # ── Верифицированные цифры из бухгалтерии ──────────────────
@@ -187,12 +190,25 @@ RECON_BAD_PCT = 5
 # ==============================
 
 def _rev_stats(df, groupby_col, revenue_col, avg_mask=None):
-    """Groupby с суммой/количеством/средним чеком и переводом в тыс. руб."""
-    grp = df.groupby(groupby_col)
-    stats = grp[revenue_col].agg(['sum', 'count']).round(2)
-    stats.columns = ['Сумма выручки, руб.', 'Количество заказов']
-    avg_df = df if avg_mask is None else df.loc[avg_mask]
-    stats['Средний чек, руб.'] = avg_df.groupby(groupby_col)[revenue_col].mean().round(2)
+    """
+    Groupby с суммой, числом заказов, числом позиций и средним чеком.
+    'Количество заказов' — уникальные заказы, 'Позиций' — строки выгрузки с выручкой.
+    'Средний чек' — выручка на один заказ (по строкам avg_mask, если она задана).
+    """
+    d = df.loc[df[revenue_col].notna()]
+    grp = d.groupby(groupby_col)
+    stats = grp[revenue_col].sum().round(2).to_frame('Сумма выручки, руб.')
+    has_order = COL_ORDER in d.columns
+    stats['Количество заказов'] = grp[COL_ORDER].nunique() if has_order else grp[revenue_col].count()
+    stats['Позиций'] = grp[revenue_col].count()
+    if avg_mask is None:
+        avg_df = d
+    else:
+        avg_mask = pd.Series(avg_mask, index=df.index)
+        avg_df = d.loc[avg_mask.loc[d.index]]
+    avg_grp = avg_df.groupby(groupby_col)
+    avg_orders = avg_grp[COL_ORDER].nunique() if has_order else avg_grp[revenue_col].count()
+    stats['Средний чек, руб.'] = (avg_grp[revenue_col].sum() / avg_orders).round(2)
     stats['Сумма выручки, тыс. руб.'] = (stats['Сумма выручки, руб.'] / 1000).round(2)
     return stats.reset_index().sort_values('Сумма выручки, тыс. руб.', ascending=False)
 
@@ -245,15 +261,15 @@ def recon_verdict(delta_pct):
 
 def _json_candidates(explicit, filename, input_path):
     """
-    Порядок поиска JSON-справочника: явный путь (из GUI) → папка приложения
-    (её правят редакторы) → папка входного файла → текущий каталог.
-    Раньше папка приложения шла последней, и копия рядом с выгрузкой молча
-    перекрывала правки, сделанные в редакторе.
+    Порядок поиска JSON-справочника: папка выгрузки → явный путь из GUI →
+    папка приложения (её правят редакторы) → текущий каталог. Копия рядом с
+    выгрузкой нужна для анализа прошлого года (см. ИНСТРУКЦИЯ, раздел 9);
+    какой файл взят, пишется в журнал полным путём.
     """
     return [p for p in (
-        explicit,
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
         os.path.join(os.path.dirname(input_path), filename),
+        explicit,
+        data_path(filename),
         filename,
     ) if p]
 
@@ -283,7 +299,7 @@ def build_unclassified_projects_report(df_full, revenue_col):
 
     report = (
         unclassified.groupby(COL_PROJECT, dropna=False)
-        .agg(Заказов=(COL_ORDER, 'count'), Выручка_руб=(revenue_col, 'sum'))
+        .agg(Заказов=(COL_ORDER, 'nunique'), Выручка_руб=(revenue_col, 'sum'))
         .reset_index()
         .rename(columns={COL_PROJECT: 'Проект CRM'})
     )
@@ -317,8 +333,10 @@ def build_crm_issue_rows(df_full, revenue_col):
     def blank(col):
         return df_full[col].isna() | df_full[col].astype(str).str.strip().eq('')
 
+    # Позиции 'Это выручка' = 'Нет' с пустой выручкой сюда не попадают — они
+    # отфильтрованы в периметре и проблемой данных не являются.
     add_issue(df_full[revenue_col].isna(), 'Пустая/нечисловая выручка')
-    add_issue(df_full[revenue_col].fillna(0).eq(0), 'Нулевая выручка')
+    add_issue(df_full[revenue_col].eq(0), 'Нулевая выручка')
     add_issue(df_full[revenue_col].fillna(0).lt(0), 'Отрицательная выручка')
 
     if 'Дата_заказа' in df_full.columns:
@@ -346,35 +364,60 @@ def build_crm_issue_rows(df_full, revenue_col):
 
 
 def build_reconciliation_bridge(
+    rev_raw_k,
+    excluded,
     rev_all_k,
-    rev_bez_prog_k,
     rev_reklama_k,
     crm_prog_k,
+    crm_barter_k,
     ext_cats,
     vf_total_with_prog_k,
     vf_total_no_prog_k,
     vf_ads_no_events_k,
+    label='',
 ):
-    """Строит понятный мост от CRM-итога к бухгалтерским срезам."""
+    """
+    Мост от суммы выгрузки к периметру аналитики и к бухгалтерским срезам.
+
+    rev_raw_k    — вся выгрузка CRM (за год сверки);
+    excluded     — сводка исключённых строк по причинам (excluded_summary);
+    rev_all_k    — периметр (без ФОНТАНКА ФЕСТ, АНО Медиа ДОМ и бартера);
+    crm_barter_k — бартер CRM по клиентам периметра (исключён из rev_all_k).
+
+    В срезах для бухгалтерии каждая статья учитывается один раз: бартер берётся
+    из CRM (в JSON это те же сделки), ИРИ/АНО — строкой JSON (в CRM исключён
+    АНО Медиа ДОМ), 47News — из CRM (строка 'Выручка 47 (в план)' его дублирует).
+    """
     ext_prog_k = ext_cats.get('programmatic', 0) / 1000
     ext_barter_k = ext_cats.get('barter', 0) / 1000
-    ext_income_k = ext_cats.get('total_income', 0) / 1000
+    ext_iri_k = ext_cats.get('iri_grants', 0) / 1000
+    ext_47_k = ext_cats.get('47_plan', 0) / 1000
     ext_deduct_k = ext_cats.get('deductions', 0) / 1000
+    ext_perimeter_k = ext_income.perimeter_total(ext_cats) / 1000
 
-    rows = [
-        ('CRM: все строки выгрузки', rev_all_k, '', '', ''),
-        ('минус CRM-программатик', -crm_prog_k, '', '', ''),
-        ('CRM без программатика', rev_bez_prog_k, '', '', ''),
+    rows = [(f'CRM: все строки выгрузки{label}', rev_raw_k, '', '', '')]
+    for _, r in excluded.iterrows():
+        rows.append((f"минус {r['Причина исключения']}", -r['Выручка, тыс. руб.'], '', '', ''))
+    rows += [
+        ('CRM: периметр аналитики', rev_all_k, '', '', ''),
+        ('в т.ч. CRM-программатик', crm_prog_k, '', '', ''),
         ('плюс внешний программатик', ext_prog_k, '', '', ''),
-        ('плюс внешний бартер', ext_barter_k, '', '', ''),
-        ('плюс прочие внешние доходы', ext_income_k - ext_prog_k - ext_barter_k, '', '', ''),
-        ('справочно: внешние вычеты не в grand total', ext_deduct_k, '', '', ''),
+        ('плюс прочие внешние (рек. системы, e-com и т.п.)', ext_perimeter_k - ext_prog_k, '', '', ''),
+        ('Итого: периметр + внешние доходы', rev_all_k + ext_perimeter_k, '', '', ''),
+        ('── Для сверки с бухгалтерией ──', '', '', '', ''),
+        ('плюс бартер CRM (клиенты периметра)', crm_barter_k, '', '', ''),
+        ('плюс ИРИ/АНО/гранты (строка бухгалтерии)', ext_iri_k, '', '', ''),
+        ('справочно: бартер по бухгалтерии, те же сделки (не прибавляется)', ext_barter_k, '', '', ''),
+        ('справочно: Выручка 47 (в план), дубль CRM 47News (не прибавляется)', ext_47_k, '', '', ''),
+        ('справочно: вычеты и взаимозачёты (не прибавляются)', ext_deduct_k, '', '', ''),
     ]
 
+    comparable_k = rev_all_k + ext_perimeter_k + crm_barter_k + ext_iri_k
     scenarios = [
-        ('Итого: CRM + все внешние доходы', rev_all_k + ext_income_k, vf_total_with_prog_k),
-        ('Итого: CRM без прогр. + бартер', rev_bez_prog_k + ext_barter_k, vf_total_no_prog_k),
-        ('Итого: реклама без мероприятий', rev_reklama_k, vf_ads_no_events_k),
+        ('Итого: сопоставимо с бухгалтерией, с программатиком', comparable_k, vf_total_with_prog_k),
+        ('Итого: сопоставимо с бухгалтерией, без программатика',
+         comparable_k - ext_prog_k - crm_prog_k, vf_total_no_prog_k),
+        ('Итого: реклама без мероприятий (периметр)', rev_reklama_k, vf_ads_no_events_k),
     ]
     for name, fact, target in scenarios:
         delta = fact - target if target else None
@@ -630,6 +673,7 @@ def build_signals(df_full, revenue_col, monthly_stats, manager_stats, client_sta
     # строк-позиций), и по тем же клиентам, что и топ клиентов (без мероприятий).
     if 'КОНЕЧНЫЙ_КЛИЕНТ' in df_full.columns:
         src = df_full if client_mask is None else df_full.loc[client_mask]
+        src = src.loc[src[revenue_col].notna()]
         order_counts = src.groupby('КОНЕЧНЫЙ_КЛИЕНТ').agg(
             count=(COL_ORDER if COL_ORDER in src.columns else revenue_col, 'nunique'),
             sum=(revenue_col, 'sum'))
@@ -681,7 +725,7 @@ def build_signals(df_full, revenue_col, monthly_stats, manager_stats, client_sta
             f'{top_rev:,.0f} тыс. руб.')
 
     # ── 6. Средний чек ────────────────────────────────────────
-    rev_no_events = df_full.loc[mask_no_events, revenue_col].dropna()
+    rev_no_events = order_totals(df_full.loc[mask_no_events], revenue_col)  # чек на заказ
     if len(rev_no_events) > 0:
         avg_check = rev_no_events.mean() / 1000
         median_check = rev_no_events.median() / 1000
@@ -693,11 +737,14 @@ def build_signals(df_full, revenue_col, monthly_stats, manager_stats, client_sta
                 f'Среднее: {avg_check:,.1f} тыс. | Медиана: {median_check:,.1f} тыс.')
 
     # ── 7. Нулевые и аномальные суммы ────────────────────────
-    zero_rev = (df_full[revenue_col].fillna(0) == 0).sum()
-    if zero_rev > 0:
+    # Только настоящие нули и пустые суммы у строк, помеченных как выручка.
+    # Позиции 'Это выручка' = 'Нет' сюда не попадают (см. crm_data.prepare_crm).
+    zero_rev = int((df_full[revenue_col] == 0).sum())
+    empty_rev = int(df_full[revenue_col].isna().sum())
+    if zero_rev > 0 or empty_rev > 0:
         add('🟡 Средний', 'Качество данных',
-            f'{zero_rev} заказов с нулевой выручкой',
-            'Проверь: возможно незакрытые сделки или технические строки')
+            f'Позиций с нулевой выручкой: {zero_rev}, с пустой: {empty_rev}',
+            'Проверь лист 18б_CRM_проблемные_строки')
 
     if not signals:
         add('🟢 Инфо', 'Общее', 'Явных аномалий не обнаружено', 'Данные выглядят стабильно')
@@ -709,12 +756,15 @@ def build_signals(df_full, revenue_col, monthly_stats, manager_stats, client_sta
 
 
 def reconciliation_warnings(unclassified_projects, external_quality_report,
-                            payment_order_reconciliation):
+                            payment_order_reconciliation, total_payment_k=None, year_warnings=()):
     """
     Замечания к сверке — одни и те же для листа сигналов и для GUI.
     Возвращает список dict: Приоритет/Категория/Сигнал/Детали + 'diag' (для GUI).
     """
-    warnings = []
+    warnings = [{
+        'Приоритет': '🔴 Высокий', 'Категория': 'Сверка',
+        'Сигнал': 'Год JSON-файла не совпадает с годом выгрузки', 'Детали': w, 'diag': w,
+    } for w in year_warnings]
     if unclassified_projects is not None and not unclassified_projects.empty:
         unclass_total = unclassified_projects['Выручка, тыс. руб.'].sum()
         if unclass_total > 0:
@@ -741,7 +791,10 @@ def reconciliation_warnings(unclassified_projects, external_quality_report,
 
     if payment_order_reconciliation is not None and not payment_order_reconciliation.empty:
         total_order_k = payment_order_reconciliation['CRM по дате заказа, тыс. руб.'].sum()
-        total_payment_k = payment_order_reconciliation['CRM по дате оплаты, тыс. руб.'].sum()
+        # Все оплаты, включая пришедшие вне месяцев выгрузки: иначе оплаты
+        # следующего года выглядели бы как расхождение
+        if total_payment_k is None:
+            total_payment_k = payment_order_reconciliation['CRM по дате оплаты, тыс. руб.'].sum()
         payment_delta_pct = _pct_delta(total_payment_k, total_order_k)
         if payment_delta_pct is not None and abs(payment_delta_pct) > RECON_WARN_PCT:
             warnings.append({
@@ -771,8 +824,11 @@ def load_reference_data(input_path, verified_path, external_path, log):
         log("⚠ verified_figures.json не найден — использую константы из analytics.py")
 
     ext_path = _find_existing(_json_candidates(external_path, EXTERNAL_INCOME_JSON, input_path))
-    ext = ext_income.load(ext_path)
-    return verified, ext, ext_path
+    errors = []
+    ext = ext_income.load(ext_path, errors)
+    if errors:
+        log(f"⚠ external_income.json не прочитан ({os.path.abspath(ext_path)}): {errors[0]}")
+    return verified, ext, ext_path, (errors[0] if errors else None)
 
 
 def verified_targets(verified):
@@ -787,7 +843,7 @@ def verified_targets(verified):
     }
 
 
-def prepare_crm(df_full):
+def add_derived_columns(df_full):
     """Отрасли, категории выручки и скидок (in place)."""
     df_full['ОТРАСЛЬ_КЛИЕНТА'] = df_full.apply(pick_industry, axis=1)
     df_full['ОТРАСЛЬ_КЛИЕНТА_НОРМ'] = df_full.apply(classify_industry, axis=1)
@@ -853,52 +909,66 @@ def parse_payments(df_full, revenue_col, log):
 
     first_dates = parsed.apply(lambda r: r[0][0][0] if r[0] else pd.NaT)
 
-    # Каждый транш — в СВОЙ месяц со своей суммой, а не вся сумма заказа в месяц
-    # первого платежа. Если хоть одна сумма в ячейке не распозналась — относим
-    # ВСЮ выручку заказа на дату первого платежа (не рискуем потерять итог).
+    # Каждый транш — в СВОЙ месяц со своей суммой. Если хоть одна сумма в ячейке
+    # не распозналась — относим ВСЮ выручку заказа на дату первого платежа.
+    #
+    # Сумма в ячейке может относиться ко всему счёту, а не к позиции (счёт на
+    # 40 500 оплачен целиком, а позиция в строке стоит 12 150) — тогда при
+    # суммировании по строкам платёж засчитывался бы несколько раз. Поэтому
+    # транши приводятся к оплаченной выручке позиции: к 'Выручка без НДС опл',
+    # если колонка есть, иначе платёж только ограничивается сверху выручкой строки.
+    paid = df_full[COL_REVENUE_PAID].apply(parse_money) if COL_REVENUE_PAID in df_full.columns else None
     pay_rows = []
-    fallback_rows = 0
+    fallback_rows = scaled_rows = 0
     for idx, (pairs, ok) in parsed.items():
         if not pairs:
             continue
         if ok:
-            pay_rows.extend(pairs)
+            total = sum(a for _, a in pairs)
+            rev = df_full.at[idx, revenue_col]
+            target = None
+            if paid is not None and pd.notna(paid.at[idx]):
+                target = paid.at[idx]
+            elif pd.notna(rev) and total > rev > 0:
+                target = rev
+            if target is not None and total and abs(total - target) > max(1.0, abs(target) * 0.01):
+                pairs = [(d, a * target / total) for d, a in pairs]
+                scaled_rows += 1
+            pay_rows.extend((d, a, idx) for d, a in pairs)
         else:
-            pay_rows.append((pairs[0][0], df_full.at[idx, revenue_col]))
+            pay_rows.append((pairs[0][0], df_full.at[idx, revenue_col], idx))
             fallback_rows += 1
+    if scaled_rows:
+        log(f"Оплаты: в {scaled_rows} строках сумма платежа относится ко всему счёту, "
+            f"приведена к оплаченной выручке позиции")
     if fallback_rows:
         log(f"⚠ {fallback_rows} строк(и) 'ДатаСуммаОплаты_' с нераспознанной строкой/суммой "
             f"платежа — вся выручка заказа отнесена на дату первого распознанного платежа")
-    return first_dates, pd.DataFrame(pay_rows, columns=['Дата_оплаты', 'Сумма_оплаты'])
+    # _row — индекс строки df_full, к которой относится платёж
+    return first_dates, pd.DataFrame(pay_rows, columns=['Дата_оплаты', 'Сумма_оплаты', '_row'])
 
 
 def build_monthly_stats(df_full, revenue_col, payments_df, ext_monthly, ext_year,
                         mask_no_events, log):
     """
-    01_Месячная_статистика: CRM по колонке 'Месяц', по дате оплаты, YoY,
-    внешние доходы. Добавляет в df_full колонку 'Дата_месяц'.
+    01_Месячная_статистика по колонке 'Месяц' ('Дата_месяц' уже в df_full).
+    'Количество заказов' в месяце — заказы с позициями в этом месяце (заказ на
+    несколько месяцев входит в каждый); 'Средний чек' — выручка месяца на один
+    такой заказ, без мероприятий.
     """
-    df_full['Дата_месяц'] = df_full[COL_MONTH].apply(parse_month)
-    dated = df_full.dropna(subset=['Дата_месяц'])
-
-    monthly_stats = dated.groupby('Дата_месяц').agg({revenue_col: ['sum', 'count']}).round(2)
-    monthly_stats.columns = ['Сумма выручки, руб.', 'Количество заказов']
-    monthly_stats['Средний чек, руб.'] = (
-        df_full.loc[mask_no_events].dropna(subset=['Дата_месяц'])
-        .groupby('Дата_месяц')[revenue_col].mean().round(2)
-    )
+    with_month = df_full['Дата_месяц'].notna()
+    monthly_stats = _rev_stats(df_full.loc[with_month], 'Дата_месяц', revenue_col,
+                               avg_mask=mask_no_events.loc[with_month])
     monthly_stats['Сумма выручки, тыс. руб.'] = monthly_stats['Сумма выручки, руб.'] / 1000
 
     # Сортируем по реальной дате, а не по строке 'MM.YYYY' — иначе на границе года
-    # (напр. 11.2025..02.2026) строки идут не по хронологии, что ломает прогноз,
-    # тренд-сигналы и порядок точек на графике.
-    monthly_stats = monthly_stats.reset_index().sort_values('Дата_месяц').reset_index(drop=True)
+    # (напр. 11.2025..02.2026) строки идут не по хронологии.
+    monthly_stats = monthly_stats.sort_values('Дата_месяц').reset_index(drop=True)
     monthly_stats['Период'] = monthly_stats['Дата_месяц'].dt.strftime('%m.%Y')
     monthly_stats = monthly_stats.drop(columns=['Дата_месяц'])
     monthly_stats = monthly_stats[['Период'] + [c for c in monthly_stats.columns if c != 'Период']]
 
-    # Выручка по дате оплаты — сумма фактически оплаченных траншей (payments_df),
-    # а не полная сумма заказа в каждом месяце, где встретилась дата платежа.
+    # Выручка по дате оплаты — сумма фактически оплаченных траншей (payments_df)
     if not payments_df.empty:
         paydate_sums = (
             payments_df
@@ -908,6 +978,12 @@ def build_monthly_stats(df_full, revenue_col, payments_df, ext_monthly, ext_year
         monthly_stats['Выручка по дате оплаты, тыс. руб.'] = (
             monthly_stats['Период'].map(paydate_sums).fillna(0).round(2)
         )
+        # Платежи вне месяцев выгрузки (оплата в следующем/предыдущем году)
+        # в помесячную колонку не попадают — сообщаем сумму явно.
+        outside_k = sum(v for p, v in paydate_sums.items() if p not in set(monthly_stats['Период']))
+        if abs(outside_k) > 0.005:
+            log(f"Оплаты вне месяцев выгрузки: {outside_k:,.0f} тыс. руб. "
+                f"(в помесячную колонку не входят, в общий итог по оплате входят)")
 
     # YoY (год к году), если в данных больше одного года
     if len(df_full['Дата_месяц'].dt.year.dropna().unique()) > 1:
@@ -958,45 +1034,46 @@ def build_group_stats(df_full, revenue_col):
         df_full[COL_PROJECT].map(PROJECT_GROUP_MAP).fillna('НЕ КЛАССИФИЦИРОВАНО')
         if COL_PROJECT in df_full.columns else 'НЕ КЛАССИФИЦИРОВАНО'
     )
-    group_stats = df_full.groupby('БИЗНЕС_ГРУППА').agg({revenue_col: ['sum', 'count']}).round(2)
-    group_stats.columns = ['Выручка CRM, руб.', 'Заказов']
+    grp = df_full.loc[df_full[revenue_col].notna()].groupby('БИЗНЕС_ГРУППА')
+    group_stats = grp[revenue_col].sum().round(2).to_frame('Выручка CRM, руб.')
+    group_stats['Заказов'] = grp[COL_ORDER].nunique()
+    group_stats['Позиций'] = grp[revenue_col].count()
     group_stats['Выручка CRM, тыс. руб.'] = (group_stats['Выручка CRM, руб.'] / 1000).round(2)
     return group_stats.reset_index().sort_values('Выручка CRM, тыс. руб.', ascending=False)
 
 
-def reconciliation_scope(df_full, verified, ext_year, log):
+def reconciliation_scope(df, verified, ext_year, log):
     """
     Верифицированные цифры и external_income.json — годовые. CRM для сверки
     берём только за этот год (по колонке 'Месяц'), иначе выгрузка за 13+
-    месяцев или за другой год сравнивается с годовым итогом бухгалтерии.
-    Возвращает (recon_year, recon_mask, recon_applicable, recon_label).
+    месяцев сравнивается с годовым итогом бухгалтерии.
+    Возвращает (recon_year, recon_mask, recon_applicable, recon_label);
+    recon_label непустой, только если фильтр по году реально отбросил строки.
     """
     recon_year = None
     if isinstance(verified, dict) and isinstance(verified.get('_год'), (int, float)):
         recon_year = int(verified['_год'])
     elif ext_year:
         recon_year = ext_year
-    recon_mask = pd.Series(True, index=df_full.index)
-    applicable = True
-    if recon_year and 'Дата_месяц' in df_full.columns:
-        in_year = df_full['Дата_месяц'].map(lambda d: pd.notna(d) and d.year == recon_year).astype(bool)
+    recon_mask = pd.Series(True, index=df.index)
+    applicable, label = True, ''
+    if recon_year and 'Дата_месяц' in df.columns:
+        in_year = df['Дата_месяц'].map(lambda d: pd.notna(d) and d.year == recon_year).astype(bool)
         if in_year.any():
             recon_mask = in_year
             skipped = int((~in_year).sum())
             if skipped:
+                label = f' ({recon_year})'
                 log(f"Сверка с бухгалтерией за {recon_year} г.: {skipped} строк других "
                     f"периодов в сверку не включены")
         else:
-            applicable = False
-            log(f"⚠ В выгрузке нет строк за {recon_year} г. (год verified_figures/"
-                f"external_income) — сверка с бухгалтерией не применима")
-    label = f' ({recon_year})' if recon_year and applicable else ''
+            applicable = False  # предупреждение — в year_warnings (run_analytics)
     return recon_year, recon_mask, applicable, label
 
 
 def build_group_summary(df_full, revenue_col, recon_mask, recon_label, rev_bez_prog, rev_reklama,
-                        ext_cats, targets):
-    """15_Сводка_по_группам — CRM по группам vs бухгалтерия (без попытки сложить)."""
+                        rev_raw_k, crm_barter_k, ext_cats, targets):
+    """15_Сводка_по_группам — CRM периметра по группам vs бухгалтерия."""
     grp = df_full['БИЗНЕС_ГРУППА']
     rev = df_full[revenue_col].where(recon_mask)
     crm_total = rev.sum()
@@ -1004,54 +1081,62 @@ def build_group_summary(df_full, revenue_col, recon_mask, recon_label, rev_bez_p
     gs = {k: ext_cats.get(k, 0) / 1000 for k in
           ('programmatic', 'barter', 'iri_grants', 'recsys', 'ecom', '47_plan', 'deductions', 'total_income')}
     has_ext = bool(ext_cats)
+    ext_perimeter_k = ext_income.perimeter_total(ext_cats) / 1000
+    # Сопоставимый с бухгалтерией итог: каждая статья один раз — периметр CRM +
+    # внешние (программатик, рек. системы, e-com, прочие) + бартер CRM (в JSON те
+    # же сделки) + ИРИ/АНО/гранты (строка бухгалтерии; в CRM АНО Медиа ДОМ
+    # исключён). 'Выручка 47 (в план)' не прибавляется: 47News уже есть в CRM.
     crm_plus_prog = crm_total / 1000 + gs['programmatic']
-    crm_plus_all = crm_total / 1000 + gs['total_income']
-    crm_no_prog_bar = rev_bez_prog + gs['barter']
+    comparable = crm_total / 1000 + ext_perimeter_k + crm_barter_k + gs['iri_grants']
+    comparable_no_prog = comparable - gs['programmatic'] - (crm_total / 1000 - rev_bez_prog)
 
     vf_prog_k = targets['total_with_prog'] / 1000 if targets['total_with_prog'] else None
     vf_no_prog_k = targets['total_no_prog'] / 1000 if targets['total_no_prog'] else None
     vf_ads_k = targets['ads_no_events'] / 1000 if targets['ads_no_events'] else None
 
-    def ext_val(key):
-        return round(gs[key], 2) if has_ext else '—'
+    def ext_val(v):
+        return round(v, 2) if has_ext else '—'
 
     rows = [
-        (f'═══ CRM (расчёт по выгрузке){recon_label} ═══', ''),
+        (f'═══ CRM, периметр аналитики{recon_label} (без ФОНТАНКА ФЕСТ, АНО Медиа ДОМ, бартера) ═══', ''),
         ('Реклама Фонтанка + Доктор, тыс. руб.', round(rev[grp.isin(['Реклама Фонтанка', 'Реклама Доктор'])].sum() / 1000, 2)),
         ('Программатик (CRM-часть), тыс. руб.',  round(rev[grp == 'Программатик'].sum() / 1000, 2)),
         ('Мероприятия, тыс. руб.',               round(rev[grp == 'Мероприятия'].sum() / 1000, 2)),
         ('47News / Прочее, тыс. руб.',           round(rev[grp == '47News / Прочее'].sum() / 1000, 2)),
         ('НЕ классифицированное, тыс. руб.',     round(rev[grp == 'НЕ КЛАССИФИЦИРОВАНО'].sum() / 1000, 2)),
-        ('Итого CRM, тыс. руб.',                 round(crm_total / 1000, 2)),
+        ('Итого CRM (периметр), тыс. руб.',      round(crm_total / 1000, 2)),
+        ('Справочно: вся выгрузка CRM, тыс. руб.', round(rev_raw_k, 2)),
+        ('Справочно: бартер CRM вне периметра, тыс. руб.', round(crm_barter_k, 2)),
         ('═══ Внешние доходы (external_income.json) ═══', ''),
-        ('Программатик (вне CRM), тыс. руб.',     ext_val('programmatic')),
-        ('Медийный бартер, тыс. руб.',            ext_val('barter')),
-        ('ИРИ / Гранты, тыс. руб.',               ext_val('iri_grants')),
-        ('Рекомендательные системы, тыс. руб.',   ext_val('recsys')),
-        ('E-com, тыс. руб.',                      ext_val('ecom')),
-        ('47News (в план), тыс. руб.',            ext_val('47_plan')),
-        ('Вычеты (взаимозачёты/корректировки), тыс. руб.', ext_val('deductions')),
-        ('Итого внешних доходов (без вычетов), тыс. руб.', ext_val('total_income')),
+        ('Программатик (вне CRM), тыс. руб.',     ext_val(gs['programmatic'])),
+        ('Медийный бартер (те же сделки, что бартер CRM), тыс. руб.', ext_val(gs['barter'])),
+        ('ИРИ / Гранты, тыс. руб.',               ext_val(gs['iri_grants'])),
+        ('Рекомендательные системы, тыс. руб.',   ext_val(gs['recsys'])),
+        ('E-com, тыс. руб.',                      ext_val(gs['ecom'])),
+        ('47News (в план), дубль CRM 47News, тыс. руб.', ext_val(gs['47_plan'])),
+        ('Вычеты (взаимозачёты/корректировки), тыс. руб.', ext_val(gs['deductions'])),
+        ('Итого внешних доходов (без вычетов), тыс. руб.', ext_val(gs['total_income'])),
+        ('в т.ч. прибавляется к периметру, тыс. руб.', ext_val(ext_perimeter_k)),
         ('═══ Сверка с верифицированными цифрами ═══', ''),
-        ('CRM + программатик (факт), тыс. руб.',
+        ('Периметр CRM + программатик (факт), тыс. руб.',
             round(crm_plus_prog, 2) if has_ext else round(crm_total / 1000, 2)),
-        ('CRM + все внешние доходы (факт), тыс. руб.',
-            round(crm_plus_all, 2) if has_ext else round(crm_total / 1000, 2)),
+        ('Сопоставимо с бухгалтерией: периметр + внешние + бартер CRM + ИРИ/АНО, тыс. руб.',
+            round(comparable, 2) if has_ext else round(crm_total / 1000, 2)),
         ('Верифицировано: всего с прогр. (бух.), тыс. руб.', round(vf_prog_k, 2) if vf_prog_k else '—'),
         ('Расхождение: всего с прогр., тыс. руб.',
-            round(crm_plus_all - vf_prog_k, 2) if vf_prog_k and has_ext else '—'),
+            round(comparable - vf_prog_k, 2) if vf_prog_k and has_ext else '—'),
         ('Расхождение: всего с прогр., %',
-            _fmt_pct(_pct_delta(crm_plus_all, vf_prog_k)) if vf_prog_k and has_ext else '—'),
+            _fmt_pct(_pct_delta(comparable, vf_prog_k)) if vf_prog_k and has_ext else '—'),
         ('── Без программатика ──', ''),
-        ('CRM (без прогр.) + бартер (факт), тыс. руб.', round(crm_no_prog_bar, 2) if has_ext else '—'),
+        ('То же без программатика (CRM и внешнего), тыс. руб.', round(comparable_no_prog, 2) if has_ext else '—'),
         ('Верифицировано: с бартером без прогр. (бух.), тыс. руб.',
             round(vf_no_prog_k, 2) if vf_no_prog_k else '—'),
         ('Расхождение: без программатика, тыс. руб.',
-            round(crm_no_prog_bar - vf_no_prog_k, 2) if vf_no_prog_k and has_ext else '—'),
+            round(comparable_no_prog - vf_no_prog_k, 2) if vf_no_prog_k and has_ext else '—'),
         ('Расхождение: без программатика, %',
-            _fmt_pct(_pct_delta(crm_no_prog_bar, vf_no_prog_k)) if vf_no_prog_k and has_ext else '—'),
+            _fmt_pct(_pct_delta(comparable_no_prog, vf_no_prog_k)) if vf_no_prog_k and has_ext else '—'),
         ('── Рекламная без мероприятий ──', ''),
-        ('CRM реклама (без мер.), тыс. руб.', round(rev_reklama, 2)),
+        ('CRM реклама (периметр, без мер. и прогр.), тыс. руб.', round(rev_reklama, 2)),
         ('Верифицировано: реклама без мер. (бух.), тыс. руб.', round(vf_ads_k, 2) if vf_ads_k else '—'),
         ('Расхождение: реклама, тыс. руб.', round(rev_reklama - vf_ads_k, 2) if vf_ads_k else '—'),
         ('Расхождение: реклама, %', _fmt_pct(_pct_delta(rev_reklama, vf_ads_k)) if vf_ads_k else '—'),
@@ -1065,25 +1150,32 @@ def build_group_summary(df_full, revenue_col, recon_mask, recon_label, rev_bez_p
 
 
 def build_seasonality(df_full, revenue_col, mask_no_events, ext_monthly, ext_year, log):
-    """05_Сезонность и 06_Кварталы по дате заказа (+ внешние доходы, если применимо)."""
-    df_full['Месяц_число'] = df_full['Дата_заказа'].dt.month
-    df_full['Квартал'] = df_full['Дата_заказа'].dt.quarter
-    # Без даты — None (выпадает из группировки, как и в кварталах);
-    # раньше такие строки попадали в «Осень».
+    """
+    05_Сезонность и 06_Кварталы по периоду выручки ('Период_дата' — поле
+    'Месяц'; дата заказа — только если 'Месяца' нет). Заказы — уникальные,
+    средний чек — на заказ без мероприятий.
+    """
+    df_full['Месяц_число'] = df_full['Период_дата'].dt.month
+    df_full['Квартал'] = df_full['Период_дата'].dt.quarter
+    # Без даты — None (выпадает из группировки, как и в кварталах)
     df_full['Сезон'] = df_full['Месяц_число'].map(
         lambda x: None if pd.isna(x) else MONTH_TO_SEASON[f"{int(x):02d}"])
 
-    seasonal = (
-        df_full.groupby('Сезон')
-        .agg({revenue_col: ['sum', 'count'], 'КОНЕЧНЫЙ_КЛИЕНТ': 'nunique'}).round(2)
-    )
-    seasonal.columns = ['Выручка, руб.', 'Количество заказов', 'Уникальных клиентов']
-    seasonal['Средний чек, руб.'] = df_full.loc[mask_no_events].groupby('Сезон')[revenue_col].mean().round(2)
+    src = df_full.loc[df_full[revenue_col].notna() & df_full['Период_дата'].notna()]
+    src_ne = src.loc[mask_no_events.loc[src.index]]
+
+    sg, sg_ne = src.groupby('Сезон'), src_ne.groupby('Сезон')
+    seasonal = sg[revenue_col].sum().round(2).to_frame('Выручка, руб.')
+    seasonal['Количество заказов'] = sg[COL_ORDER].nunique()
+    seasonal['Уникальных клиентов'] = sg['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
+    seasonal['Средний чек, руб.'] = (sg_ne[revenue_col].sum() / sg_ne[COL_ORDER].nunique()).round(2)
     seasonal['Выручка, тыс. руб.'] = seasonal['Выручка, руб.'] / 1000
     seasonal = seasonal.reset_index()
 
-    quarterly = df_full.groupby('Квартал').agg({revenue_col: ['sum', 'count']}).round(2)
-    quarterly.columns = ['Выручка, руб.', 'Количество заказов']
+    qg = src.groupby('Квартал')
+    quarterly = qg[revenue_col].sum().round(2).to_frame('Выручка, руб.')
+    quarterly['Количество заказов'] = qg[COL_ORDER].nunique()
+    quarterly.index = quarterly.index.astype(int)
     quarterly['Выручка, тыс. руб.'] = quarterly['Выручка, руб.'] / 1000
     quarterly['Коэф. сезонности'] = (quarterly['Выручка, тыс. руб.'] / quarterly['Выручка, тыс. руб.'].mean()).round(2)
     quarterly = quarterly.reset_index()
@@ -1111,15 +1203,17 @@ def build_seasonality(df_full, revenue_col, mask_no_events, ext_monthly, ext_yea
     return seasonal, quarterly
 
 
-def build_rfm(rfm_source, revenue_col):
-    """07–09: RFM по клиентам без мероприятий. Возвращает (все, сегменты, не-топ)."""
-    current_date = rfm_source['Дата_заказа'].max()
+def build_rfm(rfm_source, revenue_col, current_date):
+    """
+    07–09: RFM по клиентам без мероприятий. Давность — внутри периода выгрузки:
+    от последнего месяца выгрузки до последнего месяца с выручкой клиента;
+    частота — уникальные заказы. Возвращает (все, сегменты, не-топ).
+    """
     rfm = (
         rfm_source.groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        # nunique, а не count: у одного заказа много строк-позиций
-        .agg({'Дата_заказа': 'max', COL_ORDER: 'nunique', revenue_col: 'sum'})
+        .agg({'Период_дата': 'max', COL_ORDER: 'nunique', revenue_col: 'sum'})
         .reset_index()
-        .rename(columns={'Дата_заказа': 'Последняя_покупка', COL_ORDER: 'Частота',
+        .rename(columns={'Период_дата': 'Последняя_покупка', COL_ORDER: 'Частота',
                          revenue_col: 'Денежная_ценность_руб'})
     )
     rfm['Recency_days']       = (current_date - rfm['Последняя_покупка']).dt.days
@@ -1169,7 +1263,8 @@ def build_rfm(rfm_source, revenue_col):
 
 def build_order_distribution(df_full, revenue_col):
     """10_Распределение_заказов: сколько клиентов сделали N уникальных заказов."""
-    per_client = df_full.groupby('КОНЕЧНЫЙ_КЛИЕНТ').agg({COL_ORDER: 'nunique', revenue_col: 'sum'})
+    per_client = (df_full.loc[df_full[revenue_col].notna()].groupby('КОНЕЧНЫЙ_КЛИЕНТ')
+                  .agg({COL_ORDER: 'nunique', revenue_col: 'sum'}))
     freq = per_client[COL_ORDER].value_counts().sort_index()
     return pd.DataFrame({
         'Количество заказов': freq.index,
@@ -1178,12 +1273,13 @@ def build_order_distribution(df_full, revenue_col):
     })
 
 
-def build_summary(df_full, revenue_col, mask_no_events, recon_label, rev_all, rev_bez_prog,
-                  rev_reklama, targets):
+def build_summary(df_full, revenue_col, mask_no_events, recon_label, rev_raw_k, rev_all,
+                  rev_bez_prog, rev_reklama, targets):
     """11_Расширенный_сводный: CRM-расчёт рядом с верифицированными цифрами."""
     rows = [
-        (f'— CRM (расчёт по выгрузке){recon_label} —', ''),
-        ('Выручка: все заказы в CRM, тыс. руб.', round(rev_all, 2)),
+        (f'— CRM, периметр аналитики{recon_label} —', ''),
+        ('Выручка: вся выгрузка CRM (справочно), тыс. руб.', round(rev_raw_k, 2)),
+        ('Выручка: периметр (без ФОНТАНКА ФЕСТ, АНО Медиа ДОМ, бартера), тыс. руб.', round(rev_all, 2)),
         ('Выручка: CRM без программатика, тыс. руб.', round(rev_bez_prog, 2)),
         ('Выручка: CRM рекламная без мероприятий, тыс. руб.', round(rev_reklama, 2)),
         ('— Верифицированные (из бухгалтерии) —', ''),
@@ -1193,37 +1289,41 @@ def build_summary(df_full, revenue_col, mask_no_events, recon_label, rev_all, re
                        ('ads_no_events', 'рекламная без мероприятий')):
         if targets[key]:
             rows.append((f'Верифицированная: {label}, тыс. руб.', round(targets[key] / 1000, 2)))
-    no_events_rev = df_full.loc[mask_no_events, revenue_col]
+    order_sums = order_totals(df_full.loc[mask_no_events], revenue_col)
     rows.extend([
         ('— Прочее —', ''),
-        ('Средний чек БЕЗ мероприятий, тыс. руб.', round(no_events_rev.mean() / 1000, 2)),
-        ('Медианный чек БЕЗ мероприятий, тыс. руб.', round(no_events_rev.median() / 1000, 2)),
-        ('Количество заказов', len(df_full)),
+        ('Средний чек БЕЗ мероприятий (на заказ), тыс. руб.', round(order_sums.mean() / 1000, 2)),
+        ('Медианный чек БЕЗ мероприятий (на заказ), тыс. руб.', round(order_sums.median() / 1000, 2)),
+        ('Количество заказов (уникальных)', count_orders(df_full, revenue_col)),
+        ('Количество позиций с выручкой', int(df_full[revenue_col].notna().sum())),
         ('Уникальных клиентов', df_full['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()),
         ('Уникальных менеджеров', df_full[COL_MANAGER].nunique() if COL_MANAGER in df_full.columns else None),
     ])
     return pd.DataFrame(rows, columns=['Метрика', 'Значение'])
 
 
-def build_comparison_metrics(df_full, recon_label, rev_all, rev_bez_prog, rev_reklama,
-                             ext_cats, targets, monthly_stats):
+def build_comparison_metrics(df_raw, df_full, recon_label, rev_raw_k, rev_all, rev_bez_prog,
+                             rev_reklama, crm_barter_k, ext_cats, targets, monthly_stats):
     """12_Сравнение: детальная сверка CRM vs бухгалтерия + помесячно."""
     k = {key: ext_cats.get(key, 0) / 1000 for key in
          ('programmatic', 'barter', 'iri_grants', 'recsys', 'ecom', '47_plan', 'other',
           'deductions', 'total_income', 'total_net')}
+    ext_perimeter_k = ext_income.perimeter_total(ext_cats) / 1000
 
-    # «Строк в исходнике» — без строк с пустым/служебным 'Месяц'
-    if COL_MONTH in df_full.columns:
-        rows_src = int((~df_full[COL_MONTH].astype(str).str.strip().str.lower()
+    # «Строк в исходнике» — вся выгрузка без строк с пустым/служебным 'Месяц'
+    if COL_MONTH in df_raw.columns:
+        rows_src = int((~df_raw[COL_MONTH].astype(str).str.strip().str.lower()
                         .isin(['итого', 'nan', 'none'])).sum())
     else:
-        rows_src = len(df_full)
+        rows_src = len(df_raw)
 
     rows = [
-        ('═══ CRM (выгрузка) ═══', '', '', ''),
+        (f'═══ CRM (выгрузка){recon_label} ═══', '', '', ''),
         ('Строк в исходнике',           rows_src,                      '',    ''),
-        ('Строк после очистки',         len(df_full),                  '',    ''),
-        (f'CRM итого{recon_label}, тыс. руб.', round(rev_all, 2),      '',    ''),
+        ('Строк в периметре',           len(df_full),                  '',    ''),
+        ('CRM вся выгрузка, тыс. руб.', round(rev_raw_k, 2),           '',    ''),
+        ('CRM периметр, тыс. руб.',     round(rev_all, 2),             '',    ''),
+        ('Бартер CRM вне периметра, тыс.', round(crm_barter_k, 2),     '',    ''),
         ('CRM без программатика, тыс.', round(rev_bez_prog, 2),        '',    ''),
         ('CRM рекламная (без мер.), тыс.', round(rev_reklama, 2),      '',    ''),
     ]
@@ -1243,11 +1343,12 @@ def build_comparison_metrics(df_full, recon_label, rev_all, rev_bez_prog, rev_re
         ]
 
     rows.append(('═══ Сверка с бухгалтерией ═══', '', '', ''))
+    comparable = rev_all + ext_perimeter_k + crm_barter_k + k['iri_grants']
     slices = [
-        ('── Срез: всего с программатиком ──', 'CRM + внешние доходы, тыс.',
-         rev_all + k['total_income'], targets['total_with_prog']),
-        ('── Срез: с бартером, без программатика ──', 'CRM (без прогр.) + бартер, тыс.',
-         rev_bez_prog + k['barter'], targets['total_no_prog']),
+        ('── Срез: всего с программатиком ──', 'Периметр + внешние + бартер CRM + ИРИ/АНО, тыс.',
+         comparable, targets['total_with_prog']),
+        ('── Срез: с бартером, без программатика ──', 'То же без программатика, тыс.',
+         comparable - k['programmatic'] - (rev_all - rev_bez_prog), targets['total_no_prog']),
         ('── Срез: рекламная без мероприятий ──', 'CRM рекламная (без мер.), тыс.',
          rev_reklama, targets['ads_no_events']),
     ]
@@ -1336,7 +1437,7 @@ def build_nomenclature(df_full, revenue_col, mask_no_events):
     """04а_Номенклатура: топ-50 без мероприятий."""
     stats = (
         df_full.loc[mask_no_events].groupby(COL_NOMEN)
-        .agg(Выручка_руб=(revenue_col, 'sum'), Заказов=(COL_ORDER, 'count'),
+        .agg(Выручка_руб=(revenue_col, 'sum'), Заказов=(COL_ORDER, 'nunique'),
              Клиентов=('КОНЕЧНЫЙ_КЛИЕНТ', 'nunique'))
         .reset_index()
         .sort_values('Выручка_руб', ascending=False)
@@ -1357,7 +1458,7 @@ def build_discounts(df_full, revenue_col, mask_no_events):
 
     def by(key, sort_col, head=None):
         t = (df_disc.groupby(key)
-             .agg(Заказов=(COL_ORDER, 'count'), Выручка_руб=(revenue_col, 'sum'),
+             .agg(Заказов=(COL_ORDER, 'nunique'), Выручка_руб=(revenue_col, 'sum'),
                   Ср_скидка=(disc_col, 'mean'), Макс_скидка=(disc_col, 'max'))
              .reset_index().sort_values(sort_col, ascending=False))
         if head:
@@ -1369,19 +1470,20 @@ def build_discounts(df_full, revenue_col, mask_no_events):
 
     buckets = (
         df_disc.groupby('Категория_скидки')
-        .agg(Заказов=(COL_ORDER, 'count'), Выручка_руб=(revenue_col, 'sum'))
+        .agg(Заказов=(COL_ORDER, 'nunique'), Выручка_руб=(revenue_col, 'sum'))
         .reset_index().sort_values('Выручка_руб', ascending=False)
     )
     buckets['Выручка, тыс. руб.'] = (buckets['Выручка_руб'] / 1000).round(2)
     total_disc_rev = buckets['Выручка_руб'].sum()
     buckets['Доля, %'] = (buckets['Выручка_руб'] / total_disc_rev * 100).round(1) if total_disc_rev > 0 else 0
 
-    total_orders = int(mask_no_events.sum())
+    total_orders = count_orders(df_full.loc[mask_no_events], revenue_col)
+    orders_with_disc = count_orders(df_disc, revenue_col)
     no_events_rev = df_full.loc[mask_no_events, revenue_col].sum()
     summary = pd.DataFrame([
         ('Заказов без мероприятий (всего)', total_orders),
-        ('Заказов со скидкой', len(df_disc)),
-        ('Доля заказов со скидкой, %', round(len(df_disc) / total_orders * 100, 1) if total_orders else 0),
+        ('Заказов со скидкой', orders_with_disc),
+        ('Доля заказов со скидкой, %', round(orders_with_disc / total_orders * 100, 1) if total_orders else 0),
         ('Средняя скидка по скидочным сделкам, %', round(df_disc[disc_col].mean(), 1)),
         ('Медианная скидка, %', round(df_disc[disc_col].median(), 1)),
         ('Максимальная скидка, %', round(df_disc[disc_col].max(), 1)),
@@ -1421,6 +1523,28 @@ def export_report(export_data, output_path, log):
         log(f"⚠ Графики не добавлены: {e}")
 
 
+def year_mismatch_warnings(df_full, ext_year, verified):
+    """
+    Год JSON-файлов против года выгрузки. Внешние доходы хранятся по месяцам
+    одного года: если выгрузка за другой год, прибавлять их нельзя.
+    Возвращает (предупреждения, ext_не_применимы).
+    """
+    warnings = []
+    years = set()
+    if 'Дата_месяц' in df_full.columns:
+        years = {int(y) for y in df_full['Дата_месяц'].dt.year.dropna().unique()}
+    data = ', '.join(str(y) for y in sorted(years))
+    ext_off = bool(ext_year and years and ext_year not in years)
+    if ext_off:
+        warnings.append(f"external_income.json за {ext_year} год, а выгрузка за {data}: внешние доходы "
+                        f"в месячную, квартальную и сезонную статистику НЕ добавлены")
+    vf_year = verified.get('_год') if isinstance(verified, dict) else None
+    if vf_year and years and int(vf_year) not in years:
+        warnings.append(f"verified_figures.json за {int(vf_year)} год, а выгрузка за {data}: "
+                        f"сверка с бухгалтерией сравнивает разные годы")
+    return warnings, ext_off
+
+
 # ============================================================
 # ГЛАВНАЯ ФУНКЦИЯ — запускается из app.py
 # ============================================================
@@ -1437,22 +1561,20 @@ def run_analytics(input_path: str, output_path: str, log=print,
     date_by      — 'order' (дата заказа, по умолчанию) или 'payment' (дата оплаты)
     verified_path / external_path — явные пути к JSON-справочникам (из GUI)
 
-    Возвращает: dict с ключами:
-        'output_path'       — путь к созданному файлу
-        'crm_total'         — итог CRM за год сверки, тыс. руб.
-        'crm_paydate_total' — итог CRM по дате оплаты, тыс. руб.
-        'external_total'    — внешние доходы для месячной аналитики, тыс. руб.
-        'full_external_total' — все внешние доходы для сверки, тыс. руб.
-        'grand_total'       — CRM + внешние, тыс. руб. (по выбранной дате)
-        'verified_total'    — верифицированная цель, тыс. руб.
-        'deviation_pct'     — процент отклонения от верифицированной цели
-        'date_by', 'diagnostics'
+    Все листы считаются по периметру аналитики (без ФОНТАНКА ФЕСТ, АНО Медиа
+    ДОМ, бартера и позиций 'Это выручка' = 'Нет'); исключённые суммы — в
+    18_Мост_расхождений и 00_Data_Quality.
+
+    Возвращает dict: output_path, crm_total (периметр за год сверки, тыс. руб.),
+    crm_paydate_total, external_total, full_external_total, crm_raw_total,
+    comparable_addon (бартер CRM + ИРИ/АНО), grand_total (сопоставимо с
+    бухгалтерией), verified_total, deviation_pct, date_by, diagnostics.
     """
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Файл не найден: {input_path}")
 
     # ── 0. Справочники ───────────────────────────────────────
-    verified, ext, ext_path = load_reference_data(input_path, verified_path, external_path, log)
+    verified, ext, ext_path, ext_error = load_reference_data(input_path, verified_path, external_path, log)
     targets = verified_targets(verified)
     ext_year = ext_income.year(ext)
     ext_monthly = ext_income.monthly_totals(ext)
@@ -1465,29 +1587,61 @@ def run_analytics(input_path: str, output_path: str, log=print,
             f"external_income.json={ext_year}. "
             "Проверьте, что оба файла относятся к одному отчетному году.")
     ext_cats = ext_income.totals_by_category(ext)
-    external_quality_report = ext_income.quality_report(ext, verified, _pct_delta, _recon_status)
+    external_quality_report = ext_income.quality_report(
+        ext, verified, _pct_delta, _recon_status, other_keys=ACCOUNTING_BLOCKS['Total Прочие доходы'],
+        load_error=ext_error)
 
     # ── 1. Загрузка и контроль качества ──────────────────────
     log("Загрузка файла...")
-    df_full = load_crm(input_path, with_clients=False)
-    log(f"Загружено строк: {len(df_full)}")
+    df_raw = load_crm(input_path, with_clients=False, required=(COL_ORDER, COL_DATE, COL_REVENUE))
+    log(f"Загружено строк: {len(df_raw)}")
 
     log("Проверка качества данных...")
-    quality_report, critical_errors = run_data_quality_checks(df_full, log=log)
+    quality_report, critical_errors = run_data_quality_checks(df_raw, log=log)
     if critical_errors:
         error_text = "\n".join(f" - {e}" for e in critical_errors)
         raise ValueError(f"Критические ошибки в данных:\n{error_text}")
     log("Качество данных: ОК")
 
-    # ── 2. Подготовка ────────────────────────────────────────
+    # ── 2. Год сверки и периметр ─────────────────────────────
     revenue_col = COL_REVENUE
-    df_full['КОНЕЧНЫЙ_КЛИЕНТ'] = df_full.apply(pick_client, axis=1).apply(normalize_client)
-    prepare_crm(df_full)
+    if COL_MONTH in df_raw.columns:
+        df_raw['Дата_месяц'] = pd.to_datetime(df_raw[COL_MONTH].apply(parse_month), errors='coerce')
+    recon_year, recon_mask_raw, recon_applicable, recon_label = \
+        reconciliation_scope(df_raw, verified, ext_year, log)
+    df_raw['_recon'] = recon_mask_raw
+    rev_raw_k = df_raw[revenue_col].sum() / 1000                      # вся выгрузка
+    rev_raw_recon_k = df_raw.loc[df_raw['_recon'], revenue_col].sum() / 1000
+
+    # df_full — только периметр аналитики, все листы считаются по нему
+    df_full, df_excluded = apply_perimeter(df_raw, log=log)
+    excluded_all = excluded_summary(df_excluded)
+    excluded_recon = excluded_summary(df_excluded.loc[df_excluded['_recon']])
+    crm_barter_k = dict(zip(excluded_recon['Причина исключения'],
+                            excluded_recon['Выручка, тыс. руб.'])).get(EXCLUDE_REASON_BARTER, 0)
+    quality_report = pd.concat([
+        quality_report,
+        pd.DataFrame(
+            [(f"Вне периметра: {r['Причина исключения']}, строк / тыс. руб.",
+              f"{r['Строк']} / {r['Выручка, тыс. руб.']:,.2f}") for _, r in excluded_all.iterrows()]
+            + [('Строк в периметре аналитики', len(df_full))],
+            columns=['Метрика', 'Значение'],
+        ),
+    ], ignore_index=True)
+
+    # ── 3. Подготовка ────────────────────────────────────────
+    add_derived_columns(df_full)
     df_full['Дата_оплаты'], payments_df = parse_payments(df_full, revenue_col, log)
     mask_no_events = _mask_no_events(df_full)
     mask_no_prog = _mask_no_prog(df_full)
 
-    # ── 3. Месячная статистика ───────────────────────────────
+    year_warnings, ext_off = year_mismatch_warnings(df_full, ext_year, verified)
+    if ext_off:
+        ext_monthly = None
+    for w in year_warnings:
+        log(f"⚠ {w}")
+
+    # ── 4. Месячная статистика ───────────────────────────────
     monthly_stats = payment_order_reconciliation = None
     if COL_MONTH in df_full.columns:
         log("Считаю месячную статистику...")
@@ -1495,7 +1649,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
                                             ext_year, mask_no_events, log)
         payment_order_reconciliation = build_payment_order_reconciliation(monthly_stats)
 
-    # ── 4. Клиенты, менеджеры, отрасли, группы ───────────────
+    # ── 5. Клиенты, менеджеры, отрасли, группы ───────────────
     log("Считаю топ клиентов...")
     client_df_for_rank = df_full.loc[client_rank_mask(df_full)]
     client_stats = _rev_stats(client_df_for_rank, 'КОНЕЧНЫЙ_КЛИЕНТ', revenue_col)
@@ -1514,63 +1668,74 @@ def run_analytics(input_path: str, output_path: str, log=print,
     group_stats = build_group_stats(df_full, revenue_col)
     unclassified_projects = build_unclassified_projects_report(df_full, revenue_col)
 
-    # ── 5. Сверка с бухгалтерией (за год сверки) ─────────────
-    recon_year, recon_mask, recon_applicable, recon_label = \
-        reconciliation_scope(df_full, verified, ext_year, log)
+    # ── 6. Сверка с бухгалтерией (за год сверки) ─────────────
+    recon_mask = df_full['_recon']
     # rev_bez_prog — через mask_no_prog (regex по названию проекта), а не через
     # БИЗНЕС_ГРУППА=='Программатик': иначе «CRM минус программатик» в мосте
     # не равнялся бы «CRM без программатика».
     rev_reklama  = df_full.loc[mask_no_prog & mask_no_events & recon_mask, revenue_col].sum() / 1000
     rev_bez_prog = df_full.loc[mask_no_prog & recon_mask, revenue_col].sum() / 1000
     group_summary_df, crm_total = build_group_summary(
-        df_full, revenue_col, recon_mask, recon_label, rev_bez_prog, rev_reklama, ext_cats, targets)
+        df_full, revenue_col, recon_mask, recon_label, rev_bez_prog, rev_reklama,
+        rev_raw_recon_k, crm_barter_k, ext_cats, targets)
     rev_all = crm_total / 1000
 
-    # Дата заказа — один раз, для сезонности, RFM и проблемных строк
+    # Дата заказа — для проблемных строк; период выручки (сезонность, RFM) —
+    # поле 'Месяц': заказ оформляется заранее (в т.ч. в прошлом году), а
+    # размещается и признаётся выручкой в другие месяцы.
     if COL_DATE in df_full.columns:
         df_full['Дата_заказа'] = parse_dates(df_full[COL_DATE])
+    if 'Дата_месяц' in df_full.columns and df_full['Дата_месяц'].notna().any():
+        df_full['Период_дата'] = df_full['Дата_месяц']
+    elif 'Дата_заказа' in df_full.columns:
+        df_full['Период_дата'] = df_full['Дата_заказа']
     crm_issue_rows = build_crm_issue_rows(df_full, revenue_col)
 
-    # ── 6. Сезонность, RFM, лояльность ───────────────────────
+    # ── 7. Сезонность, RFM, лояльность ───────────────────────
     seasonal_stats = quarterly_stats = None
-    if 'Дата_заказа' in df_full.columns:
+    rfm_all = rfm_segment_extended = rfm_non_top = None
+    if 'Период_дата' in df_full.columns:
         log("Считаю сезонность...")
         seasonal_stats, quarterly_stats = build_seasonality(
             df_full, revenue_col, mask_no_events, ext_monthly, ext_year, log)
-
-    rfm_all = rfm_segment_extended = rfm_non_top = None
-    if 'Дата_заказа' in df_full.columns:
         try:
             log("Провожу RFM-анализ...")
-            rfm_all, rfm_segment_extended, rfm_non_top = build_rfm(client_df_for_rank, revenue_col)
+            rfm_source = client_df_for_rank.loc[client_df_for_rank[revenue_col].notna()]
+            rfm_source = df_full.loc[rfm_source.index]  # с колонкой Период_дата
+            last_month = df_full.loc[df_full[revenue_col].notna(), 'Период_дата'].max()
+            rfm_all, rfm_segment_extended, rfm_non_top = build_rfm(rfm_source, revenue_col, last_month)
         except Exception as e:
             log(f"RFM-анализ не выполнен: {e}")
 
     log("Считаю лояльность клиентов...")
     order_freq_df = build_order_distribution(df_full, revenue_col)
 
-    # ── 7. Сводки и сверка ───────────────────────────────────
+    # ── 8. Сводки и сверка ───────────────────────────────────
     summary_df = build_summary(df_full, revenue_col, mask_no_events, recon_label,
-                               rev_all, rev_bez_prog, rev_reklama, targets)
-    comparison_metrics = build_comparison_metrics(df_full, recon_label, rev_all, rev_bez_prog,
-                                                  rev_reklama, ext_cats, targets, monthly_stats)
+                               rev_raw_recon_k, rev_all, rev_bez_prog, rev_reklama, targets)
+    comparison_metrics = build_comparison_metrics(
+        df_raw.loc[df_raw['_recon']], df_full.loc[recon_mask], recon_label, rev_raw_recon_k, rev_all,
+        rev_bez_prog, rev_reklama, crm_barter_k, ext_cats, targets, monthly_stats)
 
     def k(v):
         return v / 1000 if v else None
     reconciliation_bridge = build_reconciliation_bridge(
+        rev_raw_k=rev_raw_recon_k,
+        excluded=excluded_recon,
         rev_all_k=rev_all,
-        rev_bez_prog_k=rev_bez_prog,
         rev_reklama_k=rev_reklama,
         # rev_all - rev_bez_prog (не crm_prog!) — согласовано по построению
         # с «CRM без программатика» (оба через mask_no_prog).
         crm_prog_k=rev_all - rev_bez_prog,
+        crm_barter_k=crm_barter_k,
         ext_cats=ext_cats,
         vf_total_with_prog_k=k(targets['total_with_prog']),
         vf_total_no_prog_k=k(targets['total_no_prog']),
         vf_ads_no_events_k=k(targets['ads_no_events']),
+        label=recon_label,
     )
 
-    # ── 8. Прогноз, план, номенклатура, скидки ───────────────
+    # ── 9. Прогноз, план, номенклатура, скидки ───────────────
     forecast_summary = build_forecast(monthly_stats)
 
     plan_stats = None
@@ -1588,14 +1753,15 @@ def run_analytics(input_path: str, output_path: str, log=print,
         log("Считаю анализ скидок...")
         discount_stats = build_discounts(df_full, revenue_col, mask_no_events)
 
-    # ── 9. Сигналы ───────────────────────────────────────────
+    # ── 10. Сигналы ──────────────────────────────────────────
     log("Ищу сигналы и аномалии...")
     signals_df = build_signals(
         df_full, revenue_col, monthly_stats, manager_stats, client_stats,
         rfm_all, mask_no_events, log=log, client_mask=client_df_for_rank.index
     )
+    total_payment_all_k = payments_df['Сумма_оплаты'].sum() / 1000 if not payments_df.empty else 0
     warnings = reconciliation_warnings(unclassified_projects, external_quality_report,
-                                       payment_order_reconciliation)
+                                       payment_order_reconciliation, total_payment_all_k, year_warnings)
     if warnings:
         signals_df = pd.concat([pd.DataFrame([{k_: v for k_, v in w.items() if k_ != 'diag'}
                                               for w in warnings]), signals_df], ignore_index=True)
@@ -1607,7 +1773,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     else:
         log(f"⚠ Файл {EXTERNAL_INCOME_JSON} не найден — бухгалтерская таблица не построена")
 
-    # ── 10. Экспорт ──────────────────────────────────────────
+    # ── 11. Экспорт ──────────────────────────────────────────
     log("Сохраняю отчёт...")
     sheets = [
         ('00_Сигналы', signals_df),
@@ -1648,22 +1814,27 @@ def run_analytics(input_path: str, output_path: str, log=print,
     export_report({name: df for name, df in sheets if df is not None}, output_path, log)
     log(f"✅ Готово! Отчёт сохранён: {output_path}")
 
-    # ── 11. Сводка расхождения для GUI ───────────────────────
-    # Для сверки — только год сверки (recon_mask); оплаты — по году даты оплаты.
+    # ── 12. Сводка расхождения для GUI ───────────────────────
+    # CRM для сверки — только строки года сверки. Оплаты — тех же строк, включая
+    # пришедшие вне месяцев выгрузки (оплата заказа 2025 года в начале 2026-го
+    # входит в итог). Для однолетней выгрузки — все оплаты, как раньше.
     crm_total_k = df_full.loc[recon_mask, revenue_col].sum() / 1000
-    pay_recon = payments_df
-    if recon_year and recon_applicable and not payments_df.empty:
-        pay_recon = payments_df.loc[payments_df['Дата_оплаты'].dt.year == recon_year]
-    crm_paydate_total_k = pay_recon['Сумма_оплаты'].sum() / 1000 if not pay_recon.empty else 0
+    crm_paydate_total_k = (
+        payments_df.loc[payments_df['_row'].map(recon_mask), 'Сумма_оплаты'].sum() / 1000
+        if not payments_df.empty else 0
+    )
 
     # external_total_k — то, что добавляется в месячную аналитику (программатик);
-    # full_external_k — все внешние доходы без закупочных/технических статей.
+    # full_external_k — внешние доходы к периметру (без вычетов, дублей CRM и ИРИ/АНО).
     external_total_k = sum(ext_monthly.values()) / 1000 if ext_monthly else 0
     full_external_k = ext_income.full_total(ext) / 1000 if ext is not None else 0.0
 
     by_payment = date_by == 'payment' and crm_paydate_total_k > 0
     crm_base_k = crm_paydate_total_k if by_payment else crm_total_k
-    grand_total_k = crm_base_k + full_external_k
+    # Итог для индикатора — сопоставимый с бухгалтерией: периметр CRM + внешние
+    # доходы + бартер CRM + ИРИ/АНО (см. build_reconciliation_bridge).
+    comparable_addon_k = crm_barter_k + ext_cats.get('iri_grants', 0) / 1000
+    grand_total_k = crm_base_k + full_external_k + comparable_addon_k
     verified_total_k = targets['total_with_prog'] / 1000 if targets['total_with_prog'] else 0
     deviation_pct = (
         (grand_total_k / verified_total_k - 1) * 100
@@ -1672,11 +1843,11 @@ def run_analytics(input_path: str, output_path: str, log=print,
     diagnostics = [w['diag'] for w in warnings]
 
     date_label = "по дате оплаты" if by_payment else "по дате заказа"
-    log(f"📊 CRM ({date_label}): {crm_base_k:,.0f} тыс. | "
-        f"Прогр. (ежемес.): {external_total_k:,.0f} тыс. | "
-        f"Все внешние доходы: {full_external_k:,.0f} тыс.")
+    log(f"📊 CRM, периметр ({date_label}): {crm_base_k:,.0f} тыс. | "
+        f"Внешние доходы к периметру: {full_external_k:,.0f} тыс. | "
+        f"Для сверки: + бартер CRM и ИРИ/АНО {comparable_addon_k:,.0f} тыс.")
     if deviation_pct is not None:
-        log(f"📊 Итого CRM + внешние: {grand_total_k:,.0f} тыс. | "
+        log(f"📊 Сопоставимо с бухгалтерией: {grand_total_k:,.0f} тыс. | "
             f"Верифицировано: {verified_total_k:,.0f} тыс. | "
             f"Отклонение: {deviation_pct:+.2f}% — {recon_verdict(deviation_pct)}")
     else:
@@ -1690,6 +1861,8 @@ def run_analytics(input_path: str, output_path: str, log=print,
         'crm_paydate_total':     round(crm_paydate_total_k, 2),
         'external_total':        round(external_total_k, 2),
         'full_external_total':   round(full_external_k, 2),
+        'crm_raw_total':         round(rev_raw_k, 2),
+        'comparable_addon':      round(comparable_addon_k, 2),
         'grand_total':           round(grand_total_k, 2),
         'verified_total':        round(verified_total_k, 2),
         'deviation_pct':         round(deviation_pct, 2) if deviation_pct is not None else None,

@@ -31,15 +31,26 @@ ECOM_KEYS   = {'E-com ФОНТАНКА', 'E-com ДОКТОР'}
 PLAN47_KEYS = {'Выручка 47 (в план)'}
 DEDUCT_KEYS = set(DEFAULT_DEDUCTIONS)
 
+# Статьи, которые нельзя прибавлять к CRM: дублируют строки выгрузки (47News есть
+# в CRM проектами '47News*', бартер — строками с 'Бартер' = 'Да') либо находятся
+# вне периметра (ИРИ/АНО). В сверке бартер и ИРИ/АНО показываются отдельно.
+EXTERNAL_DUPLICATES_OF_CRM = {'Выручка 47 (в план)', 'Медийный бартер ФОНТАНКА', 'Медийный бартер ЭВЕНТЫ'}
+EXTERNAL_OUT_OF_PERIMETER = {'ИРИ/АНО/Петроцентр', 'Гранты Фонтанка', 'Гранты Доктор'}
 
-def load(path):
-    """Содержимое external_income.json или None (нет файла / не читается)."""
+
+def load(path, errors=None):
+    """
+    Содержимое external_income.json или None (нет файла / не читается).
+    errors — список, куда добавляется текст ошибки чтения (для отчёта качества).
+    """
     if not path or not os.path.exists(path):
         return None
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        if errors is not None:
+            errors.append(str(e))
         return None
 
 
@@ -84,11 +95,13 @@ def monthly_totals(ext):
 
 def full_total(ext):
     """
-    Сумма внешних доходов для сверки с бухгалтерией (руб.) — без статей из
+    Внешние доходы (руб.), прибавляемые к периметру CRM — без статей из
     '_не_включать_в_grand_total' (закупка, взаимозачёты, затраты — это не
     реальный доход, а технические/расходные проводки).
     """
     exclude = set((ext or {}).get('_не_включать_в_grand_total', DEFAULT_DEDUCTIONS))
+    # Дубли CRM и статьи вне периметра тоже не прибавляются к CRM
+    exclude |= EXTERNAL_DUPLICATES_OF_CRM | EXTERNAL_OUT_OF_PERIMETER
     return sum(row_sum(v) for k, v in data_rows(ext).items() if k not in exclude)
 
 
@@ -129,19 +142,34 @@ def totals_by_category(ext):
     return cats
 
 
-def quality_report(ext, verified_data=None, pct_delta=None, recon_status=None):
+def perimeter_total(cats):
+    """
+    Внешние доходы (руб.), которые прибавляются к периметру CRM: программатик,
+    рекомендательные системы, e-com и прочие доходные статьи. Без бартера и
+    'Выручка 47 (в план)' (дубли CRM), без ИРИ/АНО/грантов (вне периметра)
+    и без вычетов.
+    """
+    return sum(cats.get(k, 0) for k in ('programmatic', 'recsys', 'ecom', 'other'))
+
+
+def quality_report(ext, verified_data=None, pct_delta=None, recon_status=None, other_keys=(),
+                   load_error=None):
     """
     Проверяет external_income.json на ошибки, которые чаще всего ломают сверку.
     Возвращает DataFrame: Проверка / Статус / Детали.
-    pct_delta, recon_status — функции из analytics (чтобы не дублировать).
+    pct_delta, recon_status — функции из analytics (чтобы не дублировать);
+    other_keys — статьи блока 'Total Прочие доходы' бухгалтерии.
     """
     rows = []
 
     def add(check, status, details):
         rows.append({'Проверка': check, 'Статус': status, 'Детали': details})
 
+    if load_error:
+        add('Чтение external_income.json', 'Критично', load_error)
+        return pd.DataFrame(rows)
     if ext is None:
-        add('Файл external_income.json', 'Критично', 'Файл не найден или не читается')
+        add('Файл external_income.json', 'Критично', 'Файл не найден')
         return pd.DataFrame(rows)
 
     rows_data = data_rows(ext)
@@ -198,12 +226,12 @@ def quality_report(ext, verified_data=None, pct_delta=None, recon_status=None):
 
         verified_other = verified_data.get('other_external_income')
         if verified_other:
-            other = cats.get('total_income', 0) - cats.get('programmatic', 0)
-            other_pct = pct_delta(other, verified_other)
-            add('Прочие внешние vs verified_figures',
-                'OK' if other_pct is not None and abs(other_pct) < 5 else 'Проверить',
+            # other_external_income — это блок 'Total Прочие доходы' бухгалтерии
+            # (включая закупку 47 и взаимозачёт ФФ/АМ): сравниваем с теми же статьями
+            other = sum(row_sum(rows_data.get(k, {})) for k in other_keys)
+            add('Прочие доходы (блок) vs verified_figures',
+                recon_status(pct_delta(other, verified_other), warn=1, bad=3),
                 f'JSON={other:,.0f} руб.; verified={verified_other:,.0f} руб.; '
-                f'delta={other - verified_other:,.0f} руб.; '
-                'проверь состав статей, он может отличаться от бухгалтерской группировки.')
+                f'delta={other - verified_other:,.0f} руб.')
 
     return pd.DataFrame(rows)

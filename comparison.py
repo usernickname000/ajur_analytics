@@ -13,7 +13,7 @@ from openpyxl.styles import Font
 
 from crm_data import (
     COL_MANAGER, COL_ORDER, COL_REVENUE, EXCLUDE_MANAGERS,
-    client_rank_mask, load_crm, mask_no_events,
+    count_orders, load_crm, mask_no_events, order_totals, prepare_crm,
 )
 from excel_style import (
     ACCENT, ACCENT_2, HEADER_FILL, HEADER_FONT, LOST_FILL, NEG_FONT, NEW_FILL, POS_FONT, POSITIVE,
@@ -25,12 +25,13 @@ DELTA_COL = 'Δ выручка, тыс.'
 
 def _load_period(path: str, log) -> pd.DataFrame:
     """
-    Загружает файл с той же очисткой, что и run_analytics. EXCLUDE_MANAGERS
-    и мероприятия не вырезаются из общего датасета — как и в отчёте «Анализ»,
-    они влияют только на конкретные срезы (менеджеры / клиенты / средний чек).
+    Загружает файл с той же очисткой и тем же периметром, что run_analytics
+    (без ФОНТАНКА ФЕСТ, АНО Медиа ДОМ, бартера), — иначе цифры двух отчётов
+    расходятся. EXCLUDE_MANAGERS и мероприятия влияют только на свои срезы.
     """
-    df = load_crm(path)
-    log(f"  Загружено строк после фильтров: {len(df)}")
+    df, _ = prepare_crm(load_crm(path), log=lambda m: log(f"  {m}"))
+    df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
+    log(f"  Позиций с выручкой в периметре: {len(df)}")
     return df
 
 
@@ -39,10 +40,10 @@ def _load_period(path: str, log) -> pd.DataFrame:
 # ============================================================
 
 def _stats(df: pd.DataFrame, key: str) -> pd.DataFrame:
-    """Выручка (тыс.) и число строк-заказов по ключу."""
+    """Выручка (тыс.) и число уникальных заказов по ключу."""
     stats = (
         df.groupby(key)
-        .agg(Выручка_руб=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'count'))
+        .agg(Выручка_руб=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'nunique'))
         .reset_index()
         .sort_values('Выручка_руб', ascending=False)
     )
@@ -58,8 +59,9 @@ def _manager_stats(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _client_stats(df: pd.DataFrame) -> pd.DataFrame:
-    # Без мероприятий — как лист 02_Топ_клиентов в отчёте «Анализ»
-    return _stats(df.loc[client_rank_mask(df)], 'КОНЕЧНЫЙ_КЛИЕНТ')
+    # Все клиенты периметра, включая мероприятия: лист показывает изменение
+    # выручки по каждому клиенту (как и 04_Движение_клиентов)
+    return _stats(df, 'КОНЕЧНЫЙ_КЛИЕНТ')
 
 
 # ============================================================
@@ -88,15 +90,18 @@ def _sheet_summary(wb, df_a, df_b, label_a, label_b):
     ws.append(["Метрика", label_a, label_b, "Δ абс.", "Δ %"])
     style_header_row(ws, 1)
 
-    # Средний/медианный чек — без мероприятий (см. README), как в run_analytics
-    mask_a, mask_b = mask_no_events(df_a), mask_no_events(df_b)
+    # Заказы — уникальные значения 'Заказ'; строка выгрузки — позиция заказа.
+    # Средний/медианный чек — на заказ, без мероприятий (см. README).
+    sums_a = order_totals(df_a.loc[mask_no_events(df_a)])
+    sums_b = order_totals(df_b.loc[mask_no_events(df_b)])
     metrics = [
         ("Выручка, тыс. руб.", round(df_a[COL_REVENUE].sum() / 1000, 2), round(df_b[COL_REVENUE].sum() / 1000, 2)),
-        ("Количество заказов", len(df_a), len(df_b)),
-        ("Средний чек, тыс. руб.", round(df_a.loc[mask_a, COL_REVENUE].mean() / 1000, 2),
-                                   round(df_b.loc[mask_b, COL_REVENUE].mean() / 1000, 2)),
-        ("Медианный чек, тыс. руб.", round(df_a.loc[mask_a, COL_REVENUE].median() / 1000, 2),
-                                     round(df_b.loc[mask_b, COL_REVENUE].median() / 1000, 2)),
+        ("Количество заказов", count_orders(df_a), count_orders(df_b)),
+        ("Количество позиций", len(df_a), len(df_b)),
+        ("Средний чек (на заказ, без мероприятий), тыс. руб.",
+         round(sums_a.mean() / 1000, 2), round(sums_b.mean() / 1000, 2)),
+        ("Медианный чек (на заказ, без мероприятий), тыс. руб.",
+         round(sums_a.median() / 1000, 2), round(sums_b.median() / 1000, 2)),
         ("Уникальных клиентов", df_a['КОНЕЧНЫЙ_КЛИЕНТ'].nunique(), df_b['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()),
     ]
     if COL_MANAGER in df_a.columns and COL_MANAGER in df_b.columns:
@@ -150,7 +155,7 @@ def _client_block(ws, title, df, clients, label, fill):
     detail = (
         df[df['КОНЕЧНЫЙ_КЛИЕНТ'].isin(clients)]
         .groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'count'))
+        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'nunique'))
         .reset_index()
         .sort_values('Выручка', ascending=False)
     )

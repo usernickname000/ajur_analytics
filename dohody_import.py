@@ -496,8 +496,8 @@ def apply_to_external_income(json_path, pw, backup=True):
             data['_план_KPI_по_месяцам_руб'] = {
                 d: ({m: 0 for m in MONTHS} if isinstance(v, dict) else v) for d, v in kpi.items()
             }
-        report_lines.append(f"Смена года {old_year} → {pw.year}: все статьи и планы обнулены "
-                            f"перед загрузкой нового файла.")
+        report_lines.append(f"Отчётный год сменён с {old_year} на {pw.year}: все статьи и планы "
+                            f"обнулены перед загрузкой. KPI-планы на {pw.year} год нужно ввести заново.")
 
     for canonical, months in update.items():
         # В рамках ТОГО ЖЕ года сохраняем то, что уже есть (могло быть поправлено
@@ -510,6 +510,8 @@ def apply_to_external_income(json_path, pw, backup=True):
             if v is None:
                 continue
             old_v = existing.get(m, 0) or 0
+            if not isinstance(old_v, (int, float)):
+                old_v = 0
             if round(float(old_v), 2) != round(float(v), 2):
                 changed_months.append(f"{m}: {old_v:,.0f} → {v:,.0f}")
             existing[m] = round(float(v), 2)

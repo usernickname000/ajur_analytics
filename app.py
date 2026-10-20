@@ -11,7 +11,6 @@ if _HERE not in sys.path:
 
 import json
 import queue
-import shutil
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -21,6 +20,7 @@ import crm_data
 import ui_theme as ui
 from ui_theme import ICON, T, px
 from analytics import RECON_BAD_PCT, RECON_WARN_PCT, recon_verdict, run_analytics
+from paths import app_dir, bundle_dir, data_path
 from comparison import run_comparison
 from dashboard import generate_dashboard
 
@@ -43,28 +43,16 @@ except ImportError:
 
 VERSION = "3.1"
 
-# В собранном onefile-exe __file__ указывает во временную папку распаковки
-# (sys._MEIPASS), которая удаляется при выходе: правки JSON и config
-# пропадали бы. Записываемые файлы держим рядом с exe, ресурсы (иконка,
-# дефолтные JSON) берём из папки распаковки.
-RES_DIR = _HERE
-if getattr(sys, "frozen", False):
-    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
-    for _name in ("external_income.json", "verified_figures.json", "client_aliases.json"):
-        _src, _dst = os.path.join(RES_DIR, _name), os.path.join(APP_DIR, _name)
-        if os.path.exists(_src) and not os.path.exists(_dst):
-            try:
-                shutil.copy2(_src, _dst)
-            except OSError:
-                pass
-else:
-    APP_DIR = RES_DIR
-
+# Настройки и JSON лежат в app_dir(): из исходников — папка проекта, в
+# собранном .exe — рядом с .exe (не во временной папке распаковки, которая
+# удаляется при закрытии). При первом запуске exe data_path() копирует туда
+# вшитые значения по умолчанию. Иконка — из папки распаковки.
+APP_DIR              = app_dir()
 CONFIG_PATH          = os.path.join(APP_DIR, "config.json")
-ICON_PATH            = os.path.join(RES_DIR, "icon.ico")
-EXTERNAL_INCOME_PATH = os.path.join(APP_DIR, "external_income.json")
-VERIFIED_PATH        = os.path.join(APP_DIR, "verified_figures.json")
-ALIASES_PATH         = os.path.join(APP_DIR, "client_aliases.json")
+ICON_PATH            = os.path.join(bundle_dir(), "icon.ico")
+EXTERNAL_INCOME_PATH = data_path("external_income.json")
+VERIFIED_PATH        = data_path("verified_figures.json")
+ALIASES_PATH         = data_path("client_aliases.json")
 
 # Анализ и редактор алиасов должны работать с одним и тем же файлом
 crm_data.set_aliases_path(ALIASES_PATH)
@@ -73,7 +61,7 @@ DEFAULT_MANAGERS = [
     "Петрова Э.", "Егорова И.", "Демахина Е.",
     "Дубровская Т.", "Долгополова Н.", "Демидова Г.",
     "Сосновик А.", "Киселёва Е.", "Лея К.",
-    "Борисенко Е.", "Сорокина Т.", "Шевчук Е.", "Карпус О.",
+    "[УВ] Борисенко Е.", "Сорокина Т.", "Шевчук Е.", "Карпусь О.",
 ]
 
 DEFAULT_VERIFIED = {
@@ -484,7 +472,7 @@ class App(tk.Tk):
         self.output_dir_var = tk.StringVar(value=self._cfg.get("last_output_dir", ""))
         self._path_row(grid, 0, "Файл CRM", self.input_var, self._browse_input)
         self._path_row(grid, 1, "Папка отчёта", self.output_dir_var, self._browse_output)
-        ui.label(grid, "Группировать по", "body", fg="text2").grid(row=2, column=0, sticky="w",
+        ui.label(grid, "База итога для сверки", "body", fg="text2").grid(row=2, column=0, sticky="w",
                                                                    pady=(px(10), 0))
         radios = tk.Frame(grid, bg=T["card"])
         radios.grid(row=2, column=1, columnspan=2, sticky="w", pady=(px(10), 0))
@@ -499,8 +487,8 @@ class App(tk.Tk):
         kpis = tk.Frame(self._result, bg=T["bg"])
         kpis.pack(fill="x")
         self._kpi = {}
-        for i, (key, caption) in enumerate((("crm", "CRM, тыс. ₽"), ("external", "Внешние, тыс. ₽"),
-                                            ("grand", "Итого, тыс. ₽"), ("dev", "Отклонение от бухгалтерии"))):
+        for i, (key, caption) in enumerate((("crm", "CRM, периметр, тыс. ₽"), ("external", "Внешние, тыс. ₽"),
+                                            ("grand", "Сопоставимо с бухгалтерией, тыс. ₽"), ("dev", "Отклонение от бухгалтерии"))):
             outer, body = ui.card(kpis, pad=14)
             outer.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else px(6), 0))
             kpis.columnconfigure(i, weight=1, uniform="kpi")
@@ -516,11 +504,11 @@ class App(tk.Tk):
         by = "по дате оплаты" if result.get("date_by") == "payment" else "по дате заказа"
 
         if pct is None or verified <= 0:
-            self._recon_bar.set("info", f"CRM + внешние доходы: {_fmt_k(grand)} тыс. ₽. "
+            self._recon_bar.set("info", f"Сопоставимо с бухгалтерией: {_fmt_k(grand)} тыс. ₽. "
                                         "Сверка с бухгалтерией не применима — подробности в журнале.")
         else:
             kind = "ok" if abs(pct) < RECON_WARN_PCT else "warn" if abs(pct) < RECON_BAD_PCT else "err"
-            self._recon_bar.set(kind, f"Сверка {by}: CRM + внешние {_fmt_k(grand)} тыс. ₽ · "
+            self._recon_bar.set(kind, f"Сверка {by}: сопоставимо с бухгалтерией {_fmt_k(grand)} тыс. ₽ · "
                                       f"бухгалтерия {_fmt_k(verified)} тыс. ₽ · "
                                       f"{pct:+.2f}% — {recon_verdict(pct)}")
 
@@ -726,7 +714,7 @@ class App(tk.Tk):
     def _get_plan_rub(self):
         result = {}
         for name, var in self._plan_vars.items():
-            val = var.get().strip().replace(",", ".").replace(" ", "")
+            val = var.get().strip().replace(",", ".").replace(" ", "").replace("\xa0", "")
             if val:
                 try:
                     result[name] = float(val) * 1000
