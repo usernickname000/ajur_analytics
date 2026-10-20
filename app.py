@@ -1,5 +1,5 @@
 # ============================================================
-# app.py — Аналитика заказов, Фонтанка.ру  v3.1
+# app.py — AJUR Analytics (Фонтанка.ру, коммерческий отдел)  v3.1
 # Окно в стиле Windows 11: тема — ui_theme.py
 # ============================================================
 
@@ -194,7 +194,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         ui.init(self)
-        self.title("Аналитика заказов — Фонтанка.ру")
+        self.title("AJUR Analytics")
         self.geometry(f"{px(1100)}x{px(740)}")
         self.minsize(px(940), px(640))
         if os.path.exists(ICON_PATH):
@@ -259,8 +259,8 @@ class App(tk.Tk):
 
         brand = tk.Frame(side, bg=T["bg"])
         brand.pack(fill="x", padx=px(20), pady=(px(22), px(18)))
-        ui.label(brand, "фонтанка.ру", "brand", fg="brand", bg="bg").pack(anchor="w")
-        ui.label(brand, "Аналитика заказов", "caption", fg="text2", bg="bg").pack(anchor="w")
+        ui.label(brand, "AJUR Analytics", "subtitle", fg="brand", bg="bg").pack(anchor="w")
+        ui.label(brand, "Фонтанка.ру", "caption", fg="text2", bg="bg").pack(anchor="w")
 
         for page_id, icon, text in self.NAV_ITEMS:
             self._nav[page_id] = self._nav_item(side, page_id, icon, text)

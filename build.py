@@ -36,7 +36,7 @@ cmd = [
     sys.executable, "-m", "PyInstaller",
     "--onefile",
     "--windowed",
-    "--name", "АналитикаЗаказов",
+    "--name", "AJUR Analytics",
     # pandas / numpy
     "--hidden-import=pandas",
     "--hidden-import=numpy",
@@ -67,7 +67,7 @@ print()
 result = subprocess.run(cmd, cwd=APP_DIR)
 
 if result.returncode == 0:
-    exe_path = os.path.join(APP_DIR, "dist", "АналитикаЗаказов.exe")
+    exe_path = os.path.join(APP_DIR, "dist", "AJUR Analytics.exe")
     print()
     print("✅ Сборка успешна!")
     print(f"   Файл: {exe_path}")
