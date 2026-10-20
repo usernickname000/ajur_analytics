@@ -43,9 +43,35 @@ try:
 except ImportError:
     HAS_DOHODY_IMPORT = False
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-ICON_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-APP_DIR     = os.path.dirname(os.path.abspath(__file__))
+import shutil
+import analytics
+
+# В собранном onefile-exe __file__ указывает во временную папку распаковки
+# (sys._MEIPASS), которая удаляется при выходе: правки JSON и config
+# пропадали бы. Записываемые файлы держим рядом с exe, ресурсы (иконка,
+# дефолтные JSON) берём из папки распаковки.
+RES_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    for _name in ("external_income.json", "verified_figures.json", "client_aliases.json"):
+        _src, _dst = os.path.join(RES_DIR, _name), os.path.join(APP_DIR, _name)
+        if os.path.exists(_src) and not os.path.exists(_dst):
+            try:
+                shutil.copy2(_src, _dst)
+            except OSError:
+                pass
+else:
+    APP_DIR = RES_DIR
+
+CONFIG_PATH          = os.path.join(APP_DIR, "config.json")
+ICON_PATH            = os.path.join(RES_DIR, "icon.ico")
+EXTERNAL_INCOME_PATH = os.path.join(APP_DIR, "external_income.json")
+VERIFIED_PATH        = os.path.join(APP_DIR, "verified_figures.json")
+ALIASES_PATH         = os.path.join(APP_DIR, "client_aliases.json")
+
+# Анализ и редактор алиасов должны работать с одним и тем же файлом
+analytics._ALIASES_PATH = ALIASES_PATH
+analytics.reload_aliases()
 
 # ── Палитра ──────────────────────────────────────────────────
 C_ORANGE   = "#F38120"
@@ -481,12 +507,19 @@ class App(tk.Tk):
                                    bg=T["surface"], fg=C_ORANGE)
         self._anim_lbl.pack(side="right", padx=16)
 
+    # Счётчик активных задач: анализ, сравнение и дашборд могут идти
+    # одновременно — спиннер гаснет, только когда завершилась последняя.
     def _start_anim(self):
-        self._anim_running = True
-        self._anim_step = 0
-        self._tick_anim()
+        self._anim_tasks = getattr(self, "_anim_tasks", 0) + 1
+        if self._anim_tasks == 1:
+            self._anim_running = True
+            self._anim_step = 0
+            self._tick_anim()
 
     def _stop_anim(self):
+        self._anim_tasks = max(0, getattr(self, "_anim_tasks", 1) - 1)
+        if self._anim_tasks:
+            return
         self._anim_running = False
         try:
             self._anim_lbl.config(text="")
@@ -654,6 +687,11 @@ class App(tk.Tk):
         lbl.pack(side="left")
 
     def _write_log(self, box, msg):
+        # Логи приходят из рабочих потоков, а Tk-виджеты можно трогать только
+        # из главного — перекладываем вызов в очередь событий Tk.
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, lambda: self._write_log(box, msg))
+            return
         T = self._T
         tag = ("ok"   if "✅" in msg or "Готово" in msg else
                "err"  if "❌" in msg or "ОШИБКА" in msg else
@@ -756,9 +794,21 @@ class App(tk.Tk):
         self.run_btn = self._run_btn(inner, "Запустить анализ", self._start_analysis)
 
     def _bind_mousewheel(self, canvas):
+        # Одна глобальная привязка; прокручиваем тот холст, над которым курсор
+        # (раньше всегда крутился холст «Анализа», даже на других страницах).
+        self._scroll_canvases = getattr(self, "_scroll_canvases", set())
+        self._scroll_canvases.add(canvas)
+        if getattr(self, "_wheel_bound", False):
+            return
+        self._wheel_bound = True
+
         def _scroll(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _scroll)
+            w = self.winfo_containing(e.x_root, e.y_root)
+            while w is not None and w not in self._scroll_canvases:
+                w = getattr(w, "master", None)
+            if w is not None:
+                w.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        self.bind_all("<MouseWheel>", _scroll)
 
     def _build_settings_card(self, parent):
         T = self._T
@@ -976,6 +1026,7 @@ class App(tk.Tk):
                     lambda e: canvas.itemconfig(win_id, width=e.width))
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._bind_mousewheel(canvas)
 
         self._page_header(inner, "Сравнение периодов",
                           "Сравните показатели двух произвольных периодов")
@@ -1041,6 +1092,7 @@ class App(tk.Tk):
         canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+        self._bind_mousewheel(canvas)
 
         # Заголовок таблицы
         hdr = tk.Frame(self._plan_inner, bg=T["surface2"])
@@ -1268,6 +1320,7 @@ class App(tk.Tk):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = os.path.join(out, f"аналитика_заказов_{ts}.xlsx")
         plan = self._get_plan_rub()
+        date_by = self._date_by.get()  # читаем Tk-переменную в главном потоке
         self.main_bar.config(value=0)
         self.main_pct.config(text="0%")
         self.run_btn.configure(state="disabled", text="  Выполняется...  ")
@@ -1275,17 +1328,18 @@ class App(tk.Tk):
         self._recon_label.config(text="  Считаю...", fg=self._T["muted"])
         log_fn = self._progress_log(self.main_bar, self.main_pct)
         threading.Thread(target=self._thread_analysis,
-                         args=(inp, out_path, plan, log_fn),
+                         args=(inp, out_path, plan, log_fn, date_by),
                          daemon=True).start()
 
-    def _thread_analysis(self, inp, out_path, plan, log_fn):
+    def _thread_analysis(self, inp, out_path, plan, log_fn, date_by):
         try:
             log_fn(f"Файл: {os.path.basename(inp)}")
-            date_by = self._date_by.get()
             result = run_analytics(inp, out_path,
                                    log=log_fn,
                                    manager_plan=plan,
-                                   date_by=date_by)
+                                   date_by=date_by,
+                                   verified_path=VERIFIED_PATH,
+                                   external_path=EXTERNAL_INCOME_PATH)
             log_fn(f"✅ Готово: {out_path}")
             self.after(0, lambda: (
                 self.main_bar.config(value=100),
@@ -1320,7 +1374,7 @@ class App(tk.Tk):
                 f"Ошибка: {m[:80]}", kind="err", duration=7000))
             self.after(0, lambda: messagebox.showerror("Ошибка", err))
         finally:
-            self._stop_anim()
+            self.after(0, self._stop_anim)
             self.after(0, lambda: self.run_btn.configure(
                 state="normal", text="  Запустить анализ  "))
 
@@ -1396,7 +1450,7 @@ class App(tk.Tk):
                 f"Ошибка: {m[:80]}", kind="err", duration=7000))
             self.after(0, lambda: messagebox.showerror("Ошибка", err))
         finally:
-            self._stop_anim()
+            self.after(0, self._stop_anim)
             self.after(0, lambda: self.cmp_run_btn.configure(
                 state="normal", text="  Сравнить периоды  "))
 
@@ -1417,10 +1471,13 @@ class App(tk.Tk):
         try:
             generate_dashboard(inp, log=self._dash_log)
         except Exception as e:
-            self._dash_log(f"❌ ОШИБКА: {e}")
-            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+            # Копируем текст: после выхода из except имя `e` удаляется,
+            # и отложенная lambda падала с NameError — диалог не показывался.
+            err = str(e)
+            self._dash_log(f"❌ ОШИБКА: {err}")
+            self.after(0, lambda: messagebox.showerror("Ошибка", err))
         finally:
-            self._stop_anim()
+            self.after(0, self._stop_anim)
             self.after(0, lambda: self.dash_btn.configure(
                 state="normal", text="  Открыть дашборд в браузере  "))
 

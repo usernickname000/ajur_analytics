@@ -111,6 +111,8 @@ RAW_LABEL_MAP = {
     'ФФ/АМ взаимозачет':                                            'ФФ/АМ взаимозачет',
     'ИРИ/АНО':                                                      'ИРИ/АНО/Петроцентр',
     'ИРИ/АНО/Петроцентр':                                           'ИРИ/АНО/Петроцентр',
+    'Гранты Фонтанка':                                              'Гранты Фонтанка',
+    'Гранты Доктор':                                                'Гранты Доктор',
     # ── Корректировки (второй блок файла, но те же колонки) ──
     'Взаимозачет/Затраты':                                          'Взаимозачет/Затраты',
     'Корректировка скидки (комиссия ХШМ)':                          'Корректировка скидки (комиссия ХШМ)',
@@ -478,18 +480,31 @@ def apply_to_external_income(json_path, pw, backup=True):
 
     data['_год'] = pw.year
 
+    # При смене отчётного года обнуляем ВСЕ статьи и планы прошлого года, а не
+    # только те, что нашлись в новом файле: иначе статьи, которых в новом файле
+    # нет (пустые строки, переименованные, гранты), тихо оставались с цифрами
+    # прошлого года под меткой нового. Старые цифры — в резервной копии выше.
+    if year_switch:
+        for key, val in list(data.items()):
+            if key.startswith('_') or not isinstance(val, dict):
+                continue
+            data[key] = {m: 0 for m in MONTHS}
+        if isinstance(data.get('_план_группы_по_месяцам_руб'), dict):
+            data['_план_группы_по_месяцам_руб'] = {m: 0 for m in MONTHS}
+        kpi = data.get('_план_KPI_по_месяцам_руб')
+        if isinstance(kpi, dict):
+            data['_план_KPI_по_месяцам_руб'] = {
+                d: ({m: 0 for m in MONTHS} if isinstance(v, dict) else v) for d, v in kpi.items()
+            }
+        report_lines.append(f"Смена года {old_year} → {pw.year}: все статьи и планы обнулены "
+                            f"перед загрузкой нового файла.")
+
     for canonical, months in update.items():
-        # При смене отчётного года не переносим цифры прошлого года на
-        # месяцы, которых ещё нет в источнике — иначе под меткой 2026-го
-        # тихо останутся факты 2025-го. Начинаем с чистого листа; при
-        # обновлении в рамках ТОГО ЖЕ года — сохраняем то, что уже есть
-        # (могло быть поправлено вручную через редактор).
-        if year_switch:
+        # В рамках ТОГО ЖЕ года сохраняем то, что уже есть (могло быть поправлено
+        # вручную через редактор); при смене года данные уже обнулены выше.
+        existing = data.get(canonical)
+        if not isinstance(existing, dict):
             existing = {m: 0 for m in MONTHS}
-        else:
-            existing = data.get(canonical)
-            if not isinstance(existing, dict):
-                existing = {m: 0 for m in MONTHS}
         changed_months = []
         for m, v in months.items():
             if v is None:
@@ -510,8 +525,11 @@ def apply_to_external_income(json_path, pw, backup=True):
         data['_план_группы_по_месяцам_руб'] = plan
         report_lines.append("Обновлён план группы по месяцам.")
 
-    with open(json_path, 'w', encoding='utf-8') as f:
+    # Через временный файл: сбой посреди записи не оставит полупустой JSON
+    tmp_path = json_path + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, json_path)
 
     if not report_lines:
         report_lines.append("Изменений нет — external_income.json уже соответствует файлу.")

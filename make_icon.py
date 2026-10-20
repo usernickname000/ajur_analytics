@@ -3,20 +3,29 @@
 python make_icon.py
 """
 from PIL import Image, ImageDraw, ImageFont
-import os, urllib.request
+import os, sys, urllib.request
+
+# Пути — от папки скрипта, а не от текущего каталога: build.py и app.py
+# ищут icon.ico рядом со скриптами.
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Скачиваем оригинальный логотип Фонтанки
 LOGO_URL = "https://fontanka.ru/apple-touch-icon.png"
-LOGO_PATH = "fontanka_logo.png"
+LOGO_PATH = os.path.join(HERE, "fontanka_logo.png")
+ICO_PATH = os.path.join(HERE, "icon.ico")
 
+downloaded = False
 print("Скачиваю логотип...")
 try:
     urllib.request.urlretrieve(LOGO_URL, LOGO_PATH)
+    downloaded = True
     print("OK")
 except Exception as e:
     print(f"Не удалось скачать: {e}")
-    print("Положи логотип вручную как fontanka_logo.png рядом со скриптом")
-    exit(1)
+    if not os.path.exists(LOGO_PATH):
+        print("Положи логотип вручную как fontanka_logo.png рядом со скриптом")
+        sys.exit(1)
+    print("Использую локальный fontanka_logo.png")
 
 src = Image.open(LOGO_PATH).convert("RGBA")
 
@@ -67,9 +76,10 @@ draw.text((tx, ty), text, font=font, fill=(255, 255, 255))
 # Сохраняем ICO всех размеров
 sizes = [16, 32, 48, 64, 128, 256]
 icons = [img.resize((s, s), Image.LANCZOS).convert("RGBA") for s in sizes]
-icons[0].save("icon.ico", format="ICO",
+icons[0].save(ICO_PATH, format="ICO",
               sizes=[(s, s) for s in sizes],
               append_images=icons[1:])
 
 print("✅ icon.ico создан успешно!")
-os.remove(LOGO_PATH)
+if downloaded:  # положенный вручную логотип не удаляем
+    os.remove(LOGO_PATH)

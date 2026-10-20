@@ -11,7 +11,7 @@ from openpyxl.chart import BarChart, Reference
 from openpyxl.utils import get_column_letter
 
 from analytics import (
-    parse_money, pick_client, normalize_client,
+    parse_money, pick_client, normalize_client, client_rank_mask,
     EXCLUDE_MANAGERS, EXCLUDE_PROJECTS,
     COL_MONTH, COL_ORDER, COL_DATE, COL_MANAGER,
     COL_REVENUE, COL_PROJECT,
@@ -43,11 +43,10 @@ def _load_period(path: str, log) -> pd.DataFrame:
         df = df.loc[~df[COL_MONTH].astype(str).str.strip().str.lower().eq("итого")]
     df = df.dropna(how="all").reset_index(drop=True)
 
-    # Парсим выручку. Нулевую/отрицательную выручку не выбрасываем (сторно,
-    # корректировки) — иначе "Выручка"/"Заказов" здесь не совпадут с отчётом
-    # "Анализ", где run_analytics такие строки оставляет в расчётах.
+    # Парсим выручку. Строки с нулевой/отрицательной/пустой выручкой не выбрасываем
+    # (сторно, корректировки) — иначе "Заказов"/"Клиентов" здесь не совпадут с
+    # отчётом "Анализ", где run_analytics такие строки оставляет в расчётах.
     df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
-    df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
 
     # Клиент
     df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1)
@@ -70,7 +69,7 @@ def _mask_no_events(df: pd.DataFrame) -> pd.Series:
 
 def _manager_stats(df: pd.DataFrame) -> pd.DataFrame:
     if COL_MANAGER not in df.columns:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[COL_MANAGER, 'Выручка_руб', 'Заказов', 'Выручка_тыс'])
     # Менеджеры вне отдела исключаются только из этого среза (см. README), а не из общих итогов.
     df = df.loc[~df[COL_MANAGER].isin(EXCLUDE_MANAGERS)]
     stats = (
@@ -87,8 +86,9 @@ def _manager_stats(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _client_stats(df: pd.DataFrame) -> pd.DataFrame:
+    # Без мероприятий — как лист 02_Топ_клиентов в отчёте "Анализ"
     stats = (
-        df.groupby('КОНЕЧНЫЙ_КЛИЕНТ')
+        df.loc[client_rank_mask(df)].groupby('КОНЕЧНЫЙ_КЛИЕНТ')
         .agg(
             Выручка_руб=(COL_REVENUE, 'sum'),
             Заказов=(COL_ORDER, 'count')
@@ -538,6 +538,12 @@ def run_comparison(
     path_a / path_b — пути к Excel-выгрузкам из CRM
     label_a / label_b — произвольные метки (например, "Янв 2024")
     """
+    # Метки становятся частью имён колонок — одинаковые метки ломают слияние
+    label_a = (label_a or '').strip() or "Период А"
+    label_b = (label_b or '').strip() or "Период Б"
+    if label_a == label_b:
+        label_a, label_b = f"{label_a} (А)", f"{label_b} (Б)"
+
     log(f"Загружаю период А: {os.path.basename(path_a)}")
     df_a = _load_period(path_a, log)
 

@@ -11,6 +11,7 @@ import pandas as pd
 
 from analytics import (
     parse_money, pick_client, normalize_client, pick_industry, classify_industry,
+    client_rank_mask,
     EXCLUDE_MANAGERS, EXCLUDE_PROJECTS,
     COL_REVENUE, COL_MONTH, COL_MANAGER, COL_PROJECT,
     COL_ORDER, COL_DATE, COL_CLIENT, COL_CLIENT_RA, COL_REKLAMD,
@@ -30,11 +31,9 @@ def _load_and_prepare(path: str) -> pd.DataFrame:
     if COL_MONTH in df.columns:
         df = df[~df[COL_MONTH].astype(str).str.strip().str.lower().eq('итого')]
     df = df.dropna(how='all').reset_index(drop=True)
-    # Нулевую/отрицательную выручку не выбрасываем (сторно, корректировки) —
-    # иначе KPI дашборда не совпадают с отчётом "Анализ", где run_analytics
-    # такие строки оставляет в расчётах.
+    # Строки с нулевой/отрицательной/пустой выручкой не выбрасываем — как и
+    # run_analytics, иначе «Заказов» и «Клиентов» не совпадают с отчётом "Анализ".
     df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
-    df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
     df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1).apply(normalize_client)
     # Колонка должна называться именно 'ОТРАСЛЬ_КЛИЕНТА' — classify_industry() в
     # analytics.py читает row['ОТРАСЛЬ_КЛИЕНТА']; при другом имени она получает
@@ -72,7 +71,8 @@ def _collect_data(df: pd.DataFrame) -> dict:
         grp['revenue'] = (grp[COL_REVENUE] / 1000).round(1)
         monthly = grp[['month', 'revenue']].to_dict('records')
 
-    top_cli = (df.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[COL_REVENUE]
+    # Без мероприятий — как лист 02_Топ_клиентов в отчёте
+    top_cli = (df.loc[client_rank_mask(df)].groupby('КОНЕЧНЫЙ_КЛИЕНТ')[COL_REVENUE]
                  .sum().nlargest(10).reset_index())
     top_cli.columns = ['name', 'revenue']
     top_cli['revenue'] = (top_cli['revenue'] / 1000).round(1)

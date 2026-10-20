@@ -7,18 +7,18 @@ import os
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Дополнительные файлы данных для включения в .exe
+# Дополнительные файлы данных для включения в .exe. JSON — дефолты: при первом
+# запуске app.py копирует их рядом с exe, дальше правятся копии. config.json
+# (личные пути) в сборку не кладём. icon.ico — для иконки окна (iconbitmap).
 data_files = [
     ("external_income.json", "."),
     ("verified_figures.json", "."),
-    ("config.json", ".") if os.path.exists(os.path.join(APP_DIR, "config.json")) else None,
+    ("client_aliases.json", "."),
+    ("icon.ico", "."),
 ]
 
 add_data = []
-for item in data_files:
-    if item is None:
-        continue
-    src, dst = item
+for src, dst in data_files:
     full_src = os.path.join(APP_DIR, src)
     if os.path.exists(full_src):
         add_data.extend(["--add-data", f"{full_src};{dst}"])

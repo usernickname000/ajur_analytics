@@ -7,6 +7,8 @@ from tkinter import messagebox
 import json
 import os
 
+from jsonio import save_json_atomic
+
 C_ORANGE = "#F38120"
 
 
@@ -31,7 +33,9 @@ class ClientAliasesEditor(tk.Toplevel):
         self.configure(bg=T['bg'])
 
         self.groups = []  # list of {'canonical': str, 'patterns': list[str]}
-        self._load_data()
+        self._extra = {}  # прочие ключи верхнего уровня — сохраняем как есть
+        if not self._load_data():
+            return
         self._build_ui()
 
         self.transient(parent)
@@ -50,15 +54,24 @@ class ClientAliasesEditor(tk.Toplevel):
                      'patterns': list(g.get('patterns', []))}
                     for g in data.get('groups', [])
                 ]
-            except Exception:
-                self.groups = []
+                self._extra = {k: v for k, v in data.items()
+                               if k not in ('groups', '_описание')}
+            except Exception as e:
+                # Битый файл не открываем «пустым»: сохранение стёрло бы все правила
+                messagebox.showerror("Ошибка чтения JSON",
+                    f"Не удалось прочитать {os.path.basename(self.json_path)}:\n{e}\n\n"
+                    "Исправьте файл вручную, иначе сохранение затрёт его.")
+                self.destroy()
+                return False
+        return True
 
     def _save(self):
         groups = []
         for row in self._rows:
             canonical = row['canonical_var'].get().strip()
             raw = row['patterns_var'].get().strip()
-            patterns = [p.strip() for p in raw.split(',') if p.strip()]
+            # Поиск идёт по имени клиента в верхнем регистре
+            patterns = [p.strip().upper() for p in raw.split(',') if p.strip()]
             if not canonical:
                 continue
             groups.append({'canonical': canonical, 'patterns': patterns})
@@ -66,14 +79,14 @@ class ClientAliasesEditor(tk.Toplevel):
         data = {
             '_описание': (
                 'Правила нормализации клиентов. Каждая группа: '
-                "'canonical' — итоговое имя, 'patterns' — подстроки для поиска "
+                "'canonical' — итоговое имя, 'patterns' — начало слова для поиска "
                 '(в верхнем регистре). Редактируется через GUI (кнопка \'Алиасы клиентов\').'
             ),
+            **self._extra,
             'groups': groups
         }
         try:
-            with open(self.json_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            save_json_atomic(self.json_path, data)
         except Exception as e:
             messagebox.showerror("Ошибка сохранения", str(e))
             return
@@ -146,8 +159,12 @@ class ClientAliasesEditor(tk.Toplevel):
             scrollregion=canvas.bbox('all')))
         canvas.bind('<Configure>', lambda e: canvas.itemconfig(
             self._scroll_win, width=e.width))
-        canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(
-            int(-1 * (e.delta / 120)), 'units'))
+        # Через общий обработчик приложения (см. external_income_editor)
+        if hasattr(self.master, '_bind_mousewheel'):
+            self.master._bind_mousewheel(canvas)
+        else:
+            canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(
+                int(-1 * (e.delta / 120)), 'units'))
 
         self._canvas = canvas
         self._rows = []

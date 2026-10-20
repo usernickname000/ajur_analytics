@@ -8,6 +8,9 @@ from tkinter import ttk, messagebox
 import json
 import os
 
+from analytics import parse_money
+from jsonio import save_json_atomic
+
 C_ORANGE = "#F38120"
 
 
@@ -51,7 +54,8 @@ class VerifiedFiguresEditor(tk.Toplevel):
         self.entries = {}
         self.year_var = tk.StringVar()
 
-        self._load_data()
+        if not self._load_data():
+            return
         self._build_ui()
 
         self.transient(parent)
@@ -59,12 +63,18 @@ class VerifiedFiguresEditor(tk.Toplevel):
         self.focus_set()
 
     def _load_data(self):
+        # Битый файл не открываем «пустым»: сохранение затёрло бы его нулями
         if os.path.exists(self.json_path):
             try:
                 with open(self.json_path, 'r', encoding='utf-8') as f:
                     self.data = json.load(f)
-            except Exception:
-                self.data = {}
+            except Exception as e:
+                messagebox.showerror("Ошибка чтения JSON",
+                    f"Не удалось прочитать {os.path.basename(self.json_path)}:\n{e}\n\n"
+                    "Исправьте файл вручную, иначе сохранение затрёт его.")
+                self.destroy()
+                return False
+        return True
 
     def _build_ui(self):
         T = self.theme
@@ -157,13 +167,11 @@ class VerifiedFiguresEditor(tk.Toplevel):
         self.bind('<Escape>', lambda e: self.destroy())
 
     def _parse(self, s):
-        if not s:
+        """Целое число рублей; None — если не распозналось (пусто = 0)."""
+        if not str(s).strip():
             return 0
-        s = str(s).strip().replace(' ', '').replace(',', '.')
-        try:
-            return int(float(s))
-        except Exception:
-            return 0
+        v = parse_money(s)
+        return None if v is None else int(round(v))
 
     def _fmt(self, v):
         try:
@@ -177,16 +185,28 @@ class VerifiedFiguresEditor(tk.Toplevel):
         try:
             new_data['_год'] = int(self.year_var.get())
         except Exception:
-            new_data['_год'] = 2025
+            messagebox.showerror("Не сохранено",
+                f"Отчётный год «{self.year_var.get()}» — не число.", parent=self)
+            return
         new_data.setdefault('_описание',
             "Верифицированные годовые итоги из бухгалтерии.")
 
+        # Нераспознанное число не превращаем в 0: analytics считает 0
+        # «не задано» и молча пропускает сверку
+        labels = {key: label for key, label, _ in self.FIELDS}
+        bad = []
         for key, var in self.entries.items():
-            new_data[key] = self._parse(var.get())
+            v = self._parse(var.get())
+            if v is None:
+                bad.append(f"{labels[key]}: «{var.get()}»")
+            new_data[key] = v
+        if bad:
+            messagebox.showerror("Не сохранено",
+                "Не удалось распознать числа:\n\n" + "\n".join(bad), parent=self)
+            return
 
         try:
-            with open(self.json_path, 'w', encoding='utf-8') as f:
-                json.dump(new_data, f, ensure_ascii=False, indent=2)
+            save_json_atomic(self.json_path, new_data)
         except Exception as e:
             messagebox.showerror("Ошибка сохранения", str(e))
             return

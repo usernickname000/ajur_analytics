@@ -6,6 +6,7 @@
 import pandas as pd
 import numpy as np
 import os
+import re
 import json
 from datetime import datetime
 from openpyxl.utils import get_column_letter
@@ -26,8 +27,19 @@ def reload_aliases():
     try:
         with open(_ALIASES_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        _aliases_cache = [(g['canonical'], g['patterns']) for g in data.get('groups', [])]
-    except Exception:
+        # Паттерн ищется с начала слова (?<!\w): 'ГАЗПРОМ' ловит «Газпромбанк» и
+        # «ПАО Газпром», но не «Запсибгазпром», где это часть другого слова.
+        # upper() — на случай паттернов, введённых строчными буквами.
+        _aliases_cache = [
+            (g['canonical'],
+             [re.compile(r'(?<!\w)' + re.escape(str(p).strip().upper()))
+              for p in g['patterns'] if str(p).strip()])
+            for g in data.get('groups', [])
+        ]
+    except FileNotFoundError:
+        _aliases_cache = []
+    except Exception as e:
+        print(f"⚠ client_aliases.json не прочитан ({e}) — нормализация клиентов отключена")
         _aliases_cache = []
 
 
@@ -255,8 +267,11 @@ def parse_money(x):
     if pd.isna(x):
         return None
     x = str(x).strip()
-    x = x.replace("руб", "").replace("Руб", "")
-    x = x.replace(" ", "").replace("'", "")
+    # Валюта вместе с точкой ('руб.', 'р.', '₽') и все пробелы, включая
+    # неразрывные (\xa0,  ), которые Excel/1С ставят между разрядами.
+    # Раньше точка из 'руб.' оставалась и '1 234,56 руб.' читалось как 123456.
+    x = re.sub(r'(?i)(руб\.?|р\.|₽)', '', x)
+    x = re.sub(r"[\s']", '', x)
     has_comma = "," in x
     has_dot = "." in x
     if has_comma and has_dot:
@@ -271,6 +286,9 @@ def parse_money(x):
     elif has_comma:
         # Одна запятая — дробная часть (рус. формат); несколько — разделители тысяч
         x = x.replace(",", ".") if x.count(",") == 1 else x.replace(",", "")
+    elif x.count(".") > 1:
+        # '1.234.567' — точки как разделители тысяч
+        x = x.replace(".", "")
     try:
         return float(x)
     except Exception:
@@ -289,9 +307,25 @@ def normalize_client(name):
         return name
     name_clean = str(name).upper()
     for canonical, patterns in _load_aliases():
-        if any(p in name_clean for p in patterns):
+        if any(p.search(name_clean) for p in patterns):
             return canonical
     return name
+
+
+def client_rank_mask(df):
+    """
+    Строки для рейтингов клиентов (топ клиентов, RFM): без проектов-мероприятий
+    и без клиентов-мероприятий (фестивали). Общая для отчёта, дашборда и
+    сравнения, чтобы «Топ клиентов» везде совпадал.
+    \\b — граница слова: без неё 'ФЕСТ' ловил бы «Манифест групп» или «Инфест».
+    """
+    is_event_client = (
+        df['КОНЕЧНЫЙ_КЛИЕНТ'].astype(str).str.upper()
+        .str.contains(r'\b(?:ФЕСТ|МЕРОПРИЯТИ)', na=False, regex=True)
+    )
+    if COL_PROJECT in df.columns:
+        return ~(df[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS) | is_event_client)
+    return ~is_event_client
 
 
 def pick_industry(row):
@@ -301,44 +335,59 @@ def pick_industry(row):
     return ''
 
 
+def _kw_regex(stems, words=()):
+    """Регулярка: stems — с начала слова (основы), words — только целым словом."""
+    parts = [re.escape(s) for s in stems] + [re.escape(w) + r'(?!\w)' for w in words]
+    return re.compile(r'(?<!\w)(?:' + '|'.join(parts) + ')')
+
+
+_EXPO_RE = _kw_regex(['выстав', 'expo', 'expо', 'стенд', 'форум', 'конгресс', 'ярмарк',
+                      'фестиваль', 'ивент'], ['event', 'events'])
+_ADS_RE = _kw_regex(['реклам', 'размещ', 'баннер', 'промо', 'digital', 'диджитал',
+                     'программатик', 'programmatic', 'performance', 'перфоманс',
+                     'таргет', 'target', 'охват', 'спецпроект', 'интеграц', 'медиа'],
+                    ['cpm', 'cpc', 'cpp', 'media', 'показ', 'показы', 'показов'])
+_MARKETING_RE = _kw_regex(['маркет', 'бренд', 'branding', 'пиар', 'контент',
+                           'исслед', 'аналит', 'стратег', 'консалт', 'коммуникац'],
+                          ['pr', 'smm'])
+
+
 def classify_industry(row):
-    raw = str(row.get('ОТРАСЛЬ_КЛИЕНТА', '')).strip().lower()
-    text = (
-        str(row.get(COL_POS_ORDER, '') or '') + ' ' +
-        str(row.get(COL_DESCRIPTION, '') or '') + ' ' +
-        str(row.get(COL_NOMEN, '') or '') + ' ' +
-        str(row.get('КОНЕЧНЫЙ_КЛИЕНТ', '') or '')
-    ).lower()
+    """
+    Отрасль клиента из CRM как есть. Текст заказа (позиция, описание, номенклатура)
+    используется только чтобы разбить отрасль «Реклама, маркетинг, выставки»
+    (или пустую) на Выставки / Реклама / Маркетинг.
+
+    Раньше эвристика применялась ко всем отраслям, а почти любой заказ медиахолдинга
+    содержит «размещение»/«баннер»/«реклама» — поэтому банки, издательства,
+    производство и т.д. массово уходили в «Рекламу».
+    """
+    orig = row.get('ОТРАСЛЬ_КЛИЕНТА', '')
+    raw = str(orig if pd.notna(orig) else '').strip().lower()
 
     if any(x in raw for x in ['строит', 'строй', 'недвиж']):
         return 'Строительство + Недвижимость'
+
     if raw in ['маркетинг', 'реклама', 'выставки']:
         return raw.capitalize()
 
-    expo_keywords = ['выстав', 'expo', 'expо', 'стенд', 'форум', 'конгресс', 'ярмарк', 'фестиваль', 'event', 'ивент']
-    if any(k in text for k in expo_keywords):
+    is_marketing_industry = any(x in raw for x in ['реклам', 'маркет', 'выстав'])
+    if raw and not is_marketing_industry:
+        return orig
+
+    text = ' '.join(
+        str(v) for v in (row.get(COL_POS_ORDER), row.get(COL_DESCRIPTION),
+                         row.get(COL_NOMEN), row.get('КОНЕЧНЫЙ_КЛИЕНТ'))
+        if v is not None and pd.notna(v)
+    ).lower()
+
+    if _EXPO_RE.search(text):
         return 'Выставки'
-
-    ads_keywords = [
-        'реклам', 'размещ', 'баннер', 'промо', 'digital', 'диджитал',
-        'программатик', 'programmatic', 'performance', 'перфоманс',
-        'таргет', 'target', 'cpm', 'cpc', 'cpp', 'охват', 'показ',
-        'спецпроект', 'интеграц', 'media', 'медиа'
-    ]
-    if any(k in text for k in ads_keywords):
+    if _ADS_RE.search(text):
         return 'Реклама'
-
-    marketing_keywords = [
-        'маркет', 'бренд', 'branding', 'pr', 'пиар', 'smm', 'контент',
-        'исслед', 'аналит', 'стратег', 'консалт', 'коммуникац'
-    ]
-    if any(k in text for k in marketing_keywords):
+    if _MARKETING_RE.search(text):
         return 'Маркетинг'
-
-    if 'маркетинг, реклама, выставки' in raw:
-        return 'Маркетинг'
-
-    return row.get('ОТРАСЛЬ_КЛИЕНТА', '')
+    return orig
 
 def categorize_revenue_amount(v):
     if pd.isna(v):
@@ -437,9 +486,11 @@ def get_external_monthly_totals(external_json_path):
     months = [f"{m:02d}" for m in range(1, 13)]
     monthly_total = {m: 0.0 for m in months}
 
-    # Если задан список — берём только его, иначе все не-служебные
-    include_list = ext.get('_включать_в_аналитику')
-    if include_list:
+    # Если ключ задан — берём только его (пустой список = ничего не добавлять),
+    # иначе все не-служебные строки. Раньше пустой список трактовался как
+    # «ключа нет», и в аналитику попадали все статьи, включая вычеты и закупку.
+    if '_включать_в_аналитику' in ext:
+        include_list = ext.get('_включать_в_аналитику') or []
         rows_to_sum = [r for r in include_list if r in ext and isinstance(ext[r], dict)]
     else:
         rows_to_sum = [
@@ -505,9 +556,11 @@ def get_external_totals_by_category(external_json_path):
         'ecom':         E-com,
         '47_plan':      47News в план (реальная выручка),
         'other':        остальные доходные статьи,
-        'deductions':   взаимозачёты/затраты/корректировки (со знаком, обычно отриц.),
+        'deductions':   взаимозачёты/затраты/корректировки — сумма модулей
+                        (в JSON закупка/взаимозачёты положительные, корректировка
+                        скидки отрицательная, но все они уменьшают доход),
         'total_income': всё кроме deductions,
-        'total_net':    total_income + deductions (итог для сверки),
+        'total_net':    total_income - deductions,
     }
     """
     if not external_json_path or not os.path.exists(external_json_path):
@@ -550,13 +603,13 @@ def get_external_totals_by_category(external_json_path):
         elif key in PLAN47_KEYS:
             cats['47_plan'] += s
         elif key in DEDUCT_KEYS:
-            cats['deductions'] += s
+            cats['deductions'] += abs(s)
         else:
             cats['other'] += s
 
     cats['total_income'] = sum(cats[k] for k in ('programmatic','barter','iri_grants',
                                                    'recsys','ecom','47_plan','other'))
-    cats['total_net'] = cats['total_income'] + cats['deductions']
+    cats['total_net'] = cats['total_income'] - cats['deductions']
     return cats
 
 
@@ -845,6 +898,35 @@ def parse_month(s):
         return None
 
 
+def parse_dates(series):
+    """
+    Разбирает колонку дат из выгрузки CRM. Даты приходят строками 'ДД.ММ.ГГГГ'
+    вперемешку с датами Excel. Без явного формата pandas угадывает его по первой
+    строке: '05.03.2025' читается как 3 мая, а все дни >12 превращаются в NaT.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    result = pd.to_datetime(series.where(series.map(lambda v: isinstance(v, str))).str.strip(),
+                            format='%d.%m.%Y', errors='coerce')
+    rest = result.isna() & series.notna()
+    if rest.any():
+        result.loc[rest] = series.loc[rest].map(
+            lambda v: pd.to_datetime(v, dayfirst=True, errors='coerce'))
+    return pd.to_datetime(result, errors='coerce')
+
+
+def external_json_year(external_json_path):
+    """Отчётный год из external_income.json ('_год') или None."""
+    if not external_json_path or not os.path.exists(external_json_path):
+        return None
+    try:
+        with open(external_json_path, 'r', encoding='utf-8') as f:
+            y = json.load(f).get('_год')
+        return int(y) if isinstance(y, (int, float)) else None
+    except Exception:
+        return None
+
+
 def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
     """
     Строит бухгалтерскую таблицу в стиле Доходы_2025.xlsx.
@@ -950,12 +1032,14 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
     # Выручка 47 (закупка) — тоже вычет
     deduction_rows.append('Выручка 47 (закупка)')
 
-    # Считаем итог в бюджет отдела
+    # Считаем итог в бюджет отдела. Корректировка скидки хранится в JSON со знаком
+    # минус — вычитаем её модуль, иначе «минус минус» увеличивал бюджет.
     budget_monthly = dict(commercial_monthly)
     for rn in deduction_rows:
         if rn in row_totals:
             for m in months:
-                budget_monthly[m] -= row_totals[rn].get(m, 0)
+                v = row_totals[rn].get(m, 0)
+                budget_monthly[m] -= abs(v) if rn == 'Корректировка скидки (комиссия ХШМ)' else v
 
     budget_total = sum(budget_monthly.values())
     rows.append({
@@ -1021,6 +1105,23 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
             })
 
 
+    # Контроль: CRM-выручка отчётного года, не попавшая ни в одну строку таблицы
+    # (проект отсутствует в ACCOUNTING_ROWS) — иначе она теряется молча.
+    mapped_projects = {p for _, projects in ACCOUNTING_ROWS for p in projects}
+    year_mask = df_full['_year_num'] == analysis_year
+    if COL_PROJECT in df_full.columns:
+        unmapped = df_full.loc[year_mask & ~df_full[COL_PROJECT].isin(mapped_projects)]
+        unmapped_monthly = {
+            m: round(unmapped.loc[unmapped['_month_num'] == m, revenue_col].sum() / 1000, 2)
+            for m in months
+        }
+        rows.append({'Показатель': '── Справочно ──', **{m: '' for m in months}, 'Total': ''})
+        rows.append({
+            'Показатель': 'CRM вне строк таблицы (проверить маппинг)',
+            **unmapped_monthly,
+            'Total': round(sum(unmapped_monthly.values()), 2),
+        })
+
     # Собираем DataFrame
     columns = ['Показатель'] + [month_labels[m] for m in months] + ['Total']
     df_out = pd.DataFrame([
@@ -1031,8 +1132,23 @@ def build_accounting_table(df_full, revenue_col, external_json_path, log=print):
     return df_out
 
 
+def _closed_months(monthly_stats):
+    """
+    Месячная статистика без текущего (незакрытого) и будущих месяцев,
+    с колонкой '_ord' = год*12+месяц (для тренда с учётом пропущенных месяцев).
+    Иначе неполный текущий месяц выглядит как «падение» и тянет прогноз вниз.
+    """
+    if monthly_stats is None or monthly_stats.empty:
+        return monthly_stats
+    dt = pd.to_datetime(monthly_stats['Период'], format='%m.%Y', errors='coerce')
+    month_start = pd.Timestamp.today().normalize().replace(day=1)
+    ms = monthly_stats.loc[dt < month_start].copy()
+    ms['_ord'] = dt[dt < month_start].dt.year * 12 + dt[dt < month_start].dt.month
+    return ms.reset_index(drop=True)
+
+
 def build_signals(df_full, revenue_col, monthly_stats, manager_stats, client_stats,
-                  rfm_all, mask_no_events, log=print):
+                  rfm_all, mask_no_events, log=print, client_mask=None):
     """
     Автоматически находит аномалии и сигналы в данных.
     Возвращает DataFrame с колонками: Приоритет, Категория, Сигнал, Детали.
@@ -1044,21 +1160,26 @@ def build_signals(df_full, revenue_col, monthly_stats, manager_stats, client_sta
                         'Сигнал': signal, 'Детали': details})
 
     # ── 1. Аномалии по месяцам ───────────────────────────────
+    monthly_stats = _closed_months(monthly_stats)
     if monthly_stats is not None and len(monthly_stats) >= 3:
         rev = monthly_stats['Сумма выручки, тыс. руб.']
         mean_rev = rev.mean()
         std_rev  = rev.std()
         periods  = monthly_stats['Период'].tolist()
 
-        for i, (period, val) in enumerate(zip(periods, rev)):
-            if std_rev > 0 and abs(val - mean_rev) > 2 * std_rev:
-                direction = '🔺 аномально высокая' if val > mean_rev else '🔻 аномально низкая'
-                add('🔴 Высокий', 'Месячная выручка',
-                    f'{period}: {direction} выручка',
-                    f'{val:,.0f} тыс. vs среднее {mean_rev:,.0f} тыс. (±{std_rev:,.0f})')
+        # При n<=5 отклонение одной точки от среднего математически не может
+        # превысить 2σ (выборочное std) — проверка имеет смысл от 6 месяцев.
+        if len(rev) >= 6:
+            for period, val in zip(periods, rev):
+                if std_rev > 0 and abs(val - mean_rev) > 2 * std_rev:
+                    direction = '🔺 аномально высокая' if val > mean_rev else '🔻 аномально низкая'
+                    add('🔴 Высокий', 'Месячная выручка',
+                        f'{period}: {direction} выручка',
+                        f'{val:,.0f} тыс. vs среднее {mean_rev:,.0f} тыс. (±{std_rev:,.0f})')
 
-        # Падение последних двух месяцев подряд
-        if len(rev) >= 3:
+        # Падение три месяца подряд (только смежные месяцы, без пропусков)
+        ords = monthly_stats['_ord'].tolist()
+        if len(rev) >= 3 and ords[-1] - ords[-3] == 2:
             last3 = rev.iloc[-3:].tolist()
             if last3[2] < last3[1] < last3[0]:
                 add('🟡 Средний', 'Тренд',
@@ -1098,8 +1219,13 @@ def build_signals(df_full, revenue_col, monthly_stats, manager_stats, client_sta
                     ', '.join(client_stats.head(5)['КОНЕЧНЫЙ_КЛИЕНТ'].tolist()))
 
     # ── 3. Клиенты с одним заказом (риск оттока) ─────────────
+    # Считаем уникальные заказы, а не строки выгрузки (у одного заказа много
+    # строк-позиций), и по тем же клиентам, что и топ клиентов (без мероприятий).
     if 'КОНЕЧНЫЙ_КЛИЕНТ' in df_full.columns:
-        order_counts = df_full.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[revenue_col].agg(['count', 'sum'])
+        src = df_full if client_mask is None else df_full.loc[client_mask]
+        order_counts = src.groupby('КОНЕЧНЫЙ_КЛИЕНТ').agg(
+            count=(COL_ORDER if COL_ORDER in src.columns else revenue_col, 'nunique'),
+            sum=(revenue_col, 'sum'))
         single_order = order_counts[order_counts['count'] == 1]
         single_rev_share = single_order['sum'].sum() / order_counts['sum'].sum() * 100 if order_counts['sum'].sum() > 0 else 0
         add('🟡 Средний' if single_rev_share > 30 else '🟢 Инфо', 'Лояльность',
@@ -1351,18 +1477,20 @@ def run_data_quality_checks(df, log=print):
                 f"выручкой (сторно/корректировки?) — включены в расчёты, не критично")
 
     if COL_DATE in df.columns:
-        temp_dates = pd.to_datetime(df[COL_DATE], errors='coerce')
+        temp_dates = parse_dates(df[COL_DATE])
         report['Некорректные/пропущенные даты'] = temp_dates.isna().sum()
         report['Будущие даты'] = (temp_dates > pd.Timestamp.today()).sum()
         if report['Будущие даты'] > 0:
             log(f"⚠ Предупреждение: {report['Будущие даты']} дат в будущем (не критично)")
 
     if any(c in df.columns for c in [COL_CLIENT, COL_CLIENT_RA, COL_REKLAMD]):
-        report['Пустые поля клиентов (суммарно)'] = sum(
-            (df[col].astype(str).str.strip() == '').sum()
-            for col in [COL_CLIENT_RA, COL_CLIENT, COL_REKLAMD]
-            if col in df.columns
-        )
+        # Строки, где не заполнено НИ ОДНО поле клиента (раньше NaN превращался
+        # в строку 'nan' и счётчик почти всегда показывал 0).
+        client_cols = [c for c in [COL_CLIENT_RA, COL_CLIENT, COL_REKLAMD] if c in df.columns]
+        filled = pd.concat(
+            [df[c].notna() & (df[c].astype(str).str.strip() != '') for c in client_cols], axis=1
+        ).any(axis=1)
+        report['Строк без клиента'] = int((~filled).sum())
 
     if COL_REVENUE in df.columns:
         try:
@@ -1379,8 +1507,24 @@ def run_data_quality_checks(df, log=print):
 # ГЛАВНАЯ ФУНКЦИЯ — запускается из app.py
 # ============================================================
 
+def _json_candidates(explicit, filename, input_path):
+    """
+    Порядок поиска JSON-справочника: явный путь (из GUI) → папка приложения
+    (её правят редакторы) → папка входного файла → текущий каталог.
+    Раньше папка приложения шла последней, и копия рядом с выгрузкой молча
+    перекрывала правки, сделанные в редакторе.
+    """
+    return [p for p in (
+        explicit,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
+        os.path.join(os.path.dirname(input_path), filename),
+        filename,
+    ) if p]
+
+
 def run_analytics(input_path: str, output_path: str, log=print,
-                  manager_plan: dict = None, date_by: str = 'order'):
+                  manager_plan: dict = None, date_by: str = 'order',
+                  verified_path: str = None, external_path: str = None):
     """
     Запускает полный цикл аналитики.
     input_path   — путь к входному .xlsx
@@ -1404,16 +1548,11 @@ def run_analytics(input_path: str, output_path: str, log=print,
 
     # ── 0. Загрузка verified_figures.json (или fallback на константы) ──
     verified = None
-    vf_candidates = [
-        os.path.join(os.path.dirname(input_path), VERIFIED_FIGURES_JSON),
-        VERIFIED_FIGURES_JSON,
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), VERIFIED_FIGURES_JSON),
-    ]
-    for vf_path in vf_candidates:
+    for vf_path in _json_candidates(verified_path, VERIFIED_FIGURES_JSON, input_path):
         if os.path.exists(vf_path):
             verified = load_verified_figures(vf_path)
             if verified:
-                log(f"Верифицированные цифры подгружены из {os.path.basename(vf_path)}")
+                log(f"Верифицированные цифры подгружены из {os.path.abspath(vf_path)}")
                 break
 
     if verified:
@@ -1463,13 +1602,6 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # ── 6. Клиенты и нормализация ────────────────────────────
     df_full['КОНЕЧНЫЙ_КЛИЕНТ'] = df_full.apply(pick_client, axis=1)
     df_full['КОНЕЧНЫЙ_КЛИЕНТ'] = df_full['КОНЕЧНЫЙ_КЛИЕНТ'].apply(normalize_client)
-
-    # \b — граница слова: без неё подстрока 'ФЕСТ' ложно ловила бы клиентов вроде
-    # «Манифест групп» или «Инфест», у которых 'ФЕСТ' — часть другого слова.
-    df_full['IS_EVENT_CLIENT'] = (
-        df_full['КОНЕЧНЫЙ_КЛИЕНТ'].str.upper()
-        .str.contains(r'\b(?:ФЕСТ|МЕРОПРИЯТИ)', na=False, regex=True)
-    )
 
     # ── 7. Отрасли ───────────────────────────────────────────
     df_full['ОТРАСЛЬ_КЛИЕНТА'] = df_full.apply(pick_industry, axis=1)
@@ -1588,18 +1720,15 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # чтобы итоги совпадали с бухгалтерией. Клиенты/менеджеры/отрасли не трогаем.
     ext_monthly = None
     _ext_json_found = None
-    json_candidates = [
-        os.path.join(os.path.dirname(input_path), EXTERNAL_INCOME_JSON),
-        EXTERNAL_INCOME_JSON,
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), EXTERNAL_INCOME_JSON),
-    ]
-    for json_path in json_candidates:
+    for json_path in _json_candidates(external_path, EXTERNAL_INCOME_JSON, input_path):
         if os.path.exists(json_path):
             ext_monthly = get_external_monthly_totals(json_path)
             _ext_json_found = json_path
             if ext_monthly:
-                log(f"Внешние доходы подгружены: {sum(ext_monthly.values())/1000:,.0f} тыс. руб.")
+                log(f"Внешние доходы подгружены: {sum(ext_monthly.values())/1000:,.0f} тыс. руб. "
+                    f"({os.path.abspath(json_path)})")
             break
+    ext_year = external_json_year(_ext_json_found)
 
     validate_analytics_consistency(verified, _ext_json_found, log=log)
     external_quality_report = build_external_income_quality_report(_ext_json_found, verified)
@@ -1681,12 +1810,23 @@ def run_analytics(input_path: str, output_path: str, log=print,
         # Добавляем колонки с внешними доходами, если JSON есть
         if ext_monthly is not None:
             def get_ext(period):
-                # period формат '07.2025' → ключ '07'
+                # period формат '07.2025' → ключ '07'. Внешние доходы в JSON — за
+                # один год ('_год'), поэтому к месяцам других лет их не добавляем.
                 try:
-                    m = str(period).split('.')[0].zfill(2)
-                    return ext_monthly.get(m, 0) / 1000  # в тыс. руб.
+                    m, y = str(period).split('.')
+                    if ext_year and int(y) != ext_year:
+                        return 0
+                    return ext_monthly.get(m.zfill(2), 0) / 1000  # в тыс. руб.
                 except Exception:
                     return 0
+
+            _other_years = sorted({
+                int(p.split('.')[1]) for p in monthly_stats['Период']
+                if ext_year and int(p.split('.')[1]) != ext_year
+            })
+            if _other_years:
+                log(f"⚠ external_income.json за {ext_year} год — к месяцам "
+                    f"{', '.join(map(str, _other_years))} г. внешние доходы не добавлены")
 
             monthly_stats['Внешние доходы, тыс. руб.'] = (
                 monthly_stats['Период'].apply(get_ext).round(2)
@@ -1704,9 +1844,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
 
     # ── 11. Топ клиентов ─────────────────────────────────────
     log("Считаю топ клиентов...")
-    client_df_for_rank = df_full.loc[
-        ~(df_full[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS) | df_full['IS_EVENT_CLIENT'])
-    ] if COL_PROJECT in df_full.columns else df_full
+    client_df_for_rank = df_full.loc[client_rank_mask(df_full)]
     client_stats = _rev_stats(client_df_for_rank, 'КОНЕЧНЫЙ_КЛИЕНТ', revenue_col)
 
     # ── 12. Топ менеджеров ───────────────────────────────────
@@ -1740,21 +1878,48 @@ def run_analytics(input_path: str, output_path: str, log=print,
     )
     unclassified_projects = build_unclassified_projects_report(df_full, revenue_col)
 
+    # ── Год сверки ───────────────────────────────────────────
+    # Верифицированные цифры и external_income.json — годовые. CRM для сверки
+    # берём только за этот год (по колонке 'Месяц'), иначе выгрузка за 13+
+    # месяцев или за другой год сравнивается с годовым итогом бухгалтерии.
+    recon_year = None
+    if isinstance(verified, dict) and isinstance(verified.get('_год'), (int, float)):
+        recon_year = int(verified['_год'])
+    elif ext_year:
+        recon_year = ext_year
+    recon_mask = pd.Series(True, index=df_full.index)
+    recon_applicable = True
+    if recon_year and 'Дата_месяц' in df_full.columns:
+        _rm = df_full['Дата_месяц'].map(lambda d: pd.notna(d) and d.year == recon_year)
+        if _rm.any():
+            recon_mask = _rm.astype(bool)
+            _skipped = int((~recon_mask).sum())
+            if _skipped:
+                log(f"Сверка с бухгалтерией за {recon_year} г.: {_skipped} строк других "
+                    f"периодов в сверку не включены")
+        else:
+            recon_applicable = False
+            log(f"⚠ В выгрузке нет строк за {recon_year} г. (год verified_figures/"
+                f"external_income) — сверка с бухгалтерией не применима")
+    recon_label = f' ({recon_year})' if recon_year and recon_applicable else ''
+
     # Сводка по группам — CRM vs бухгалтерия (без попытки сложить, чтобы не дублировать)
-    crm_ads      = df_full.loc[df_full['БИЗНЕС_ГРУППА'].isin(['Реклама Фонтанка', 'Реклама Доктор']), revenue_col].sum()
-    crm_prog     = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'Программатик', revenue_col].sum()
-    crm_events   = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'Мероприятия', revenue_col].sum()
-    crm_47other  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == '47News / Прочее', revenue_col].sum()
-    crm_unclass  = df_full.loc[df_full['БИЗНЕС_ГРУППА'] == 'НЕ КЛАССИФИЦИРОВАНО', revenue_col].sum()
-    crm_total    = df_full[revenue_col].sum()
+    _grp = df_full['БИЗНЕС_ГРУППА']
+    _rev_r = df_full[revenue_col].where(recon_mask)
+    crm_ads      = _rev_r[_grp.isin(['Реклама Фонтанка', 'Реклама Доктор'])].sum()
+    crm_prog     = _rev_r[_grp == 'Программатик'].sum()
+    crm_events   = _rev_r[_grp == 'Мероприятия'].sum()
+    crm_47other  = _rev_r[_grp == '47News / Прочее'].sum()
+    crm_unclass  = _rev_r[_grp == 'НЕ КЛАССИФИЦИРОВАНО'].sum()
+    crm_total    = _rev_r.sum()
     # rev_reklama/rev_bez_prog нужны уже в group_summary_rows — считаем здесь.
     # rev_bez_prog обязательно строим через mask_no_prog (regex по названию проекта),
     # а не через БИЗНЕС_ГРУППА=='Программатик' (crm_prog выше) — это разные фильтры
     # (crm_prog требует точного совпадения имени проекта из PROJECT_GROUP_MAP), и их
     # смешение в одном расчёте делало "CRM минус программатик" не равным "CRM без
     # программатика" в мосте сверки при малейшем расхождении в написании проекта.
-    rev_reklama  = df_full.loc[mask_no_prog & mask_no_events, revenue_col].sum() / 1000
-    rev_bez_prog = df_full.loc[mask_no_prog, revenue_col].sum() / 1000
+    rev_reklama  = df_full.loc[mask_no_prog & mask_no_events & recon_mask, revenue_col].sum() / 1000
+    rev_bez_prog = df_full.loc[mask_no_prog & recon_mask, revenue_col].sum() / 1000
 
     # Факт из external_income.json по категориям
     _ext_cats_gs = get_external_totals_by_category(_ext_json_found) if _ext_json_found else {}
@@ -1782,7 +1947,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     vf_ads_k = vf_ads_no_events / 1000 if vf_ads_no_events else None
 
     group_summary_rows = [
-        ('═══ CRM (расчёт по выгрузке) ═══', ''),
+        (f'═══ CRM (расчёт по выгрузке){recon_label} ═══', ''),
         ('Реклама Фонтанка + Доктор, тыс. руб.',  round(crm_ads / 1000, 2)),
         ('Программатик (CRM-часть), тыс. руб.',   round(crm_prog / 1000, 2)),
         ('Мероприятия, тыс. руб.',                round(crm_events / 1000, 2)),
@@ -1840,7 +2005,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
 
     # Разбираем дату заказа один раз — используется в сезонности и RFM
     if COL_DATE in df_full.columns:
-        df_full['Дата_заказа'] = pd.to_datetime(df_full[COL_DATE], errors='coerce')
+        df_full['Дата_заказа'] = parse_dates(df_full[COL_DATE])
     crm_issue_rows = build_crm_issue_rows(df_full, revenue_col)
 
     # ── 14. Сезонность ───────────────────────────────────────
@@ -1850,8 +2015,11 @@ def run_analytics(input_path: str, output_path: str, log=print,
         log("Считаю сезонность...")
         df_full['Месяц_число'] = df_full['Дата_заказа'].dt.month
         df_full['Квартал'] = df_full['Дата_заказа'].dt.quarter
+        # Без даты — None (выпадает из группировки, как и в кварталах);
+        # раньше такие строки попадали в «Осень».
         df_full['Сезон'] = df_full['Месяц_число'].apply(
-            lambda x: 'Зима' if x in [12,1,2] else
+            lambda x: None if pd.isna(x) else
+                      'Зима' if x in [12,1,2] else
                       'Весна' if x in [3,4,5] else
                       'Лето' if x in [6,7,8] else 'Осень'
         )
@@ -1878,7 +2046,18 @@ def run_analytics(input_path: str, output_path: str, log=print,
         quarterly_stats = quarterly_stats.reset_index()
 
         # ── Добавляем внешние доходы по кварталам и сезонам ──
-        if ext_monthly is not None:
+        # Только если выгрузка целиком за год внешних доходов: кварталы/сезоны
+        # не разделены по годам, и внешние за один год нельзя прибавить к сумме
+        # нескольких лет.
+        _crm_years = (
+            set(df_full['Дата_месяц'].dropna().map(lambda d: d.year))
+            if 'Дата_месяц' in df_full.columns else set()
+        )
+        _ext_fits = ext_year is None or not _crm_years or _crm_years == {ext_year}
+        if ext_monthly is not None and not _ext_fits:
+            log(f"⚠ Кварталы/сезоны: выгрузка за {sorted(_crm_years)}, внешние доходы за "
+                f"{ext_year} — внешние не добавлены")
+        if ext_monthly is not None and _ext_fits:
             month_to_quarter = {
                 '01': 1, '02': 1, '03': 1,
                 '04': 2, '05': 2, '06': 2,
@@ -1918,13 +2097,12 @@ def run_analytics(input_path: str, output_path: str, log=print,
             log("Провожу RFM-анализ...")
             current_date = df_full['Дата_заказа'].max()
 
-            rfm_source = df_full.loc[
-                ~(df_full[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS) | df_full['IS_EVENT_CLIENT'])
-            ] if COL_PROJECT in df_full.columns else df_full
+            rfm_source = client_df_for_rank
 
             rfm_data = (
                 rfm_source.groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-                .agg({'Дата_заказа': 'max', COL_ORDER: 'count', revenue_col: 'sum'})
+                # nunique, а не count: у одного заказа много строк-позиций
+                .agg({'Дата_заказа': 'max', COL_ORDER: 'nunique', revenue_col: 'sum'})
                 .reset_index()
                 .rename(columns={
                     'Дата_заказа': 'Последняя_покупка',
@@ -1953,14 +2131,19 @@ def run_analytics(input_path: str, output_path: str, log=print,
             rfm_data['M'] = rfm_data['Monetary_thousands'].apply(score_m)
             rfm_data['RFM_Score'] = rfm_data[['R','F','M']].sum(axis=1)
 
-            def segment_customer(score):
-                if score >= 10: return 'Champions'
-                elif score >= 8: return 'Loyal Customers'
-                elif score >= 6: return 'Potential Loyalists'
-                elif score >= 4: return 'At Risk'
-                else: return 'Hibernating'
+            # Сегмент — по сочетанию давности (R) и ценности (F/M), а не по сумме
+            # баллов: при сумме «At Risk» получали и недавние мелкие клиенты, хотя
+            # смысл сегмента — ценные клиенты, которые давно не покупали.
+            def segment_customer(r):
+                recent = r['R'] >= 3
+                valuable = r['F'] >= 3 or r['M'] >= 3
+                if recent and r['F'] >= 3 and r['M'] >= 3: return 'Champions'
+                if recent and valuable: return 'Loyal Customers'
+                if recent: return 'Potential Loyalists'
+                if valuable: return 'At Risk'
+                return 'Hibernating'
 
-            rfm_data['Segment'] = rfm_data['RFM_Score'].apply(segment_customer)
+            rfm_data['Segment'] = rfm_data.apply(segment_customer, axis=1)
             rfm_all = rfm_data.sort_values(['RFM_Score','Monetary_thousands'], ascending=[False,False]).reset_index(drop=True)
 
             total_c = rfm_all['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
@@ -1985,7 +2168,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     log("Считаю лояльность клиентов...")
     client_order_stats = (
         df_full.groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        .agg({COL_ORDER: 'count', revenue_col: 'sum'}).round(2)
+        .agg({COL_ORDER: 'nunique', revenue_col: 'sum'}).round(2)
     )
     client_order_stats.columns = ['Количество заказов', 'Общая выручка, руб.']
     client_order_stats['Общая выручка, тыс. руб.'] = client_order_stats['Общая выручка, руб.'] / 1000
@@ -2004,7 +2187,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
 
     # Собираем сводку — CRM-расчёт и верифицированные цифры бухгалтерии
     summary_rows = [
-        ('— CRM (расчёт по выгрузке) —', ''),
+        (f'— CRM (расчёт по выгрузке){recon_label} —', ''),
         ('Выручка: все заказы в CRM, тыс. руб.', round(rev_all, 2)),
         ('Выручка: CRM без программатика, тыс. руб.', round(rev_bez_prog, 2)),
         ('Выручка: CRM рекламная без мероприятий, тыс. руб.', round(rev_reklama, 2)),
@@ -2090,7 +2273,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
         ('═══ CRM (выгрузка) ═══', '', '', ''),
         ('Строк в исходнике',           len(df_raw_for_compare),       '',    ''),
         ('Строк после очистки',         len(df_full),                  '',    ''),
-        ('CRM итого, тыс. руб.',        round(rev_all, 2),             '',    ''),
+        (f'CRM итого{recon_label}, тыс. руб.', round(rev_all, 2),      '',    ''),
         ('CRM без программатика, тыс.', round(rev_bez_prog, 2),        '',    ''),
         ('CRM рекламная (без мер.), тыс.', round(rev_reklama, 2),      '',    ''),
     ]
@@ -2173,25 +2356,34 @@ def run_analytics(input_path: str, output_path: str, log=print,
     )
 
     # ── 18. Прогноз ──────────────────────────────────────────
+    # Только закрытые месяцы; ось X — номер месяца (год*12+мес), а не индекс
+    # строки, чтобы пропущенные месяцы не сжимали шкалу времени.
     forecast_summary = None
-    if monthly_stats is not None and len(monthly_stats) >= 3:
-        ts = monthly_stats.set_index('Период')['Сумма выручки, тыс. руб.']
-        months = np.arange(len(ts))
-        coeff = np.polyfit(months, ts.values, 1)
-        forecast_value = coeff[0] * len(months) + coeff[1]
+    closed_ms = _closed_months(monthly_stats)
+    if closed_ms is not None and len(closed_ms) >= 3:
+        x = closed_ms['_ord'].to_numpy(dtype=float)
+        y = closed_ms['Сумма выручки, тыс. руб.'].to_numpy(dtype=float)
+        coeff = np.polyfit(x, y, 1)
+        next_ord = int(x[-1]) + 1
+        forecast_value = coeff[0] * next_ord + coeff[1]
         trend = "↑ растёт" if coeff[0] > 0 else "↓ падает"
-        strength = abs(coeff[0]) / ts.values.mean() * 100
+        strength = abs(coeff[0]) / y.mean() * 100 if y.mean() else 0
+        next_period = f"{(next_ord - 1) % 12 + 1:02d}.{(next_ord - 1) // 12}"
 
         forecast_summary = pd.DataFrame({
             'Метрика': [
                 'Прогноз выручки на след. месяц, тыс. руб.',
+                'Прогнозируемый период',
                 'Направление тренда',
-                'Сила тренда, % от среднего'
+                'Сила тренда, % от среднего',
+                'Месяцев в расчёте (закрытых)',
             ],
             'Значение': [
                 round(forecast_value, 2),
+                next_period,
                 trend,
-                round(strength, 2)
+                round(strength, 2),
+                len(closed_ms),
             ]
         })
 
@@ -2200,6 +2392,15 @@ def run_analytics(input_path: str, output_path: str, log=print,
     if manager_plan and manager_stats is not None and len(manager_stats) > 0:
         log("Считаю выполнение плана...")
         plan_df = manager_stats.copy()
+        # Менеджеры с планом, но без продаж в выгрузке, тоже должны быть в таблице
+        missing = [m for m, p in manager_plan.items()
+                   if p and m not in set(plan_df[COL_MANAGER])]
+        if missing:
+            plan_df = pd.concat([plan_df, pd.DataFrame({
+                COL_MANAGER: missing,
+                'Сумма выручки, руб.': 0.0,
+                'Сумма выручки, тыс. руб.': 0.0,
+            })], ignore_index=True)
         plan_df['План, руб.'] = plan_df[COL_MANAGER].map(manager_plan).fillna(0)
         plan_df['План, тыс. руб.'] = (plan_df['План, руб.'] / 1000).round(2)
         plan_df['Выполнение, %'] = plan_df.apply(
@@ -2212,10 +2413,12 @@ def run_analytics(input_path: str, output_path: str, log=print,
             if r['План, руб.'] > 0 else None,
             axis=1
         )
+        # pd.notna, а не `is not None`: после apply пустые значения — NaN,
+        # и менеджеры без плана получали статус «Отстаёт».
         plan_df['Статус'] = plan_df['Выполнение, %'].apply(
-            lambda x: '✅ Выполнен' if x is not None and x >= 100
-            else ('⚠ В работе' if x is not None and x >= 70
-            else ('❌ Отстаёт' if x is not None else '— нет плана'))
+            lambda x: '✅ Выполнен' if pd.notna(x) and x >= 100
+            else ('⚠ В работе' if pd.notna(x) and x >= 70
+            else ('❌ Отстаёт' if pd.notna(x) else '— нет плана'))
         )
         plan_stats = plan_df[[
             COL_MANAGER,
@@ -2362,7 +2565,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     log("Ищу сигналы и аномалии...")
     signals_df = build_signals(
         df_full, revenue_col, monthly_stats, manager_stats, client_stats,
-        rfm_all, mask_no_events, log=log
+        rfm_all, mask_no_events, log=log, client_mask=client_df_for_rank.index
     )
     extra_signals = []
     if unclassified_projects is not None and not unclassified_projects.empty:
@@ -2405,16 +2608,8 @@ def run_analytics(input_path: str, output_path: str, log=print,
     # ── 19г. Бухгалтерская таблица ───────────────────────────
     log("Строю бухгалтерскую таблицу...")
     accounting_table = None
-    # Ищем JSON рядом со входным файлом, потом в рабочей папке
-    json_candidates = [
-        os.path.join(os.path.dirname(input_path), EXTERNAL_INCOME_JSON),
-        EXTERNAL_INCOME_JSON,
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), EXTERNAL_INCOME_JSON),
-    ]
-    for json_path in json_candidates:
-        if os.path.exists(json_path):
-            accounting_table = build_accounting_table(df_full, revenue_col, json_path, log=log)
-            break
+    if _ext_json_found:
+        accounting_table = build_accounting_table(df_full, revenue_col, _ext_json_found, log=log)
     else:
         log(f"⚠ Файл {EXTERNAL_INCOME_JSON} не найден — бухгалтерская таблица не построена")
 
@@ -2614,9 +2809,13 @@ def run_analytics(input_path: str, output_path: str, log=print,
     log(f"✅ Готово! Отчёт сохранён: {output_path}")
 
     # ── Сводка расхождения для GUI ───────────────────────────
-    crm_total_k       = df_full[revenue_col].sum() / 1000
+    # Для сверки — только год сверки (recon_mask); оплаты — по году даты оплаты.
+    crm_total_k       = df_full.loc[recon_mask, revenue_col].sum() / 1000
+    _pay_recon = payments_df
+    if recon_year and recon_applicable and not payments_df.empty:
+        _pay_recon = payments_df.loc[payments_df['Дата_оплаты'].dt.year == recon_year]
     crm_paydate_total_k = (
-        payments_df['Сумма_оплаты'].sum() / 1000 if not payments_df.empty else 0
+        _pay_recon['Сумма_оплаты'].sum() / 1000 if not _pay_recon.empty else 0
     )
     # external_total_k — только программатик (используется в колонках месячной аналитики)
     external_total_k = sum(ext_monthly.values()) / 1000 if ext_monthly else 0
@@ -2630,7 +2829,7 @@ def run_analytics(input_path: str, output_path: str, log=print,
     verified_total_k = vf_total_with_prog / 1000 if vf_total_with_prog else 0
     deviation_pct = (
         (grand_total_k / verified_total_k - 1) * 100
-        if verified_total_k > 0 else None
+        if verified_total_k > 0 and recon_applicable else None
     )
     diagnostics = []
     if unclassified_projects is not None and not unclassified_projects.empty:

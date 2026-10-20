@@ -8,6 +8,9 @@ from tkinter import ttk, messagebox
 import json
 import os
 
+from analytics import parse_money
+from jsonio import save_json_atomic
+
 # Цвета — те же что в app.py (светлая/тёмная тема)
 C_ORANGE  = "#F38120"
 C_BORDER  = "#DEDEDE"
@@ -43,7 +46,9 @@ class ExternalIncomeEditor(tk.Toplevel):
         self.include_vars = {}     # {row_name: BooleanVar}
         self.plan_entries = {}     # {month: Entry widget}
 
-        self._load_data()
+        # При ошибке чтения окно уже уничтожено — UI не строим
+        if not self._load_data():
+            return
         self._build_ui()
 
         # Модальность
@@ -58,7 +63,7 @@ class ExternalIncomeEditor(tk.Toplevel):
                 f"Файл не найден:\n{self.json_path}\n\n"
                 "Создай его вручную или убедись что он рядом с analytics.py")
             self.destroy()
-            return
+            return False
         try:
             with open(self.json_path, 'r', encoding='utf-8') as f:
                 self.data = json.load(f)
@@ -66,7 +71,8 @@ class ExternalIncomeEditor(tk.Toplevel):
             messagebox.showerror("Ошибка чтения JSON",
                 f"Не удалось прочитать файл:\n{e}")
             self.destroy()
-            return
+            return False
+        return True
 
     # ── Построение интерфейса ────────────────────────────────
     def _build_ui(self):
@@ -110,9 +116,13 @@ class ExternalIncomeEditor(tk.Toplevel):
         scrollbar.pack(side='right', fill='y')
 
         # Скролл колесом мыши
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        # Через общий обработчик приложения: собственный bind_all перехватывал
+        # колесо глобально, и после закрытия окна главное окно не прокручивалось
+        if hasattr(self.master, '_bind_mousewheel'):
+            self.master._bind_mousewheel(canvas)
+        else:
+            canvas.bind_all('<MouseWheel>', lambda e: canvas.yview_scroll(
+                int(-1 * (e.delta / 120)), "units"))
 
         # Заголовок таблицы
         self._build_table_header(scrollable)
@@ -282,7 +292,7 @@ class ExternalIncomeEditor(tk.Toplevel):
         for m in MONTHS:
             var = self.entries.get((row_name, m))
             if var:
-                total += self._parse(var.get())
+                total += self._parse(var.get()) or 0.0
         total_var = self.entries.get((row_name, '_total_var'))
         if total_var:
             total_var.set(self._fmt(total))
@@ -292,19 +302,18 @@ class ExternalIncomeEditor(tk.Toplevel):
         for m in MONTHS:
             var = self.plan_entries.get(m)
             if var:
-                total += self._parse(var.get())
+                total += self._parse(var.get()) or 0.0
         if hasattr(self, '_plan_total_var'):
             self._plan_total_var.set(self._fmt(total))
 
     # ── Парсинг/форматирование ──────────────────────────────
     def _parse(self, s):
-        if not s:
+        """Число из ячейки; None — если не распозналось (пустая ячейка = 0)."""
+        if not str(s).strip():
             return 0.0
-        s = str(s).strip().replace(' ', '').replace(',', '.')
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
+        # parse_money понимает неразрывные пробелы и разные разделители,
+        # которые приходят при копировании из Excel
+        return parse_money(s)
 
     def _fmt(self, v):
         try:
@@ -313,7 +322,9 @@ class ExternalIncomeEditor(tk.Toplevel):
             return '0'
         if v == 0:
             return '0'
-        if abs(v) >= 1000:
+        # Копейки показываем всегда, когда они есть: _save читает значение
+        # обратно из поля, и округление при показе тихо портило данные.
+        if v == round(v):
             return f"{v:,.0f}".replace(',', ' ')
         return f"{v:,.2f}".replace(',', ' ')
 
@@ -321,6 +332,7 @@ class ExternalIncomeEditor(tk.Toplevel):
     def _save(self):
         # Пересобираем данные
         new_data = dict(self.data)  # копия с _описание, _год, служебными
+        bad_cells = []
 
         # Обновляем месячные суммы
         row_names = [k for k, v in self.data.items()
@@ -330,7 +342,10 @@ class ExternalIncomeEditor(tk.Toplevel):
             for m in MONTHS:
                 var = self.entries.get((name, m))
                 if var:
-                    new_data[name][m] = self._parse(var.get())
+                    v = self._parse(var.get())
+                    if v is None:
+                        bad_cells.append(f"{name}, {MONTH_LABELS[int(m) - 1]}: «{var.get()}»")
+                    new_data[name][m] = v
 
         # Обновляем список "включать в аналитику"
         new_data['_включать_в_аналитику'] = [
@@ -342,13 +357,23 @@ class ExternalIncomeEditor(tk.Toplevel):
         for m in MONTHS:
             var = self.plan_entries.get(m)
             if var:
-                plan[m] = self._parse(var.get())
+                v = self._parse(var.get())
+                if v is None:
+                    bad_cells.append(f"План группы, {MONTH_LABELS[int(m) - 1]}: «{var.get()}»")
+                plan[m] = v
         new_data['_план_группы_по_месяцам_руб'] = plan
+
+        # Нераспознанные числа не превращаем молча в 0 — просим исправить
+        if bad_cells:
+            messagebox.showerror(
+                "Не сохранено",
+                "Не удалось распознать числа:\n\n" + "\n".join(bad_cells[:15]) +
+                ("\n…" if len(bad_cells) > 15 else ""), parent=self)
+            return
 
         # Сохраняем
         try:
-            with open(self.json_path, 'w', encoding='utf-8') as f:
-                json.dump(new_data, f, ensure_ascii=False, indent=2)
+            save_json_atomic(self.json_path, new_data)
         except Exception as e:
             messagebox.showerror("Ошибка сохранения", str(e))
             return
