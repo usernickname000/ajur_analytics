@@ -3,322 +3,155 @@
 # Открывается как модальное окно из основного app.py
 # ============================================================
 
-import tkinter as tk
-from tkinter import ttk, messagebox
 import json
 import os
+import tkinter as tk
+from tkinter import messagebox, ttk
 
-# Цвета — те же что в app.py (светлая/тёмная тема)
-C_ORANGE  = "#F38120"
-C_BORDER  = "#DEDEDE"
+import ui_theme as ui
+from crm_data import parse_money
+from jsonio import save_json_atomic
+from ui_theme import T, px
 
 MONTHS = [f"{m:02d}" for m in range(1, 13)]
 MONTH_LABELS = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн',
                 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек']
 
 
-class ExternalIncomeEditor(tk.Toplevel):
+def _cell(parent, var, bold=False):
+    """Компактная ячейка таблицы: плоское поле с обводкой, акцент при фокусе."""
+    return tk.Entry(parent, textvariable=var, width=11, justify='right', relief='flat', bd=0,
+                    font=ui.FONTS['strong' if bold else 'body'], bg=T['card'], fg=T['text'],
+                    insertbackground=T['text'], highlightthickness=1,
+                    highlightbackground=T['stroke'], highlightcolor=T['accent'])
+
+
+class ExternalIncomeEditor(ui.FluentDialog):
     """
-    Модальное окно для редактирования external_income.json.
-    Показывает таблицу: строки = статьи доходов, колонки = 12 месяцев.
-    Позволяет редактировать суммы, переключать "включать в аналитику",
+    Таблица: строки = статьи доходов, колонки = 12 месяцев.
+    Позволяет редактировать суммы, переключать «в аналитике»,
     сохраняет обратно в JSON.
     """
 
-    def __init__(self, parent, json_path, theme=None):
-        super().__init__(parent)
-        self.title("Редактор внешних доходов")
-        self.geometry("1150x650")
+    def __init__(self, parent, json_path, **_):
         self.json_path = json_path
-        self.theme = theme or {
-            'bg': '#F5F5F5', 'surface': '#FFFFFF', 'text': '#1A1A1A',
-            'muted': '#777777', 'entry_bg': '#FAFAFA', 'border': C_BORDER
-        }
-        T = self.theme
-        self.configure(bg=T['bg'])
-
-        # Хранение данных
         self.data = {}
-        self.entries = {}          # {(row_name, month): Entry widget}
+        self.entries = {}          # {(row_name, month): StringVar}
         self.include_vars = {}     # {row_name: BooleanVar}
-        self.plan_entries = {}     # {month: Entry widget}
-
-        self._load_data()
+        self.plan_entries = {}     # {month: StringVar}
+        self._totals = {}          # {row_name: StringVar}
+        super().__init__(parent, "Внешние доходы",
+                         "Суммы в рублях. «В аналитике» — строка добавляется к CRM-выручке "
+                         "в месячной статистике (обычно только программатик).",
+                         size=(1500, 700), minsize=(900, 480))
+        # При ошибке чтения окно уже уничтожено — UI не строим
+        if not self._load_data():
+            return
         self._build_ui()
-
-        # Модальность
-        self.transient(parent)
-        self.grab_set()
-        self.focus_set()
+        self.show_modal(parent)
 
     # ── Загрузка JSON ────────────────────────────────────────
     def _load_data(self):
-        if not os.path.exists(self.json_path):
-            messagebox.showerror("Ошибка",
-                f"Файл не найден:\n{self.json_path}\n\n"
-                "Создай его вручную или убедись что он рядом с analytics.py")
-            self.destroy()
-            return
         try:
             with open(self.json_path, 'r', encoding='utf-8') as f:
                 self.data = json.load(f)
+            return True
         except Exception as e:
-            messagebox.showerror("Ошибка чтения JSON",
-                f"Не удалось прочитать файл:\n{e}")
+            messagebox.showerror("Ошибка чтения JSON", f"Не удалось прочитать файл:\n{e}", parent=self.master)
             self.destroy()
-            return
+            return False
 
     # ── Построение интерфейса ────────────────────────────────
     def _build_ui(self):
-        T = self.theme
+        outer, body = ui.card(self.body, pad=8)
+        outer.pack(fill='both', expand=True)
 
-        # Шапка
-        header = tk.Frame(self, bg=C_ORANGE, height=50)
-        header.pack(fill='x', side='top')
-        header.pack_propagate(False)
-        tk.Label(header, text="Редактор внешних доходов",
-                 bg=C_ORANGE, fg='white',
-                 font=('Segoe UI', 13, 'bold')).pack(side='left', padx=20, pady=12)
-
-        year = self.data.get('_год', 2025)
-        tk.Label(header, text=f"Год: {year}",
-                 bg=C_ORANGE, fg='white',
-                 font=('Segoe UI', 10)).pack(side='right', padx=20)
-
-        # Нотис
-        notice = tk.Frame(self, bg=T['bg'])
-        notice.pack(fill='x', padx=15, pady=(8, 4))
-        tk.Label(notice,
-                 text="Суммы в рублях. Столбец «В аналитике» — если галочка, "
-                      "строка суммируется с CRM-выручкой. Обычно это только программатик.",
-                 bg=T['bg'], fg=T['muted'],
-                 font=('Segoe UI', 9)).pack(side='left')
-
-        # Контейнер с прокруткой
-        main = tk.Frame(self, bg=T['bg'])
-        main.pack(fill='both', expand=True, padx=15, pady=(0, 10))
-
-        canvas = tk.Canvas(main, bg=T['bg'], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(main, orient='vertical', command=canvas.yview)
-        scrollable = tk.Frame(canvas, bg=T['bg'])
-
-        scrollable.bind('<Configure>',
-                        lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.create_window((0, 0), window=scrollable, anchor='nw')
-        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas = tk.Canvas(body, bg=T['card'], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(body, orient='vertical', command=canvas.yview,
+                                  style='Thin.Vertical.TScrollbar')
+        # Горизонтальная прокрутка — на узком экране 12 месяцев + итог не влезают
+        xscroll = ttk.Scrollbar(body, orient='horizontal', command=canvas.xview,
+                                style='Thin.Horizontal.TScrollbar')
+        table = tk.Frame(canvas, bg=T['card'])
+        table.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=table, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set, xscrollcommand=xscroll.set)
+        xscroll.pack(side='bottom', fill='x')
         canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
+        # Через общий обработчик приложения: собственный bind_all перехватывал
+        # колесо глобально, и после закрытия окна главное окно не прокручивалось
+        if hasattr(self.master, '_bind_mousewheel'):
+            self.master._bind_mousewheel(canvas)
 
-        # Скролл колесом мыши
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        # Заголовок
+        heads = ["Статья дохода", "В аналитике"] + MONTH_LABELS + ["Итого"]
+        for c, h in enumerate(heads):
+            ui.label(table, h, 'caption', fg='text2',
+                     anchor='w' if c == 0 else 'e' if c == 14 else 'center').grid(
+                row=0, column=c, sticky='ew', padx=px(3), pady=(px(4), px(6)))
 
-        # Заголовок таблицы
-        self._build_table_header(scrollable)
-
-        # Строки
         include_list = set(self.data.get('_включать_в_аналитику', []))
-        row_names = [k for k, v in self.data.items()
-                     if not k.startswith('_') and isinstance(v, dict)]
+        row_names = [k for k, v in self.data.items() if not k.startswith('_') and isinstance(v, dict)]
+        for i, name in enumerate(row_names, start=1):
+            self._build_row(table, i, name, self.data[name], name in include_list)
 
-        for i, name in enumerate(row_names):
-            self._build_row(scrollable, i + 1, name, self.data[name],
-                            in_analytics=name in include_list)
+        r = len(row_names) + 1
+        tk.Frame(table, bg=T['divider'], height=1).grid(row=r, column=0, columnspan=15, sticky='ew', pady=px(8))
+        self._build_plan_row(table, r + 1, self.data.get('_план_группы_по_месяцам_руб', {}))
 
-        # Строка плана группы
-        plan_data = self.data.get('_план_группы_по_месяцам_руб', {})
-        self._build_plan_row(scrollable, len(row_names) + 2, plan_data)
+        self.hint.configure(text="Tab — следующая ячейка · Esc — закрыть без сохранения")
+        self.add_button("Отмена", self.destroy)
+        self.add_button("Сохранить", self._save, kind="Accent")
 
-        # Кнопки внизу
-        btn_frame = tk.Frame(self, bg=T['bg'])
-        btn_frame.pack(fill='x', padx=15, pady=(5, 15))
-
-        tk.Button(btn_frame, text="Отмена",
-                  command=self.destroy,
-                  bg=T['surface'], fg=T['text'],
-                  relief='flat', borderwidth=1,
-                  font=('Segoe UI', 10),
-                  padx=20, pady=8,
-                  cursor='hand2').pack(side='right', padx=(8, 0))
-
-        tk.Button(btn_frame, text="Сохранить",
-                  command=self._save,
-                  bg=C_ORANGE, fg='white',
-                  activebackground='#D06A10', activeforeground='white',
-                  relief='flat', borderwidth=0,
-                  font=('Segoe UI', 10, 'bold'),
-                  padx=20, pady=8,
-                  cursor='hand2').pack(side='right')
-
-        # Подсказка снизу
-        tk.Label(btn_frame,
-                 text="Tab — следующая ячейка · Shift+Tab — предыдущая · Enter — сохранить",
-                 bg=T['bg'], fg=T['muted'],
-                 font=('Segoe UI', 8)).pack(side='left')
-
-        self.bind('<Return>', lambda e: self._save())
-        self.bind('<Escape>', lambda e: self.destroy())
-
-    # ── Заголовок таблицы ────────────────────────────────────
-    def _build_table_header(self, parent):
-        T = self.theme
-        hdr = tk.Frame(parent, bg=T['surface'])
-        hdr.grid(row=0, column=0, columnspan=15, sticky='ew', pady=(0, 2))
-
-        tk.Label(hdr, text="Статья дохода", width=36, anchor='w',
-                 bg=T['surface'], fg=T['text'],
-                 font=('Segoe UI', 9, 'bold'),
-                 padx=6, pady=6).grid(row=0, column=0)
-
-        tk.Label(hdr, text="В аналитике", width=11, anchor='center',
-                 bg=T['surface'], fg=T['text'],
-                 font=('Segoe UI', 9, 'bold'),
-                 padx=4, pady=6).grid(row=0, column=1)
-
-        for i, m_label in enumerate(MONTH_LABELS):
-            tk.Label(hdr, text=m_label, width=10, anchor='center',
-                     bg=T['surface'], fg=T['text'],
-                     font=('Segoe UI', 9, 'bold'),
-                     padx=2, pady=6).grid(row=0, column=i + 2)
-
-        tk.Label(hdr, text="Итого", width=12, anchor='e',
-                 bg=T['surface'], fg=T['muted'],
-                 font=('Segoe UI', 9, 'bold'),
-                 padx=6, pady=6).grid(row=0, column=14)
-
-    # ── Одна строка таблицы ──────────────────────────────────
-    def _build_row(self, parent, row_idx, name, monthly_data, in_analytics=False):
-        T = self.theme
-        bg_color = T['surface'] if row_idx % 2 == 0 else T['bg']
-
-        frame = tk.Frame(parent, bg=bg_color)
-        frame.grid(row=row_idx, column=0, columnspan=15, sticky='ew')
-
-        # Название
-        tk.Label(frame, text=name, width=36, anchor='w',
-                 bg=bg_color, fg=T['text'],
-                 font=('Segoe UI', 9),
-                 padx=6, pady=3).grid(row=0, column=0)
-
-        # Чекбокс "в аналитике"
+    def _build_row(self, table, r, name, monthly_data, in_analytics):
+        ui.label(table, name, anchor='w').grid(row=r, column=0, sticky='w', padx=px(3), pady=px(2))
         var = tk.BooleanVar(value=in_analytics)
         self.include_vars[name] = var
-        cb = tk.Checkbutton(frame, variable=var,
-                            bg=bg_color, activebackground=bg_color,
-                            cursor='hand2')
-        cb.grid(row=0, column=1)
-
-        # Поля месяцев
-        total_var = tk.StringVar(value='0')
+        ttk.Checkbutton(table, variable=var).grid(row=r, column=1)
         for i, m in enumerate(MONTHS):
-            value = monthly_data.get(m, 0) or 0
-            entry_var = tk.StringVar(value=self._fmt(value))
-            entry = tk.Entry(frame, width=11,
-                             textvariable=entry_var,
-                             justify='right',
-                             bg=T['entry_bg'], fg=T['text'],
-                             relief='flat', borderwidth=1,
-                             font=('Segoe UI', 9))
-            entry.grid(row=0, column=i + 2, padx=1, pady=1)
-            entry_var.trace_add('write',
-                lambda *a, n=name: self._recalc_total(n))
+            entry_var = tk.StringVar(value=self._fmt(monthly_data.get(m, 0) or 0))
+            _cell(table, entry_var).grid(row=r, column=i + 2, padx=px(2), pady=px(2), ipady=px(3))
+            entry_var.trace_add('write', lambda *a, n=name: self._recalc_total(n))
             self.entries[(name, m)] = entry_var
-
-        # Итого
-        total_label = tk.Label(frame, textvariable=total_var, width=12, anchor='e',
-                               bg=bg_color, fg=T['muted'],
-                               font=('Segoe UI', 9),
-                               padx=6, pady=3)
-        total_label.grid(row=0, column=14)
-        self.entries[(name, '_total_var')] = total_var
+        self._totals[name] = tk.StringVar()
+        ui.label(table, textvariable=self._totals[name], fg='text2', anchor='e', width=12).grid(
+            row=r, column=14, sticky='e', padx=px(3))
         self._recalc_total(name)
 
-    # ── Строка плана группы ──────────────────────────────────
-    def _build_plan_row(self, parent, row_idx, plan_data):
-        T = self.theme
-
-        # Разделитель
-        sep = tk.Frame(parent, bg=T['border'], height=1)
-        sep.grid(row=row_idx - 1, column=0, columnspan=15, sticky='ew', pady=6)
-
-        frame = tk.Frame(parent, bg=T['surface'])
-        frame.grid(row=row_idx, column=0, columnspan=15, sticky='ew')
-
-        tk.Label(frame, text="План группы (руб.)", width=36, anchor='w',
-                 bg=T['surface'], fg=T['text'],
-                 font=('Segoe UI', 9, 'bold'),
-                 padx=6, pady=4).grid(row=0, column=0)
-
-        tk.Label(frame, text="—", width=11, anchor='center',
-                 bg=T['surface'], fg=T['muted'],
-                 font=('Segoe UI', 9),
-                 padx=4).grid(row=0, column=1)
-
-        total_var = tk.StringVar(value='0')
+    def _build_plan_row(self, table, r, plan_data):
+        ui.label(table, "План группы", 'strong', anchor='w').grid(row=r, column=0, sticky='w', padx=px(3))
         for i, m in enumerate(MONTHS):
-            value = plan_data.get(m, 0) or 0
-            var = tk.StringVar(value=self._fmt(value))
-            entry = tk.Entry(frame, width=11,
-                             textvariable=var,
-                             justify='right',
-                             bg=T['entry_bg'], fg=T['text'],
-                             relief='flat', borderwidth=1,
-                             font=('Segoe UI', 9))
-            entry.grid(row=0, column=i + 2, padx=1, pady=2)
+            var = tk.StringVar(value=self._fmt(plan_data.get(m, 0) or 0))
+            _cell(table, var).grid(row=r, column=i + 2, padx=px(2), pady=px(2), ipady=px(3))
             var.trace_add('write', lambda *a: self._recalc_plan_total())
             self.plan_entries[m] = var
-
-        self._plan_total_var = total_var
-        tk.Label(frame, textvariable=total_var, width=12, anchor='e',
-                 bg=T['surface'], fg=C_ORANGE,
-                 font=('Segoe UI', 9, 'bold'),
-                 padx=6, pady=4).grid(row=0, column=14)
+        self._plan_total_var = tk.StringVar()
+        ui.label(table, textvariable=self._plan_total_var, role='strong', fg='accent', anchor='e',
+                 width=12).grid(row=r, column=14, sticky='e', padx=px(3))
         self._recalc_plan_total()
 
     # ── Расчёт итогов ────────────────────────────────────────
+    def _sum(self, variables):
+        return sum(self._parse(v.get()) or 0.0 for v in variables)
+
     def _recalc_total(self, row_name):
-        total = 0.0
-        for m in MONTHS:
-            var = self.entries.get((row_name, m))
-            if var:
-                total += self._parse(var.get())
-        total_var = self.entries.get((row_name, '_total_var'))
-        if total_var:
-            total_var.set(self._fmt(total))
+        if row_name in self._totals:
+            self._totals[row_name].set(self._fmt(self._sum(self.entries[(row_name, m)] for m in MONTHS
+                                                           if (row_name, m) in self.entries)))
 
     def _recalc_plan_total(self):
-        total = 0.0
-        for m in MONTHS:
-            var = self.plan_entries.get(m)
-            if var:
-                total += self._parse(var.get())
         if hasattr(self, '_plan_total_var'):
-            self._plan_total_var.set(self._fmt(total))
+            self._plan_total_var.set(self._fmt(self._sum(self.plan_entries.values())))
 
     # ── Парсинг/форматирование ──────────────────────────────
-    def _bad_number(self, s):
-        """True, если поле непустое, но числом не является (иначе оно молча сохранилось бы как 0)."""
-        s = (str(s or '').strip().replace(' ', '').replace('\xa0', '').replace('\u202f', '')
-             .replace('−', '-').replace(',', '.'))
-        if not s:
-            return False
-        try:
-            float(s)
-            return False
-        except Exception:
-            return True
-
     def _parse(self, s):
-        if not s:
+        """Число из ячейки; None — если не распозналось (пустая ячейка = 0)."""
+        if not str(s).strip():
             return 0.0
-        # Убираем и неразрывные пробелы: так Excel разделяет тысячи при копировании
-        s = (str(s).strip().replace(' ', '').replace('\xa0', '').replace('\u202f', '')
-             .replace('−', '-').replace(',', '.'))
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
+        # parse_money понимает неразрывные пробелы и разные разделители,
+        # которые приходят при копировании из Excel
+        return parse_money(s)
 
     def _fmt(self, v):
         try:
@@ -327,66 +160,52 @@ class ExternalIncomeEditor(tk.Toplevel):
             return '0'
         if v == 0:
             return '0'
-        if abs(v) >= 1000:
+        # Копейки показываем всегда, когда они есть: _save читает значение
+        # обратно из поля, и округление при показе тихо портило данные.
+        if v == round(v):
             return f"{v:,.0f}".replace(',', ' ')
         return f"{v:,.2f}".replace(',', ' ')
 
     # ── Сохранение ───────────────────────────────────────────
     def _save(self):
-        # Пересобираем данные
-        bad = [f"{name}, месяц {m}" for (name, m), var in self.entries.items()
-               if m != '_total_var' and self._bad_number(var.get())]
-        bad += [f"План группы, месяц {m}" for m, var in self.plan_entries.items()
-                if self._bad_number(var.get())]
-        if bad:
-            messagebox.showerror("Не число",
-                "Эти ячейки не распознаны как числа, файл не сохранён:\n" + "\n".join(bad[:15]))
-            return
         new_data = dict(self.data)  # копия с _описание, _год, служебными
+        bad_cells = []
 
-        # Обновляем месячные суммы
-        row_names = [k for k, v in self.data.items()
-                     if not k.startswith('_') and isinstance(v, dict)]
-        for name in row_names:
-            new_data[name] = {}
-            for m in MONTHS:
-                var = self.entries.get((name, m))
-                if var:
-                    new_data[name][m] = self._parse(var.get())
+        def read(var, where):
+            v = self._parse(var.get())
+            if v is None:
+                bad_cells.append(f"{where}: «{var.get()}»")
+            return v
 
-        # Обновляем список "включать в аналитику"
-        new_data['_включать_в_аналитику'] = [
-            name for name, var in self.include_vars.items() if var.get()
-        ]
+        for name in [k for k, v in self.data.items() if not k.startswith('_') and isinstance(v, dict)]:
+            new_data[name] = {m: read(self.entries[(name, m)], f"{name}, {MONTH_LABELS[int(m) - 1]}")
+                              for m in MONTHS if (name, m) in self.entries}
+        new_data['_включать_в_аналитику'] = [n for n, var in self.include_vars.items() if var.get()]
+        new_data['_план_группы_по_месяцам_руб'] = {
+            m: read(var, f"План группы, {MONTH_LABELS[int(m) - 1]}") for m, var in self.plan_entries.items()}
 
-        # Обновляем план группы
-        plan = {}
-        for m in MONTHS:
-            var = self.plan_entries.get(m)
-            if var:
-                plan[m] = self._parse(var.get())
-        new_data['_план_группы_по_месяцам_руб'] = plan
-
-        # Сохраняем
-        try:
-            with open(self.json_path, 'w', encoding='utf-8') as f:
-                json.dump(new_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            messagebox.showerror("Ошибка сохранения", str(e))
+        # Нераспознанные числа не превращаем молча в 0 — просим исправить
+        if bad_cells:
+            messagebox.showerror(
+                "Не сохранено",
+                "Не удалось распознать числа:\n\n" + "\n".join(bad_cells[:15]) +
+                ("\n…" if len(bad_cells) > 15 else ""), parent=self)
             return
 
-        messagebox.showinfo("Сохранено",
-            "Данные сохранены.\n\nЗапусти аналитику заново чтобы\n"
-            "новые цифры учитывались в отчёте.")
+        try:
+            save_json_atomic(self.json_path, new_data)
+        except Exception as e:
+            messagebox.showerror("Ошибка сохранения", str(e), parent=self)
+            return
+
+        messagebox.showinfo("Сохранено", "Данные сохранены. Запустите анализ заново, "
+                                         "чтобы новые цифры попали в отчёт.", parent=self)
         self.destroy()
 
 
-# ── Запуск для теста ─────────────────────────────────────────
 if __name__ == '__main__':
-    # Тестовый запуск без основного app
     root = tk.Tk()
+    ui.init(root)
     root.withdraw()
-    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             'external_income.json')
-    ExternalIncomeEditor(root, json_path)
+    ExternalIncomeEditor(root, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'external_income.json'))
     root.mainloop()

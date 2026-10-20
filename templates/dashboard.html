@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AJUR Analytics — Дашборд</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  /* Светлая тема в стиле Windows 11 — те же цвета, что у приложения (ui_theme.py) */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --orange:   #F38120;   /* бренд: линии графиков, акценты */
+    --accent:   #C2570C;
+    --bg:       #F3F3F3;
+    --surface:  #FFFFFF;
+    --surface2: #F5F5F5;
+    --border:   #E5E5E5;
+    --border2:  #D1D1D1;
+    --text:     #1B1B1B;
+    --text2:    #5F5F5F;
+    --text3:    #8A8A8A;
+    --green:    #0F7B0F;
+    --red:      #C42B1C;
+    --radius:   8px;
+  }
+
+  html { font-size: 14px; scroll-behavior: smooth; }
+
+  body {
+    font-family: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #C8C8C8; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #A8A8A8; }
+
+  /* ── Шапка ── */
+  header {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(243,243,243,0.85);
+    backdrop-filter: blur(20px) saturate(1.6);
+    -webkit-backdrop-filter: blur(20px) saturate(1.6);
+    border-bottom: 1px solid var(--border);
+    height: 56px;
+    display: flex; align-items: center; gap: 16px;
+    padding: 0 32px;
+  }
+  .logo-mark { display: none; }
+  .logo-text {
+    font-family: Georgia, serif; font-size: 18px; font-style: italic; font-weight: bold;
+    color: var(--orange);
+  }
+  .logo-dot { color: var(--orange); }
+  .header-sep { width: 1px; height: 20px; background: var(--border2); }
+  .header-badge { font-size: 12px; color: var(--text2); }
+  .header-right { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+  .header-file { font-size: 12px; color: var(--text2); }
+  .header-file span { color: var(--text); font-weight: 600; }
+
+  /* ── Сетка ── */
+  main { max-width: 1320px; margin: 0 auto; padding: 28px 32px 48px; }
+
+  .section-title { margin-bottom: 12px; }
+  .section-title h2 {
+    font-family: 'Segoe UI Variable Display', 'Segoe UI', sans-serif;
+    font-size: 20px; font-weight: 600; color: var(--text);
+  }
+
+  /* ── KPI ── */
+  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 32px; }
+  .kpi-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px 18px;
+  }
+  .kpi-card .card-accent { display: none; }
+  .kpi-label { font-size: 12px; color: var(--text2); margin-bottom: 6px; }
+  .kpi-value {
+    font-family: 'Segoe UI Variable Display', 'Segoe UI', sans-serif;
+    font-size: 28px; font-weight: 600; color: var(--text); line-height: 1.1; margin-bottom: 2px;
+  }
+  .kpi-unit { font-size: 12px; color: var(--text3); }
+  .kpi-trend {
+    display: inline-flex; align-items: center; gap: 4px; margin-top: 8px;
+    font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 4px;
+  }
+  .kpi-trend.up   { color: var(--green); background: #DFF6DD; }
+  .kpi-trend.down { color: var(--red);   background: #FDE7E9; }
+
+  /* ── Графики ── */
+  .charts-section { margin-bottom: 32px; }
+  .charts-grid { display: grid; gap: 12px; }
+  .charts-row-2 { grid-template-columns: 1fr 1fr; }
+  .charts-row-1 { grid-template-columns: 1fr; }
+  .chart-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 18px 20px;
+  }
+  .chart-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .chart-title { font-size: 14px; font-weight: 600; color: var(--text); }
+  .chart-badge {
+    font-size: 12px; color: var(--text2); background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px;
+  }
+  .chart-wrap      { position: relative; height: 260px; }
+  .chart-wrap-tall { position: relative; height: 320px; }
+
+  footer {
+    text-align: center; padding: 24px 32px; color: var(--text3); font-size: 12px;
+    border-top: 1px solid var(--border);
+  }
+
+  @media (max-width: 900px) {
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    .charts-row-2 { grid-template-columns: 1fr; }
+    main { padding: 20px 16px; }
+    header { padding: 0 16px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo-mark">Ф</div>
+  <span class="logo-text">фонтанка<span class="logo-dot">.</span>ру</span>
+  <div class="header-sep"></div>
+  <span class="header-badge">Коммерческий отдел · Аналитика</span>
+  <div class="header-right">
+    <div class="header-file">Файл: <span id="fname"></span></div>
+    <div class="header-file">Сформировано: <span id="fdate"></span></div>
+  </div>
+</header>
+
+<main>
+
+  <!-- KPI -->
+  <div style="margin-bottom:32px">
+    <div class="section-title"><h2>Ключевые показатели</h2></div>
+    <div class="kpi-grid" id="kpi-grid">
+      <div class="kpi-card">
+        <div class="card-accent"></div>
+        <div class="kpi-label">Выручка</div>
+        <div class="kpi-value" id="kpi-rev">—</div>
+        <div class="kpi-unit">тыс. руб.</div>
+        <div id="kpi-trend" style="display:none" class="kpi-trend"></div>
+      </div>
+      <div class="kpi-card">
+        <div class="card-accent"></div>
+        <div class="kpi-label">Заказов</div>
+        <div class="kpi-value" id="kpi-ord">—</div>
+        <div class="kpi-unit">в периоде</div>
+      </div>
+      <div class="kpi-card">
+        <div class="card-accent"></div>
+        <div class="kpi-label">Клиентов</div>
+        <div class="kpi-value" id="kpi-cli">—</div>
+        <div class="kpi-unit">уникальных</div>
+      </div>
+      <div class="kpi-card">
+        <div class="card-accent"></div>
+        <div class="kpi-label">Средний чек</div>
+        <div class="kpi-value" id="kpi-avg">—</div>
+        <div class="kpi-unit">тыс. руб.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Выручка по месяцам -->
+  <div class="charts-section">
+    <div class="section-title"><h2>Динамика выручки</h2></div>
+    <div class="charts-grid charts-row-1">
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title">Выручка по месяцам</div>
+          <div class="chart-badge">тыс. руб.</div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chartMonthly"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Клиенты и менеджеры -->
+  <div class="charts-section">
+    <div class="section-title"><h2>Топ-10</h2></div>
+    <div class="charts-grid charts-row-2">
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title">Клиенты</div>
+          <div class="chart-badge">топ-10</div>
+        </div>
+        <div class="chart-wrap-tall">
+          <canvas id="chartClients"></canvas>
+        </div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title">Менеджеры</div>
+          <div class="chart-badge">топ-10</div>
+        </div>
+        <div class="chart-wrap-tall">
+          <canvas id="chartManagers"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Отрасли -->
+  <div class="charts-section">
+    <div class="section-title"><h2>Структура по отраслям</h2></div>
+    <div class="charts-grid charts-row-1">
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title">Выручка по отраслям</div>
+          <div class="chart-badge">тыс. руб.</div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chartIndustries"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<footer>
+  AJUR Analytics &nbsp;·&nbsp; Фонтанка.ру &nbsp;·&nbsp; Коммерческий отдел
+</footer>
+
+<script>
+const DATA = __DATA_PLACEHOLDER__;
+
+// Meta
+document.getElementById('fname').textContent = DATA.meta.filename;
+document.getElementById('fdate').textContent = DATA.meta.generated;
+
+// KPI
+function fmt(n) { return n.toLocaleString('ru-RU'); }
+
+document.getElementById('kpi-rev').textContent = fmt(DATA.kpi.revenue);
+document.getElementById('kpi-ord').textContent = fmt(DATA.kpi.orders);
+document.getElementById('kpi-cli').textContent = fmt(DATA.kpi.clients);
+document.getElementById('kpi-avg').textContent = fmt(DATA.kpi.avg_check);
+
+// Тренд
+if (DATA.kpi.trend_pct !== null && DATA.kpi.trend_pct !== undefined) {
+  const trendEl = document.getElementById('kpi-trend');
+  const up = DATA.kpi.trend_pct >= 0;
+  trendEl.textContent = (up ? '↑ +' : '↓ ') + DATA.kpi.trend_pct + '% к пред. месяцу';
+  trendEl.className = 'kpi-trend ' + (up ? 'up' : 'down');
+  trendEl.style.display = 'inline-flex';
+}
+
+// ── Глобальные настройки Chart.js ────────────────────────
+Chart.defaults.color          = '#5F5F5F';
+Chart.defaults.font.family    = "'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif";
+Chart.defaults.font.size      = 11;
+
+const GRID = {
+  color: 'rgba(0,0,0,0.06)',
+  drawBorder: false,
+};
+
+const TOOLTIP = {
+  backgroundColor: '#FFFFFF',
+  borderColor: '#E5E5E5',
+  borderWidth: 1,
+  titleColor: '#5F5F5F',
+  bodyColor: '#1B1B1B',
+  padding: 12,
+  cornerRadius: 8,
+  displayColors: false,
+};
+
+// ── 1. Выручка по месяцам ────────────────────────────────
+if (DATA.monthly.length > 0) {
+  const ctx = document.getElementById('chartMonthly').getContext('2d');
+
+  const grad = ctx.createLinearGradient(0, 0, 0, 260);
+  grad.addColorStop(0,   'rgba(243,129,32,0.22)');
+  grad.addColorStop(0.6, 'rgba(243,129,32,0.04)');
+  grad.addColorStop(1,   'rgba(243,129,32,0)');
+
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: DATA.monthly.map(r => r.month),
+      datasets: [{
+        data: DATA.monthly.map(r => r.revenue),
+        borderColor: '#F38120',
+        backgroundColor: grad,
+        borderWidth: 2,
+        pointBackgroundColor: '#F38120',
+        pointBorderColor: '#FFFFFF',
+        pointBorderWidth: 2,
+        pointRadius: 4,
+        pointHoverRadius: 7,
+        pointHoverBackgroundColor: '#FFB060',
+        fill: true,
+        tension: 0.4,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          ...TOOLTIP,
+          callbacks: {
+            label: c => ' ' + c.parsed.y.toLocaleString('ru-RU') + ' тыс. руб.'
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: GRID,
+          ticks: { maxRotation: 40, color: '#8A8A8A' },
+          border: { display: false },
+        },
+        y: {
+          grid: GRID,
+          ticks: {
+            callback: v => v.toLocaleString('ru-RU'),
+            color: '#8A8A8A',
+          },
+          border: { display: false },
+        },
+      }
+    }
+  });
+}
+
+// ── 2. Топ клиентов ──────────────────────────────────────
+if (DATA.top_clients.length > 0) {
+  const sorted = [...DATA.top_clients].sort((a,b) => b.revenue - a.revenue);
+  new Chart(document.getElementById('chartClients'), {
+    type: 'bar',
+    data: {
+      labels: sorted.map(r => r.name),
+      datasets: [{
+        data: sorted.map(r => r.revenue),
+        backgroundColor: 'rgba(243,129,32,0.75)',
+        hoverBackgroundColor: '#F38120',
+        borderRadius: 4,
+        borderSkipped: false,
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          ...TOOLTIP,
+          callbacks: {
+            label: c => ' ' + c.parsed.x.toLocaleString('ru-RU') + ' тыс. руб.'
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: GRID,
+          ticks: { callback: v => v.toLocaleString('ru-RU'), color: '#8A8A8A' },
+          border: { display: false },
+        },
+        y: {
+          grid: { display: false },
+          ticks: { font: { size: 10 }, color: '#777' },
+          border: { display: false },
+        },
+      }
+    }
+  });
+}
+
+// ── 3. Топ менеджеров ────────────────────────────────────
+if (DATA.top_managers.length > 0) {
+  const mgr = DATA.top_managers;
+  new Chart(document.getElementById('chartManagers'), {
+    type: 'bar',
+    data: {
+      labels: mgr.map(r => r.name),
+      datasets: [{
+        data: mgr.map(r => r.revenue),
+        backgroundColor: 'rgba(243,129,32,0.75)',
+        hoverBackgroundColor: '#F38120',
+        borderRadius: 6,
+        borderSkipped: false,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          ...TOOLTIP,
+          callbacks: {
+            label: c => ' ' + c.parsed.y.toLocaleString('ru-RU') + ' тыс. руб.'
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: { font: { size: 10 }, maxRotation: 35, color: '#777' },
+          border: { display: false },
+        },
+        y: {
+          grid: GRID,
+          ticks: { callback: v => v.toLocaleString('ru-RU'), color: '#8A8A8A' },
+          border: { display: false },
+        },
+      }
+    }
+  });
+}
+
+// ── 4. Отрасли (горизонтальный bar) ─────────────────────
+if (DATA.industries.length > 0) {
+  // Знаменатель для % — выручка по ВСЕМ отраслям (industries_total), а не только
+  // по показанным на графике топ-8, иначе при >8 отраслях % завышается.
+  const total = DATA.industries_total ?? DATA.industries.reduce((s, r) => s + r.revenue, 0);
+  const sorted = [...DATA.industries].sort((a,b) => b.revenue - a.revenue);
+  new Chart(document.getElementById('chartIndustries'), {
+    type: 'bar',
+    data: {
+      labels: sorted.map(r => r.name),
+      datasets: [{
+        data: sorted.map(r => r.revenue),
+        backgroundColor: 'rgba(243,129,32,0.75)',
+        hoverBackgroundColor: '#F38120',
+        borderRadius: 5,
+        borderSkipped: false,
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          ...TOOLTIP,
+          callbacks: {
+            label: c => {
+              const pct = total > 0 ? ((c.parsed.x / total) * 100).toFixed(1) : '0';
+              return ' ' + c.parsed.x.toLocaleString('ru-RU') + ' тыс. руб.  (' + pct + '%)';
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: GRID,
+          ticks: { callback: v => v.toLocaleString('ru-RU'), color: '#8A8A8A' },
+          border: { display: false },
+        },
+        y: {
+          grid: { display: false },
+          ticks: { font: { size: 10 }, color: '#777' },
+          border: { display: false },
+        },
+      }
+    }
+  });
+}
+</script>
+</body>
+</html>

@@ -7,20 +7,19 @@ import os
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Дополнительные файлы данных для включения в .exe
+# Дополнительные файлы данных для включения в .exe. JSON — дефолты: при первом
+# запуске app.py копирует их рядом с exe, дальше правятся копии. config.json
+# (личные пути) в сборку не кладём. icon.ico — для иконки окна (iconbitmap).
 data_files = [
     ("external_income.json", "."),
     ("verified_figures.json", "."),
     ("client_aliases.json", "."),
-    # config.json в сборку не кладём: в нём личные пути и планы; программа
-    # создаёт его сама рядом с .exe (см. paths.py).
+    ("icon.ico", "."),
+    ("templates", "templates"),  # шаблон HTML-дашборда
 ]
 
 add_data = []
-for item in data_files:
-    if item is None:
-        continue
-    src, dst = item
+for src, dst in data_files:
     full_src = os.path.join(APP_DIR, src)
     if os.path.exists(full_src):
         add_data.extend(["--add-data", f"{full_src};{dst}"])
@@ -51,6 +50,11 @@ cmd = [
     # модули приложения
     "--hidden-import=paths",
     "--hidden-import=analytics",
+    "--hidden-import=crm_data",
+    "--hidden-import=external_income",
+    "--hidden-import=excel_style",
+    "--hidden-import=ui_theme",
+    "--hidden-import=jsonio",
     "--hidden-import=client_aliases_editor",
     "--hidden-import=comparison",
     "--hidden-import=dashboard",
