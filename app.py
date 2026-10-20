@@ -1,56 +1,53 @@
 # ============================================================
-# app.py — Аналитика заказов, Фонтанка.ру  v3.0
+# app.py — Аналитика заказов, Фонтанка.ру  v3.1
+# Окно в стиле Windows 11: тема — ui_theme.py
 # ============================================================
 
 import sys
-import os as _os
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
+import os
+_HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
-import threading
 import json
-import os
-from datetime import datetime, timezone, timedelta
+import queue
+import shutil
+import threading
+import tkinter as tk
+from datetime import datetime
+from tkinter import filedialog, messagebox, ttk
 
-from analytics import run_analytics
+import crm_data
+import ui_theme as ui
+from ui_theme import ICON, T, px
+from analytics import RECON_BAD_PCT, RECON_WARN_PCT, recon_verdict, run_analytics
 from comparison import run_comparison
 from dashboard import generate_dashboard
 
 try:
     from external_income_editor import ExternalIncomeEditor
-    HAS_EXT_EDITOR = True
 except ImportError:
-    HAS_EXT_EDITOR = False
-
+    ExternalIncomeEditor = None
 try:
     from verified_figures_editor import VerifiedFiguresEditor
-    HAS_VF_EDITOR = True
 except ImportError:
-    HAS_VF_EDITOR = False
-
+    VerifiedFiguresEditor = None
 try:
     from client_aliases_editor import ClientAliasesEditor
-    HAS_ALIASES_EDITOR = True
 except ImportError:
-    HAS_ALIASES_EDITOR = False
-
+    ClientAliasesEditor = None
 try:
     from dohody_import_dialog import DohodyImportDialog
-    HAS_DOHODY_IMPORT = True
 except ImportError:
-    HAS_DOHODY_IMPORT = False
+    DohodyImportDialog = None
 
-import shutil
-import analytics
+VERSION = "3.1"
 
 # В собранном onefile-exe __file__ указывает во временную папку распаковки
 # (sys._MEIPASS), которая удаляется при выходе: правки JSON и config
 # пропадали бы. Записываемые файлы держим рядом с exe, ресурсы (иконка,
 # дефолтные JSON) берём из папки распаковки.
-RES_DIR = os.path.dirname(os.path.abspath(__file__))
+RES_DIR = _HERE
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
     for _name in ("external_income.json", "verified_figures.json", "client_aliases.json"):
@@ -70,38 +67,23 @@ VERIFIED_PATH        = os.path.join(APP_DIR, "verified_figures.json")
 ALIASES_PATH         = os.path.join(APP_DIR, "client_aliases.json")
 
 # Анализ и редактор алиасов должны работать с одним и тем же файлом
-analytics._ALIASES_PATH = ALIASES_PATH
-analytics.reload_aliases()
+crm_data.set_aliases_path(ALIASES_PATH)
 
-# ── Палитра ──────────────────────────────────────────────────
-C_ORANGE   = "#F38120"
-C_DARK     = "#D06A10"
-C_GREEN    = "#22C55E"
-C_GREEN_D  = "#16A34A"
-C_RED      = "#EF4444"
-C_RED_D    = "#DC2626"
-C_AMBER    = "#F59E0B"
-C_BLUE     = "#3B82F6"
+DEFAULT_MANAGERS = [
+    "Петрова Э.", "Егорова И.", "Демахина Е.",
+    "Дубровская Т.", "Долгополова Н.", "Демидова Г.",
+    "Сосновик А.", "Киселёва Е.", "Лея К.",
+    "Борисенко Е.", "Сорокина Т.", "Шевчук Е.", "Карпус О.",
+]
 
-THEME = {
-    "bg":          "#F7F7F8",
-    "sidebar":     "#FFFFFF",
-    "surface":     "#FFFFFF",
-    "surface2":    "#F2F2F4",
-    "border":      "#E4E4E7",
-    "text":        "#18181B",
-    "text2":       "#52525B",
-    "muted":       "#8A8A93",
-    "log_bg":      "#FAFAFA",
-    "log_fg":      "#27272A",
-    "entry_bg":    "#FFFFFF",
-    "entry_fg":    "#18181B",
-    "tag_ok":      "#16A34A",
-    "tag_err":     "#DC2626",
-    "tag_warn":    "#D97706",
-    "nav_active":  "#FFF1E4",
-    "nav_hover":   "#F7F7F8",
-    "accent_line": "#F38120",
+DEFAULT_VERIFIED = {
+    "_описание": "Верифицированные годовые итоги из бухгалтерии.",
+    "_год": 2025,
+    "total_with_prog": 482404000,
+    "total_with_barter_no_prog": 363000166,
+    "advertising_no_events": 243005820,
+    "programmatic_external": 119403897,
+    "other_external_income": 41057102,
 }
 
 
@@ -123,680 +105,255 @@ def save_config(cfg):
         pass
 
 
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _fmt_k(v):
+    return f"{v:,.0f}".replace(",", " ")
+
+
 # ============================================================
-# TOAST
+# TOAST — уведомление в правом нижнем углу
 # ============================================================
 class Toast(tk.Toplevel):
-    _BG     = {"ok": "#EAFAF1", "err": "#FDECEA", "warn": "#FEF9E7", "info": "#EBF2FF"}
-    _BORDER = {"ok": "#22C55E", "err": "#EF4444", "warn": "#F59E0B", "info": "#3B82F6"}
-    _ICON   = {"ok": "✓", "err": "✕", "warn": "!", "info": "i"}
-
-    def __init__(self, parent, message, kind="ok",
-                 action_text=None, action_cmd=None, duration=4000):
+    def __init__(self, parent, message, kind="ok", action_text=None, action_cmd=None, duration=4000):
         super().__init__(parent)
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.attributes("-alpha", 0.0)
+        self.configure(bg=T["stroke"])
 
-        bg     = self._BG.get(kind, "#FFFFFF")
-        border = self._BORDER.get(kind, "#999")
-        icon   = self._ICON.get(kind, "·")
-
-        self.configure(bg=border)
-        inner = tk.Frame(self, bg=bg, padx=0, pady=0)
+        inner = tk.Frame(self, bg=T["card"])
         inner.pack(fill="both", expand=True, padx=1, pady=1)
-
-        # Левая акцент-полоса
-        accent = tk.Frame(inner, bg=border, width=3)
-        accent.pack(side="left", fill="y")
-
-        content = tk.Frame(inner, bg=bg, padx=14, pady=10)
-        content.pack(side="left", fill="both", expand=True)
-
-        top = tk.Frame(content, bg=bg)
-        top.pack(fill="x")
-
-        # Иконка в кружке
-        ico_f = tk.Frame(top, bg=border, width=22, height=22)
-        ico_f.pack(side="left", padx=(0, 10))
-        ico_f.pack_propagate(False)
-        tk.Label(ico_f, text=icon, font=("Segoe UI", 9, "bold"),
-                 bg=border, fg="#FFFFFF").place(relx=.5, rely=.5, anchor="center")
-
-        tk.Label(top, text=message,
-                 font=("Segoe UI", 9), bg=bg, fg="#18181B",
-                 justify="left", wraplength=260).pack(side="left", fill="x", expand=True)
-
-        tk.Button(top, text="×", font=("Segoe UI", 11),
-                  bg=bg, fg="#71717A", relief="flat", bd=0,
-                  activebackground=bg, activeforeground="#18181B",
-                  cursor="hand2", command=self._dismiss).pack(side="right", padx=(8, 0))
+        row = tk.Frame(inner, bg=T["card"])
+        row.pack(fill="x", padx=px(16), pady=(px(14), px(14) if not action_text else px(6)))
+        ui.label(row, ICON.get(kind, ICON["info"]), "icon_sm", fg=kind).pack(side="left", anchor="n", pady=px(2))
+        ui.label(row, message, justify="left", wraplength=px(280)).pack(side="left", padx=(px(12), 0))
+        close = ui.label(row, ICON["close"], "icon_sm", fg="text2", cursor="hand2")
+        close.pack(side="right", anchor="n", padx=(px(12), 0), pady=px(2))
+        close.bind("<Button-1>", lambda e: self._dismiss())
 
         if action_text and action_cmd:
-            btn_row = tk.Frame(content, bg=bg)
-            btn_row.pack(fill="x", pady=(8, 0))
-            tk.Button(btn_row, text=action_text,
-                      font=("Segoe UI", 8, "bold"),
-                      bg=border, fg="#FFF",
-                      activebackground="#FFF", activeforeground=border,
-                      relief="flat", bd=0, cursor="hand2",
-                      padx=12, pady=4,
-                      command=lambda: (action_cmd(), self._dismiss())
-                      ).pack(side="left")
+            ui.button(inner, action_text, lambda: (action_cmd(), self._dismiss())).pack(
+                anchor="w", padx=(px(44), 0), pady=(0, px(14)))
 
         self.update_idletasks()
-        w = self.winfo_reqwidth()
-        h = self.winfo_reqheight()
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        x = sw - w - 20
-        self._y_show = sh - h - 48
-        self._y_hide = sh + 20
-        self.geometry(f"{w}x{h}+{x}+{self._y_hide}")
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self._x = self.winfo_screenwidth() - w - px(20)
+        self._y = self.winfo_screenheight() - h - px(60)
+        self.geometry(f"{w}x{h}+{self._x}+{self._y}")
+        ui.style_window(self, caption=False)
         self._duration = duration
         self._alpha = 0.0
-        self._fade_in()
+        self._fade(+1)
 
-    def _fade_in(self):
-        self._alpha = min(self._alpha + 0.1, 1.0)
-        cur_y = int(self._y_hide + (self._y_show - self._y_hide) * self._alpha)
+    def _fade(self, direction):
+        self._alpha = min(max(self._alpha + 0.12 * direction, 0.0), 1.0)
         try:
             self.attributes("-alpha", self._alpha)
-            sw = self.winfo_screenwidth()
-            self.geometry(f"+{sw - self.winfo_reqwidth() - 20}+{cur_y}")
-        except Exception:
+        except tk.TclError:
             return
-        if self._alpha < 1.0:
-            self.after(14, self._fade_in)
+        if direction > 0 and self._alpha < 1:
+            self.after(16, self._fade, +1)
+        elif direction > 0:
+            self.after(self._duration, self._fade, -1)
+        elif self._alpha > 0:
+            self.after(16, self._fade, -1)
         else:
-            self.after(self._duration, self._fade_out)
-
-    def _fade_out(self):
-        self._alpha = max(self._alpha - 0.07, 0.0)
-        cur_y = int(self._y_show + (self._y_hide - self._y_show) * (1 - self._alpha))
-        try:
-            self.attributes("-alpha", self._alpha)
-            sw = self.winfo_screenwidth()
-            self.geometry(f"+{sw - self.winfo_reqwidth() - 20}+{cur_y}")
-        except Exception:
-            return
-        if self._alpha > 0:
-            self.after(14, self._fade_out)
-        else:
-            try:
-                self.destroy()
-            except Exception:
-                pass
+            self.destroy()
 
     def _dismiss(self):
         self._duration = 0
-        self._fade_out()
-
-
-# ============================================================
-# КНОПКА С ПОДСВЕТКОЙ ПРИ НАВЕДЕНИИ
-# ============================================================
-class AnimButton(tk.Button):
-    """Кнопка с плоской заливкой и мгновенной сменой цвета при наведении."""
-
-    def __init__(self, master, bg_n, bg_h, **kw):
-        super().__init__(master, bg=bg_n, relief="flat",
-                         cursor="hand2", bd=0,
-                         activebackground=bg_h,
-                         activeforeground=kw.get("fg", "#FFFFFF"), **kw)
-        self.bind("<Enter>", lambda e: self.config(bg=bg_h))
-        self.bind("<Leave>", lambda e: self.config(bg=bg_n))
+        self._fade(-1)
 
 
 # ============================================================
 # ГЛАВНОЕ ОКНО
 # ============================================================
 class App(tk.Tk):
-    # Навигационные пункты: (id, иконка, подпись)
     NAV_ITEMS = [
-        ("analysis",    "▸",  "Анализ"),
-        ("compare",     "⇄",  "Сравнение"),
-        ("plan",        "≡",  "План"),
-        ("dashboard",   "⊞",  "Дашборд"),
+        ("analysis", ICON["analysis"], "Анализ"),
+        ("compare",  ICON["compare"],  "Сравнение"),
+        ("plan",     ICON["plan"],     "Планы"),
     ]
+    NAV_BOTTOM = [("data", ICON["data"], "Данные")]
 
-    def __init__(self):
-        super().__init__()
-        self.title("Аналитика — Фонтанка.ру")
-        self.geometry("1040x720")
-        self.minsize(900, 640)
-        self.resizable(True, True)
-
-        if os.path.exists(ICON_PATH):
-            try:
-                self.iconbitmap(default=ICON_PATH)
-            except Exception:
-                pass
-
-        self._cfg         = load_config()
-        self._T           = THEME
-        self._plan_vars   = {}
-        self._anim_running= False
-        self._anim_step   = 0
-        self._date_by     = tk.StringVar(value=self._cfg.get("date_by", "order"))
-        self._active_page = tk.StringVar(value="analysis")
-        self._pages       = {}
-        self._nav_btns    = {}
-
-        self.configure(bg=self._T["bg"])
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    # ── Toast ────────────────────────────────────────────────
-    def _toast(self, message, kind="ok", action_text=None, action_cmd=None, duration=4000):
-        try:
-            Toast(self, message, kind=kind,
-                  action_text=action_text, action_cmd=action_cmd, duration=duration)
-        except Exception:
-            pass
-
-    def _on_close(self):
-        self._cfg["date_by"] = self._date_by.get()
-        save_config(self._cfg)
-        self.destroy()
-
-    # ── Регистрация виджетов (совместимость со старыми вызовами) ──
-    def _r(self, w, role):
-        return w
-
-    # ============================================================
-    # СБОРКА UI
-    # ============================================================
-    def _build_ui(self):
-        # Корневой контейнер
-        root = tk.Frame(self, bg=self._T["bg"])
-        root.pack(fill="both", expand=True)
-
-        # Боковая панель
-        self._sidebar = tk.Frame(root, bg=self._T["sidebar"], width=220)
-        self._sidebar.pack(side="left", fill="y")
-        self._sidebar.pack_propagate(False)
-
-        # Разделитель
-        tk.Frame(root, bg=self._T["border"], width=1).pack(side="left", fill="y")
-
-        # Рабочая область
-        self._workspace = tk.Frame(root, bg=self._T["bg"])
-        self._workspace.pack(side="left", fill="both", expand=True)
-
-        self._build_sidebar()
-        self._build_pages()
-        self._build_statusbar()
-        self._show_page("analysis")
-
-    # ============================================================
-    # САЙДБАР
-    # ============================================================
-    def _build_sidebar(self):
-        T = self._T
-        sb = self._sidebar
-
-        # ── Логотип ──────────────────────────────────────────
-        logo_frame = tk.Frame(sb, bg=T["sidebar"], height=80)
-        logo_frame.pack(fill="x")
-        logo_frame.pack_propagate(False)
-
-        # Оранжевая вертикальная черта слева
-        tk.Frame(logo_frame, bg=C_ORANGE, width=3).pack(side="left", fill="y")
-
-        logo_inner = tk.Frame(logo_frame, bg=T["sidebar"])
-        logo_inner.pack(side="left", fill="both", expand=True, padx=18)
-
-        tk.Label(logo_inner, text="фонтанка.ру",
-                 font=("Georgia", 16, "bold italic"),
-                 bg=T["sidebar"], fg=C_ORANGE).pack(anchor="w", pady=(20, 0))
-        tk.Label(logo_inner, text="КОММЕРЧЕСКИЙ ОТДЕЛ",
-                 font=("Segoe UI", 9, "bold"),
-                 bg=T["sidebar"], fg=T["muted"]).pack(anchor="w")
-
-        # Тонкий разделитель
-        tk.Frame(sb, bg=T["border"], height=1).pack(fill="x", pady=(4, 0))
-
-        # ── Навигация ─────────────────────────────────────────
-        nav_frame = tk.Frame(sb, bg=T["sidebar"])
-        nav_frame.pack(fill="x", pady=(12, 0))
-
-        for page_id, icon, label in self.NAV_ITEMS:
-            self._nav_btns[page_id] = self._make_nav_btn(
-                nav_frame, page_id, icon, label)
-
-        # ── Нижний блок сайдбара ─────────────────────────────
-        tk.Frame(sb, bg=T["border"], height=1).pack(fill="x", side="bottom", pady=(0, 10))
-
-        bottom = tk.Frame(sb, bg=T["sidebar"])
-        bottom.pack(side="bottom", fill="x", padx=14, pady=(0, 14))
-
-        # Часы
-        self._clock_frame = tk.Frame(bottom, bg=T["sidebar"])
-        self._clock_frame.pack(fill="x", pady=(0, 12))
-
-        self._clock_time = tk.StringVar()
-        self._clock_date = tk.StringVar()
-        tk.Label(self._clock_frame, textvariable=self._clock_time,
-                 font=("Segoe UI", 20, "bold"),
-                 bg=T["sidebar"], fg=T["text"]).pack(anchor="w")
-        tk.Label(self._clock_frame, textvariable=self._clock_date,
-                 font=("Segoe UI", 8),
-                 bg=T["sidebar"], fg=T["muted"]).pack(anchor="w")
-        self._update_clock()
-
-        # Версия
-        tk.Label(bottom, text="v 3.0",
-                 font=("Segoe UI", 8),
-                 bg=T["sidebar"], fg=T["muted"]).pack(anchor="e", pady=(8, 0))
-
-    def _make_nav_btn(self, parent, page_id, icon, label):
-        T = self._T
-
-        frame = tk.Frame(parent, bg=T["sidebar"], cursor="hand2")
-        frame.pack(fill="x", padx=8, pady=1)
-
-        # Акцент-полоска слева (скрыта по умолчанию)
-        accent = tk.Frame(frame, bg=C_ORANGE, width=3)
-        accent.pack(side="left", fill="y")
-        accent.pack_forget()
-
-        inner = tk.Frame(frame, bg=T["sidebar"], pady=10, padx=14)
-        inner.pack(side="left", fill="both", expand=True)
-
-        icon_lbl = tk.Label(inner, text=icon,
-                            font=("Segoe UI", 13),
-                            bg=T["sidebar"], fg=T["muted"],
-                            width=2, anchor="w")
-        icon_lbl.pack(side="left")
-
-        text_lbl = tk.Label(inner, text=label,
-                            font=("Segoe UI", 10),
-                            bg=T["sidebar"], fg=T["text2"],
-                            anchor="w")
-        text_lbl.pack(side="left", padx=(8, 0))
-
-        def on_click(_=None):
-            self._show_page(page_id)
-
-        def on_enter(_=None):
-            if self._active_page.get() != page_id:
-                frame.configure(bg=T["nav_hover"])
-                inner.configure(bg=T["nav_hover"])
-                icon_lbl.configure(bg=T["nav_hover"])
-                text_lbl.configure(bg=T["nav_hover"])
-
-        def on_leave(_=None):
-            if self._active_page.get() != page_id:
-                frame.configure(bg=T["sidebar"])
-                inner.configure(bg=T["sidebar"])
-                icon_lbl.configure(bg=T["sidebar"])
-                text_lbl.configure(bg=T["sidebar"])
-
-        for w in (frame, inner, icon_lbl, text_lbl):
-            w.bind("<Button-1>", on_click)
-            w.bind("<Enter>", on_enter)
-            w.bind("<Leave>", on_leave)
-
-        return {"frame": frame, "inner": inner,
-                "icon": icon_lbl, "text": text_lbl,
-                "accent": accent}
-
-    def _show_page(self, page_id):
-        T = self._T
-        prev = self._active_page.get()
-
-        # Снять выделение с предыдущего
-        if prev in self._nav_btns:
-            btn = self._nav_btns[prev]
-            btn["frame"].configure(bg=T["sidebar"])
-            btn["inner"].configure(bg=T["sidebar"])
-            btn["icon"].configure(bg=T["sidebar"], fg=T["muted"],
-                                   font=("Segoe UI", 13))
-            btn["text"].configure(bg=T["sidebar"], fg=T["text2"],
-                                   font=("Segoe UI", 10))
-            btn["accent"].pack_forget()
-
-        # Выделить новый
-        self._active_page.set(page_id)
-        if page_id in self._nav_btns:
-            btn = self._nav_btns[page_id]
-            btn["accent"].pack(side="left", fill="y")
-            btn["frame"].configure(bg=T["nav_active"])
-            btn["inner"].configure(bg=T["nav_active"])
-            btn["icon"].configure(bg=T["nav_active"], fg=C_ORANGE,
-                                   font=("Segoe UI", 13, "bold"))
-            btn["text"].configure(bg=T["nav_active"], fg=T["text"],
-                                   font=("Segoe UI", 10, "bold"))
-
-        # Переключить страницу
-        for pid, page in self._pages.items():
-            if pid == page_id:
-                page.pack(fill="both", expand=True)
-            else:
-                page.pack_forget()
-
-    def _update_clock(self):
-        try:
-            msk = timezone(timedelta(hours=3))
-            now = datetime.now(tz=msk)
-        except Exception:
-            now = datetime.now()
-        self._clock_time.set(now.strftime("%H:%M"))
-        self._clock_date.set(now.strftime("%d %B %Y").upper())
-        self.after(60000, self._update_clock)
-
-    # ============================================================
-    # СТАТУС-БАР
-    # ============================================================
-    def _build_statusbar(self):
-        T = self._T
-        sb = tk.Frame(self._workspace, bg=T["surface"], height=28)
-        sb.pack(fill="x", side="bottom")
-        sb.pack_propagate(False)
-
-        tk.Frame(sb, bg=T["border"], height=1).pack(fill="x", side="top")
-
-        self._status_var = tk.StringVar(value="Готов к работе")
-        tk.Label(sb, textvariable=self._status_var,
-                 font=("Segoe UI", 8), bg=T["surface"], fg=T["muted"],
-                 anchor="w").pack(side="left", padx=16)
-
-        self._anim_lbl = tk.Label(sb, text="",
-                                   font=("Segoe UI", 10),
-                                   bg=T["surface"], fg=C_ORANGE)
-        self._anim_lbl.pack(side="right", padx=16)
-
-    # Счётчик активных задач: анализ, сравнение и дашборд могут идти
-    # одновременно — спиннер гаснет, только когда завершилась последняя.
-    def _start_anim(self):
-        self._anim_tasks = getattr(self, "_anim_tasks", 0) + 1
-        if self._anim_tasks == 1:
-            self._anim_running = True
-            self._anim_step = 0
-            self._tick_anim()
-
-    def _stop_anim(self):
-        self._anim_tasks = max(0, getattr(self, "_anim_tasks", 1) - 1)
-        if self._anim_tasks:
-            return
-        self._anim_running = False
-        try:
-            self._anim_lbl.config(text="")
-        except Exception:
-            pass
-
-    def _tick_anim(self):
-        if not self._anim_running:
-            return
-        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        try:
-            self._anim_lbl.config(text=frames[self._anim_step % len(frames)])
-        except Exception:
-            return
-        self._anim_step += 1
-        self.after(100, self._tick_anim)
-
-    # ============================================================
-    # СТРОИТЕЛИ UI-КОМПОНЕНТОВ
-    # ============================================================
-
-    def _page_header(self, parent, title, subtitle=""):
-        T = self._T
-        hdr = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
-        hdr.pack(fill="x", padx=32, pady=(28, 0))
-
-        title_lbl = tk.Label(hdr, text=title,
-                              font=("Segoe UI", 18, "bold"),
-                              bg=T["bg"], fg=T["text"], anchor="w")
-        self._r(title_lbl, "text_bg")
-        title_lbl.pack(anchor="w")
-
-        if subtitle:
-            sub = tk.Label(hdr, text=subtitle,
-                           font=("Segoe UI", 9),
-                           bg=T["bg"], fg=T["muted"], anchor="w")
-            self._r(sub, "muted_bg")
-            sub.pack(anchor="w", pady=(2, 0))
-
-        # Тонкая разделительная линия
-        tk.Frame(hdr, bg=T["border"], height=1).pack(fill="x", pady=(16, 0))
-        return hdr
-
-    def _card(self, parent, title, icon=""):
-        T = self._T
-        wrapper = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
-        wrapper.pack(fill="x", padx=32, pady=(16, 0))
-
-        # Заголовок карточки
-        hdr = self._r(tk.Frame(wrapper, bg=T["bg"]), "bg")
-        hdr.pack(fill="x", pady=(0, 6))
-        if icon:
-            tk.Label(hdr, text=icon, font=("Segoe UI", 10),
-                     bg=T["bg"], fg=C_ORANGE).pack(side="left", padx=(0, 6))
-        lbl = tk.Label(hdr, text=title.upper(),
-                       font=("Segoe UI", 9, "bold"),
-                       bg=T["bg"], fg=T["muted"])
-        self._r(lbl, "muted_bg")
-        lbl.pack(side="left")
-
-        # Тело карточки
-        body = tk.Frame(wrapper, bg=T["surface"],
-                        highlightbackground=T["border"],
-                        highlightthickness=1)
-        self._r(body, "surface")
-        body.pack(fill="x")
-
-        pad = self._r(tk.Frame(body, bg=T["surface"]), "surface")
-        pad.pack(fill="x", padx=16, pady=12)
-        return pad
-
-    def _file_row(self, parent, var, cmd, placeholder="Выберите файл..."):
-        T = self._T
-        row = self._r(tk.Frame(parent, bg=T["surface"]), "surface")
-        row.pack(fill="x")
-
-        # Поле с иконкой
-        entry_frame = tk.Frame(row, bg=T["entry_bg"],
-                               highlightbackground=T["border"],
-                               highlightthickness=1)
-        self._r(entry_frame, "surface")
-        entry_frame.pack(side="left", fill="x", expand=True, padx=(0, 10))
-
-        tk.Label(entry_frame, text="📁",
-                 font=("Segoe UI", 9),
-                 bg=T["entry_bg"], fg=T["muted"],
-                 padx=8).pack(side="left")
-
-        tk.Frame(entry_frame, bg=T["border"], width=1).pack(side="left", fill="y", pady=4)
-
-        e = tk.Entry(entry_frame, textvariable=var,
-                     font=("Segoe UI", 9),
-                     state="readonly", relief="flat", bd=0,
-                     bg=T["entry_bg"], fg=T["entry_fg"],
-                     readonlybackground=T["entry_bg"],
-                     insertbackground=T["entry_fg"])
-        self._r(e, "entry")
-        e.pack(side="left", fill="x", expand=True, ipady=6, padx=8)
-
-        btn = AnimButton(row, C_ORANGE, C_DARK,
-                         text="Обзор",
-                         font=("Segoe UI", 9, "bold"),
-                         fg="#FFFFFF", command=cmd,
-                         padx=18, pady=6)
-        btn.pack(side="left")
-        return btn
-
-    def _log_box(self, parent, height=7):
-        T = self._T
-        frame = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
-        frame.pack(fill="both", expand=True, padx=32, pady=(0, 4))
-
-        box = scrolledtext.ScrolledText(
-            frame, font=("Consolas", 8), height=height,
-            state="disabled", bg=T["log_bg"], fg=T["log_fg"],
-            relief="flat", selectbackground=C_ORANGE,
-            insertbackground=T["log_fg"], padx=12, pady=8,
-            borderwidth=0)
-        box.pack(fill="both", expand=True)
-        box.tag_config("ok",   foreground=T["tag_ok"])
-        box.tag_config("err",  foreground=T["tag_err"])
-        box.tag_config("warn", foreground=T["tag_warn"])
-        box.tag_config("ts",   foreground=T["muted"])
-        return box
-
-    def _progress_row(self, parent):
-        T = self._T
-        row = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
-        row.pack(fill="x", padx=32, pady=(0, 4))
-
-        style = ttk.Style()
-        style.configure("F.Horizontal.TProgressbar",
-                        troughcolor=T["border"],
-                        background=C_ORANGE, thickness=4)
-        bar = ttk.Progressbar(row, style="F.Horizontal.TProgressbar",
-                               mode="determinate")
-        bar.pack(side="left", fill="x", expand=True, padx=(0, 12), ipady=0)
-
-        lbl = tk.Label(row, text="0%", font=("Segoe UI", 8, "bold"),
-                       bg=T["bg"], fg=C_ORANGE, width=5, anchor="e")
-        self._r(lbl, "bg")
-        lbl.pack(side="left")
-        return bar, lbl
-
-    def _run_btn(self, parent, text, cmd, color=C_ORANGE, hover=C_DARK, icon="▶"):
-        row = self._r(tk.Frame(parent, bg=self._T["bg"]), "bg")
-        row.pack(fill="x", padx=32, pady=(12, 20))
-        btn = AnimButton(row, color, hover,
-                         text=f"  {text}  ",
-                         font=("Segoe UI", 10, "bold"),
-                         fg="#FFFFFF", command=cmd,
-                         padx=24, pady=12)
-        btn.pack(side="left")
-        return btn
-
-    def _section_lbl(self, parent, text):
-        T = self._T
-        f = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
-        f.pack(fill="x", padx=32, pady=(16, 6))
-        tk.Frame(f, bg=C_ORANGE, width=2, height=12).pack(side="left", padx=(0, 8))
-        lbl = tk.Label(f, text=text,
-                       font=("Segoe UI", 9, "bold"),
-                       bg=T["bg"], fg=T["muted"])
-        self._r(lbl, "muted_bg")
-        lbl.pack(side="left")
-
-    def _write_log(self, box, msg):
-        # Логи приходят из рабочих потоков, а Tk-виджеты можно трогать только
-        # из главного — перекладываем вызов в очередь событий Tk.
-        if threading.current_thread() is not threading.main_thread():
-            self.after(0, lambda: self._write_log(box, msg))
-            return
-        T = self._T
-        tag = ("ok"   if "✅" in msg or "Готово" in msg else
-               "err"  if "❌" in msg or "ОШИБКА" in msg else
-               "warn" if "⚠" in msg else None)
-        ts = datetime.now().strftime("%H:%M:%S")
-        box.configure(state="normal")
-        box.insert("end", f"[{ts}] ", "ts")
-        line = f"{msg}\n"
-        box.insert("end", line, tag) if tag else box.insert("end", line)
-        box.see("end")
-        box.configure(state="disabled")
-        self._status_var.set(msg[:100])
-
-    # ── Прогресс-лог ─────────────────────────────────────────
+    # Шаги прогресса анализа: ключевое слово из лога → номер шага
     STEPS = {
         "загрузк": 1, "качеств": 2, "клиент": 3, "менеджер": 4,
         "отрасл": 5, "сезонн": 6, "rfm": 7, "лояльн": 8,
         "план": 9, "номенклатур": 10, "сигнал": 11,
         "бухгалт": 12, "сохран": 13, "граф": 14,
     }
-    TOTAL = 14
 
-    def _progress_log(self, bar, pct_lbl):
-        counter = [0]
-        def fn(msg):
-            lo = msg.lower()
-            for kw, step in self.STEPS.items():
-                if kw in lo and step > counter[0]:
-                    counter[0] = step
-                    pct = int(step / self.TOTAL * 100)
-                    self.after(0, lambda p=pct: (
-                        bar.config(value=p),
-                        pct_lbl.config(text=f"{p}%")))
-                    break
-            self._log(msg)
-        return fn
+    def __init__(self):
+        super().__init__()
+        ui.init(self)
+        self.title("Аналитика заказов — Фонтанка.ру")
+        self.geometry(f"{px(1100)}x{px(740)}")
+        self.minsize(px(940), px(640))
+        if os.path.exists(ICON_PATH):
+            try:
+                self.iconbitmap(default=ICON_PATH)
+            except Exception:
+                pass
+
+        self._cfg = load_config()
+        self._date_by = tk.StringVar(value=self._cfg.get("date_by", "order"))
+        self._pages, self._nav = {}, {}
+        self._active = None
+        self._plan_vars = {}
+        self._tasks = 0
+        self._log_count = 0
+        self._last_folder = None
+        self._scroll_canvases = set()
+        self._ui_queue = queue.Queue()
+
+        self._build()
+        self._drain_ui_queue()
+        self._show_page("analysis")
+        ui.style_window(self)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        self._cfg["date_by"] = self._date_by.get()
+        save_config(self._cfg)
+        self.destroy()
+
+    # ── Вызовы из рабочих потоков ────────────────────────────
+    # Tk можно трогать только из главного потока, а after() из чужого потока
+    # ненадёжен. Потоки кладут задание в очередь, главный поток разбирает её.
+    def _ui(self, fn, *args):
+        if threading.current_thread() is threading.main_thread():
+            fn(*args)
+        else:
+            self._ui_queue.put((fn, args))
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn, args = self._ui_queue.get_nowait()
+                fn(*args)
+        except queue.Empty:
+            pass
+        self.after(50, self._drain_ui_queue)
+
+    def _toast(self, message, kind="ok", action_text=None, action_cmd=None, duration=4000):
+        try:
+            Toast(self, message, kind, action_text, action_cmd, duration)
+        except Exception:
+            pass
 
     # ============================================================
-    # СТРАНИЦЫ
+    # КАРКАС: сайдбар | рабочая область (прогресс, страница, журнал)
     # ============================================================
-    def _build_pages(self):
-        T = self._T
-        for page_id, _, _ in self.NAV_ITEMS:
-            frame = self._r(tk.Frame(self._workspace, bg=T["bg"]), "bg")
-            self._pages[page_id] = frame
+    def _build(self):
+        side = tk.Frame(self, bg=T["bg"], width=px(220))
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
 
+        brand = tk.Frame(side, bg=T["bg"])
+        brand.pack(fill="x", padx=px(20), pady=(px(22), px(18)))
+        ui.label(brand, "фонтанка.ру", "brand", fg="brand", bg="bg").pack(anchor="w")
+        ui.label(brand, "Аналитика заказов", "caption", fg="text2", bg="bg").pack(anchor="w")
+
+        for page_id, icon, text in self.NAV_ITEMS:
+            self._nav[page_id] = self._nav_item(side, page_id, icon, text)
+        ui.label(side, f"Версия {VERSION}", "caption", fg="text3", bg="bg").pack(
+            side="bottom", anchor="w", padx=px(20), pady=(0, px(14)))
+        for page_id, icon, text in self.NAV_BOTTOM:
+            self._nav[page_id] = self._nav_item(side, page_id, icon, text, bottom=True)
+
+        work = tk.Frame(self, bg=T["bg"])
+        work.pack(side="left", fill="both", expand=True)
+
+        # Тонкий прогресс над страницей — виден только во время работы
+        self._progress_holder = tk.Frame(work, bg=T["bg"], height=px(3))
+        self._progress_holder.pack(fill="x")
+        self._progress_holder.pack_propagate(False)
+        self._progress = ttk.Progressbar(self._progress_holder, style="Thin.Horizontal.TProgressbar",
+                                         mode="determinate", maximum=100)
+
+        self._build_log(work)
+        self._page_area = tk.Frame(work, bg=T["bg"])
+        self._page_area.pack(fill="both", expand=True)
+
+        for page_id, _, _ in self.NAV_ITEMS + self.NAV_BOTTOM:
+            self._pages[page_id] = tk.Frame(self._page_area, bg=T["bg"])
         self._build_page_analysis()
         self._build_page_compare()
         self._build_page_plan()
-        self._build_page_dashboard()
+        self._build_page_data()
 
-    # ============================================================
-    # СТРАНИЦА 1: АНАЛИЗ
-    # ============================================================
-    def _build_page_analysis(self):
-        p = self._pages["analysis"]
+    def _nav_item(self, parent, page_id, icon, text, bottom=False):
+        row = tk.Frame(parent, bg=T["bg"], cursor="hand2", height=px(38))
+        row.pack(fill="x", padx=px(8), pady=px(1), side="bottom" if bottom else "top")
+        row.pack_propagate(False)
+        pill = tk.Frame(row, bg=T["bg"], width=px(3))
+        pill.pack(side="left", fill="y", pady=px(10))
+        ic = ui.label(row, icon, "icon", fg="text", bg="bg")
+        ic.pack(side="left", padx=(px(12), px(12)))
+        tx = ui.label(row, text, "body", fg="text", bg="bg")
+        tx.pack(side="left")
+        item = {"row": row, "pill": pill, "icon": ic, "text": tx}
 
-        # Скроллируемая область
-        canvas = tk.Canvas(p, bg=self._T["bg"], highlightthickness=0)
-        vsb = ttk.Scrollbar(p, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
+        def paint(bg):
+            for w in (row, ic, tx):
+                w.configure(bg=bg)
+            pill.configure(bg=T["brand"] if self._active == page_id else bg)
 
-        inner = self._r(tk.Frame(canvas, bg=self._T["bg"]), "bg")
-        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        item["paint"] = paint
+        for w in (row, ic, tx):
+            w.bind("<Button-1>", lambda e: self._show_page(page_id))
+            w.bind("<Enter>", lambda e: self._active != page_id and paint("#EAEAEA"))
+            w.bind("<Leave>", lambda e: self._active != page_id and paint(T["bg"]))
+        return item
 
-        def _on_resize(e):
-            canvas.itemconfig(win_id, width=e.width)
-        canvas.bind("<Configure>", _on_resize)
-        inner.bind("<Configure>", lambda e: canvas.configure(
-            scrollregion=canvas.bbox("all")))
+    def _show_page(self, page_id):
+        self._active = page_id
+        for pid, item in self._nav.items():
+            item["paint"](T["subtle_press"] if pid == page_id else T["bg"])
+            item["text"].configure(font=ui.FONTS["strong"] if pid == page_id else ui.FONTS["body"])
+        for pid, page in self._pages.items():
+            if pid == page_id:
+                page.pack(fill="both", expand=True)
+            else:
+                page.pack_forget()
+        if page_id == "data":
+            self._refresh_data_page()
 
-        self._bind_mousewheel(canvas)
+    # ── Общие элементы страниц ───────────────────────────────
+    def _page_header(self, page, title, subtitle):
+        hdr = tk.Frame(page, bg=T["bg"])
+        hdr.pack(fill="x", padx=px(32), pady=(px(26), px(16)))
+        left = tk.Frame(hdr, bg=T["bg"])
+        left.pack(side="left", fill="x", expand=True)
+        ui.label(left, title, "title", bg="bg").pack(anchor="w")
+        ui.label(left, subtitle, "caption", fg="text2", bg="bg").pack(anchor="w", pady=(px(2), 0))
+        actions = tk.Frame(hdr, bg=T["bg"])
+        actions.pack(side="right", anchor="s")
+        return actions
 
-        self._page_header(inner, "Анализ заказов",
-                          "Загрузите выгрузку из CRM и сформируйте отчёт Excel")
+    def _section(self, page, title=None):
+        outer, body = ui.card(page, title)
+        outer.pack(fill="x", padx=px(32), pady=(0, px(12)))
+        return body
 
-        c1 = self._card(inner, "Входной файл", "📂")
-        self.input_var = tk.StringVar(value=self._cfg.get("last_input", ""))
-        self._file_row(c1, self.input_var, self._browse_input)
-
-        c2 = self._card(inner, "Папка для отчёта", "📁")
-        self.output_dir_var = tk.StringVar(value=self._cfg.get("last_output_dir", ""))
-        self._file_row(c2, self.output_dir_var, self._browse_output)
-
-        c3 = self._card(inner, "Настройки", "⚙")
-        self._build_settings_card(c3)
-
-        self._section_lbl(inner, "ПРОГРЕСС")
-        self.main_bar, self.main_pct = self._progress_row(inner)
-
-        self._section_lbl(inner, "СВЕРКА С БУХГАЛТЕРИЕЙ")
-        self._build_recon_indicator(inner)
-
-        self._section_lbl(inner, "ЖУРНАЛ")
-        self.log_box = self._log_box(inner, height=5)
-
-        self._build_kpi_strip(inner)
-        self.run_btn = self._run_btn(inner, "Запустить анализ", self._start_analysis)
+    def _path_row(self, parent, row, caption, var, command):
+        ui.label(parent, caption, "body", fg="text2").grid(row=row, column=0, sticky="w",
+                                                            padx=(0, px(16)), pady=px(4))
+        ttk.Entry(parent, textvariable=var, state="readonly").grid(row=row, column=1, sticky="ew", pady=px(4))
+        ui.button(parent, "Обзор…", command).grid(row=row, column=2, padx=(px(8), 0), pady=px(4))
+        parent.columnconfigure(1, weight=1)
 
     def _bind_mousewheel(self, canvas):
-        # Одна глобальная привязка; прокручиваем тот холст, над которым курсор
-        # (раньше всегда крутился холст «Анализа», даже на других страницах).
-        self._scroll_canvases = getattr(self, "_scroll_canvases", set())
+        # Одна глобальная привязка; прокручиваем тот холст, над которым курсор.
+        # Редакторы регистрируют свои холсты здесь же (см. external_income_editor).
         self._scroll_canvases.add(canvas)
         if getattr(self, "_wheel_bound", False):
             return
@@ -810,463 +367,182 @@ class App(tk.Tk):
                 w.yview_scroll(int(-1 * (e.delta / 120)), "units")
         self.bind_all("<MouseWheel>", _scroll)
 
-    def _build_settings_card(self, parent):
-        T = self._T
-        row1 = self._r(tk.Frame(parent, bg=T["surface"]), "surface")
-        row1.pack(fill="x", pady=(0, 8))
-
-        lbl = tk.Label(row1, text="Дата для группировки:",
-                       font=("Segoe UI", 9), bg=T["surface"], fg=T["text2"])
-        self._r(lbl, "text2_sf")
-        lbl.pack(side="left")
-
-        for val, text in [("order", "дата заказа"), ("payment", "дата оплаты")]:
-            rb = tk.Radiobutton(row1, text=text,
-                                variable=self._date_by, value=val,
-                                bg=T["surface"], fg=T["text"],
-                                activebackground=T["surface"],
-                                selectcolor=T["surface2"],
-                                font=("Segoe UI", 9), cursor="hand2")
-            self._r(rb, "text_sf")
-            rb.pack(side="left", padx=(12, 0))
-
-        row2 = self._r(tk.Frame(parent, bg=T["surface"]), "surface")
-        row2.pack(fill="x")
-
-        lbl2 = tk.Label(row2, text="Данные бухгалтерии:",
-                        font=("Segoe UI", 9), bg=T["surface"], fg=T["text2"])
-        self._r(lbl2, "text2_sf")
-        lbl2.pack(side="left")
-
-        if HAS_VF_EDITOR:
-            AnimButton(row2, T["surface2"], T["border"],
-                       text="Верифицированные цифры",
-                       font=("Segoe UI", 9), fg=T["text"],
-                       command=self._open_verified_editor,
-                       padx=10, pady=4).pack(side="left", padx=(12, 6))
-
-        if HAS_EXT_EDITOR:
-            AnimButton(row2, T["surface2"], T["border"],
-                       text="Внешние доходы",
-                       font=("Segoe UI", 9), fg=T["text"],
-                       command=self._open_external_editor,
-                       padx=10, pady=4).pack(side="left", padx=(0, 6))
-
-        if HAS_DOHODY_IMPORT:
-            AnimButton(row2, T["surface2"], T["border"],
-                       text="Импорт Доходы.xlsx",
-                       font=("Segoe UI", 9), fg=T["text"],
-                       command=self._open_dohody_import,
-                       padx=10, pady=4).pack(side="left", padx=(0, 6))
-
-        if HAS_ALIASES_EDITOR:
-            AnimButton(row2, T["surface2"], T["border"],
-                       text="Алиасы клиентов",
-                       font=("Segoe UI", 9), fg=T["text"],
-                       command=self._open_aliases_editor,
-                       padx=10, pady=4).pack(side="left")
-
-    def _build_recon_indicator(self, parent):
-        T = self._T
-        f = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
-        f.pack(fill="x", padx=32, pady=(0, 4))
-
-        self._recon_label = tk.Label(
-            f, text="  Сверка появится после запуска анализа",
-            font=("Segoe UI", 9), bg=T["surface"], fg=T["muted"],
-            anchor="w", justify="left", padx=12, pady=10,
-            relief="flat")
-        self._r(self._recon_label, "muted_sf")
-        self._recon_label.pack(fill="x")
-
-    # ── KPI-полоска ──────────────────────────────────────────
-    def _build_kpi_strip(self, parent):
-        T = self._T
-        self._kpi_frame = self._r(tk.Frame(parent, bg=T["bg"]), "bg")
-
-        defs = [
-            ("crm",      "CRM",       "тыс. руб.",  C_ORANGE),
-            ("external", "Внешние",   "тыс. руб.",  C_BLUE),
-            ("grand",    "Итого",     "тыс. руб.",  "#8B5CF6"),
-            ("dev",      "Отклонение","от плана",   C_GREEN),
-        ]
-        self._kpi_cards = {}
-        for key, title, unit, color in defs:
-            card = tk.Frame(self._kpi_frame, bg=T["surface"],
-                            highlightbackground=T["border"],
-                            highlightthickness=1)
-            card.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=8, ipadx=12)
-
-            # Верхняя цветная полоска
-            tk.Frame(card, bg=color, height=2).pack(fill="x")
-
-            tk.Label(card, text=title,
-                     font=("Segoe UI", 9, "bold"),
-                     bg=T["surface"], fg=color).pack(anchor="w", padx=10, pady=(8, 0))
-
-            val_var = tk.StringVar(value="—")
-            tk.Label(card, textvariable=val_var,
-                     font=("Segoe UI", 16, "bold"),
-                     bg=T["surface"], fg=T["text"]).pack(anchor="w", padx=10)
-
-            tk.Label(card, text=unit,
-                     font=("Segoe UI", 9),
-                     bg=T["surface"], fg=T["muted"]).pack(anchor="w", padx=10, pady=(0, 8))
-
-            self._kpi_cards[key] = (card, val_var, color)
-
-    def _show_kpi_cards(self, result: dict):
-        if not hasattr(self, "_kpi_frame"):
-            return
-        T = self._T
-
-        crm_k   = result.get("crm_total", 0)
-        ext_k   = result.get("full_external_total", result.get("external_total", 0))
-        grand_k = result.get("grand_total", 0)
-        pct     = result.get("deviation_pct")
-
-        def _fmt(v):
-            return f"{v:,.0f}".replace(",", " ")
-
-        card, var, _ = self._kpi_cards["crm"]
-        var.set(_fmt(crm_k))
-
-        card, var, _ = self._kpi_cards["external"]
-        var.set(_fmt(ext_k))
-
-        card, var, _ = self._kpi_cards["grand"]
-        var.set(_fmt(grand_k))
-
-        card, var, _ = self._kpi_cards["dev"]
-        if pct is not None:
-            sign = "+" if pct >= 0 else ""
-            var.set(f"{sign}{pct:.2f}%")
-            dev_color = C_GREEN if abs(pct) < 2 else (C_AMBER if abs(pct) < 5 else C_RED)
-        else:
-            var.set("—")
-            dev_color = T["muted"]
-        card.configure(highlightbackground=dev_color)
-        for w in card.winfo_children():
-            if isinstance(w, tk.Label) and "16" in str(w.cget("font")):
-                w.configure(fg=dev_color)
-                break
-
-        for key, (c, v, color) in self._kpi_cards.items():
-            c.configure(bg=T["surface"])
-            for w in c.winfo_children():
-                if isinstance(w, tk.Label):
-                    w.configure(bg=T["surface"])
-
-        if not self._kpi_frame.winfo_ismapped():
-            self._kpi_frame.pack(fill="x", padx=32, pady=(0, 4),
-                                 before=self.run_btn.master)
-
-    def _open_external_editor(self):
-        path = os.path.join(APP_DIR, "external_income.json")
-        if not os.path.exists(path):
-            messagebox.showerror("Нет файла",
-                f"Файл external_income.json не найден:\n{path}")
-            return
-        ExternalIncomeEditor(self, path, theme=self._T)
-
-    def _open_dohody_import(self):
-        path = os.path.join(APP_DIR, "external_income.json")
-        DohodyImportDialog(self, path, theme=self._T)
-
-    def _open_aliases_editor(self):
-        path = os.path.join(APP_DIR, "client_aliases.json")
-        if not os.path.exists(path):
-            default = {
-                "_описание": "Правила нормализации клиентов.",
-                "groups": []
-            }
-            try:
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(default, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
-                return
-        ClientAliasesEditor(self, path, theme=self._T)
-
-    def _open_verified_editor(self):
-        path = os.path.join(APP_DIR, "verified_figures.json")
-        if not os.path.exists(path):
-            default = {
-                "_описание": "Верифицированные годовые итоги из бухгалтерии.",
-                "_год": 2025,
-                "total_with_prog": 482404000,
-                "total_with_barter_no_prog": 363000166,
-                "advertising_no_events": 243005820,
-                "programmatic_external": 119403897,
-                "other_external_income": 41057102,
-            }
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(default, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                messagebox.showerror("Ошибка", str(e))
-                return
-        VerifiedFiguresEditor(self, path, theme=self._T)
-
     # ============================================================
-    # СТРАНИЦА 2: СРАВНЕНИЕ
+    # ЖУРНАЛ — один на все страницы, по умолчанию свёрнут
     # ============================================================
-    def _build_page_compare(self):
-        p = self._pages["compare"]
+    def _build_log(self, parent):
+        wrap = tk.Frame(parent, bg=T["bg"])
+        wrap.pack(fill="x", side="bottom", padx=px(32), pady=(px(4), px(18)))
+        self._log_exp = ui.Expander(wrap, "Журнал")
+        self._log_exp.pack(fill="x")
+        self._status = ui.label(self._log_exp.header, "", "caption", fg="text3", bg="bg")
+        self._status.pack(side="left", padx=(px(16), 0))
+        self._open_folder_btn = ui.button(self._log_exp.header, "Открыть папку", self._open_last_folder,
+                                          kind="Subtle", on="bg", icon=ICON["folder"])
 
-        canvas = tk.Canvas(p, bg=self._T["bg"], highlightthickness=0)
-        vsb = ttk.Scrollbar(p, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        inner = self._r(tk.Frame(canvas, bg=self._T["bg"]), "bg")
-        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(win_id, width=e.width))
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        self._bind_mousewheel(canvas)
-
-        self._page_header(inner, "Сравнение периодов",
-                          "Сравните показатели двух произвольных периодов")
-
-        def period_block(title, path_var, label_var):
-            c = self._card(inner, title)
-            self._file_row(c, path_var,
-                           lambda v=path_var: self._browse_cmp(v))
-            row = self._r(tk.Frame(c, bg=self._T["surface"]), "surface")
-            row.pack(fill="x", pady=(8, 0))
-            lbl = tk.Label(row, text="Метка периода:",
-                           font=("Segoe UI", 9),
-                           bg=self._T["surface"], fg=self._T["text2"])
-            self._r(lbl, "text2_sf")
-            lbl.pack(side="left")
-            e = tk.Entry(row, textvariable=label_var,
-                         font=("Segoe UI", 9), width=22,
-                         relief="flat", bd=0,
-                         highlightbackground=self._T["border"],
-                         highlightthickness=1,
-                         bg=self._T["entry_bg"], fg=self._T["entry_fg"])
-            self._r(e, "entry")
-            e.pack(side="left", padx=12, ipady=4)
-
-        self.cmp_path_a  = tk.StringVar()
-        self.cmp_label_a = tk.StringVar(value="Период А")
-        self.cmp_path_b  = tk.StringVar()
-        self.cmp_label_b = tk.StringVar(value="Период Б")
-        period_block("Период А  ←", self.cmp_path_a, self.cmp_label_a)
-        period_block("Период Б  →", self.cmp_path_b, self.cmp_label_b)
-
-        co = self._card(inner, "Папка для отчёта", "📁")
-        self.cmp_output_dir = tk.StringVar(
-            value=self._cfg.get("last_output_dir", ""))
-        self._file_row(co, self.cmp_output_dir, self._browse_cmp_output)
-
-        self._section_lbl(inner, "ЖУРНАЛ")
-        self.cmp_log_box = self._log_box(inner, height=5)
-        self.cmp_run_btn = self._run_btn(inner, "Сравнить периоды",
-                                          self._start_comparison)
-
-    # ============================================================
-    # СТРАНИЦА 3: ПЛАН
-    # ============================================================
-    def _build_page_plan(self):
-        p = self._pages["plan"]
-        T = self._T
-
-        self._page_header(p, "Планы менеджеров",
-                          "Плановые суммы в тыс. руб. — сохраняются автоматически")
-
-        outer = self._r(tk.Frame(p, bg=T["bg"]), "bg")
-        outer.pack(fill="both", expand=True, padx=32, pady=(12, 0))
-
-        canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-
-        self._plan_inner = self._r(
-            tk.Frame(canvas, bg=T["surface"]), "surface")
-        self._plan_inner.bind("<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self._plan_inner, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
+        holder, body = ui.card(self._log_exp.body, pad=8)
+        holder.pack(fill="x")
+        self._log_box = tk.Text(
+            body, font=ui.FONTS["mono"], height=9, state="disabled", relief="flat", bd=0,
+            bg=T["card"], fg=T["text"], selectbackground=T["brand"], padx=px(4), pady=px(2), wrap="word")
+        sb = ttk.Scrollbar(body, orient="vertical", command=self._log_box.yview,
+                           style="Thin.Vertical.TScrollbar")
+        self._log_box.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        self._bind_mousewheel(canvas)
+        self._log_box.pack(side="left", fill="both", expand=True)
+        for tag, color in (("ok", T["ok"]), ("err", T["err"]), ("warn", T["warn"]), ("ts", T["text3"])):
+            self._log_box.tag_config(tag, foreground=color)
 
-        # Заголовок таблицы
-        hdr = tk.Frame(self._plan_inner, bg=T["surface2"])
-        hdr.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Frame(hdr, bg=C_ORANGE, width=3).pack(side="left", fill="y")
-        tk.Label(hdr, text="  Менеджер",
-                 font=("Segoe UI", 8, "bold"),
-                 bg=T["surface2"], fg=T["text2"],
-                 width=32, anchor="w", pady=8).pack(side="left")
-        tk.Label(hdr, text="План, тыс. руб.",
-                 font=("Segoe UI", 8, "bold"),
-                 bg=T["surface2"], fg=T["text2"],
-                 width=18, pady=8).pack(side="left")
-
-        saved    = self._cfg.get("manager_plan", {})
-        managers = list(dict.fromkeys([
-            "Петрова Э.", "Егорова И.", "Демахина Е.",
-            "Дубровская Т.", "Долгополова Н.", "Демидова Г.",
-            "Сосновик А.", "Киселёва Е.", "Лея К.",
-            "Борисенко Е.", "Сорокина Т.", "Шевчук Е.", "Карпус О.",
-        ] + list(saved.keys())))
-        for i, name in enumerate(managers, 1):
-            self._add_plan_row(name, str(saved.get(name, "")), i)
-
-        # Строка добавления
-        add_frame = self._r(tk.Frame(p, bg=T["bg"]), "bg")
-        add_frame.pack(fill="x", padx=32, pady=(8, 20))
-
-        tk.Label(add_frame, text="Добавить менеджера:",
-                 font=("Segoe UI", 9),
-                 bg=T["bg"], fg=T["text2"]).pack(side="left")
-        self._r(add_frame.winfo_children()[-1], "text2_bg")
-
-        self._new_mgr = tk.StringVar()
-        ne = tk.Entry(add_frame, textvariable=self._new_mgr,
-                      font=("Segoe UI", 9), width=24,
-                      relief="flat", bd=0,
-                      highlightbackground=T["border"],
-                      highlightthickness=1,
-                      bg=T["entry_bg"], fg=T["entry_fg"])
-        self._r(ne, "entry")
-        ne.pack(side="left", padx=12, ipady=5)
-
-        AnimButton(add_frame, C_ORANGE, C_DARK,
-                   text="+ Добавить",
-                   font=("Segoe UI", 9, "bold"),
-                   fg="#FFFFFF", command=self._add_manager_ui,
-                   padx=14, pady=5).pack(side="left")
-
-    def _add_plan_row(self, name, val="", idx=None):
-        T = self._T
-        if idx is None:
-            idx = len(self._plan_vars) + 1
-        even = idx % 2 == 0
-        bg = T["surface"] if even else T["surface2"]
-
-        lbl = tk.Label(self._plan_inner, text=f"  {name}",
-                       font=("Segoe UI", 9), bg=bg,
-                       fg=T["text"], anchor="w", pady=6)
-        lbl.grid(row=idx, column=0, sticky="ew")
-        self._plan_inner.columnconfigure(0, weight=1)
-
-        var = tk.StringVar(value=val)
-        var.trace_add("write",
-                      lambda *_, n=name, v=var: self._save_plan(n, v))
-        self._plan_vars[name] = var
-
-        ent = tk.Entry(self._plan_inner, textvariable=var,
-                       font=("Segoe UI", 9), width=16,
-                       relief="flat", bd=0,
-                       highlightbackground=T["border"],
-                       highlightthickness=1,
-                       bg=bg, fg=T["text"],
-                       insertbackground=T["text"])
-        ent.grid(row=idx, column=1, pady=2, padx=8)
-
-    def _add_manager_ui(self):
-        name = self._new_mgr.get().strip()
-        if not name:
+    def _log(self, msg):
+        # Логи приходят из рабочих потоков, а Tk-виджеты можно трогать только
+        # из главного — перекладываем вызов в очередь событий Tk.
+        if threading.current_thread() is not threading.main_thread():
+            self._ui(self._log, msg)
             return
-        if name in self._plan_vars:
-            messagebox.showinfo("", f"«{name}» уже есть.")
-            return
-        self._add_plan_row(name)
-        self._new_mgr.set("")
+        tag = ("ok" if "✅" in msg or "Готово" in msg else
+               "err" if "❌" in msg or "ОШИБКА" in msg else
+               "warn" if "⚠" in msg else None)
+        box = self._log_box
+        box.configure(state="normal")
+        box.insert("end", datetime.now().strftime("%H:%M:%S  "), "ts")
+        box.insert("end", msg + "\n", tag or ())
+        box.see("end")
+        box.configure(state="disabled")
+        self._log_count += 1
+        self._log_exp.set_title(f"Журнал ({self._log_count})")
+        self._status.configure(text=msg[:90])
+        if tag in ("err", "warn"):
+            self._log_exp.toggle(True)  # замечания не должны прятаться
 
-    def _save_plan(self, name, var):
-        plans = self._cfg.setdefault("manager_plan", {})
-        val = var.get().strip()
-        if val:
-            plans[name] = val
+    def _open_last_folder(self):
+        if self._last_folder and os.path.isdir(self._last_folder):
+            os.startfile(self._last_folder)
+
+    def _report_ready(self, path, title):
+        self._last_folder = os.path.dirname(path)
+        self._open_folder_btn.pack(side="right")
+        self._toast(f"{title}: {os.path.basename(path)}", "ok", "Открыть папку",
+                    self._open_last_folder, duration=6000)
+
+    # ============================================================
+    # ФОНОВЫЕ ЗАДАЧИ: прогресс + блокировка кнопки + обработка ошибок
+    # ============================================================
+    def _run_task(self, button, busy_text, worker, determinate=False):
+        idle_text = button.cget("text")
+        button.configure(state="disabled", text=busy_text)
+        self._tasks += 1
+        if self._tasks == 1:
+            self._progress.pack(fill="both", expand=True)
+        if determinate:  # анализ — проценты по шагам; остальное — «бегущая» полоса
+            self._progress.stop()
+            self._progress.configure(mode="determinate", value=0)
+        elif self._tasks == 1:
+            self._progress.configure(mode="indeterminate")
+            self._progress.start(12)
+
+        def finish():
+            button.configure(state="normal", text=idle_text)
+            self._tasks = max(0, self._tasks - 1)
+            if not self._tasks:
+                self._progress.stop()
+                self._progress.pack_forget()
+
+        def run():
+            try:
+                worker()
+            except Exception as e:
+                # Копируем текст: после выхода из except имя `e` удаляется
+                err = str(e)
+                self._log(f"❌ ОШИБКА: {err}")
+                self._ui(lambda: messagebox.showerror("Ошибка", err, parent=self))
+            finally:
+                self._ui(finish)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _set_progress(self, value):
+        if self._progress.cget("mode") == "determinate":
+            self._progress.configure(value=value)
+
+    # ============================================================
+    # СТРАНИЦА: АНАЛИЗ
+    # ============================================================
+    def _build_page_analysis(self):
+        p = self._pages["analysis"]
+        actions = self._page_header(p, "Анализ заказов", "Выгрузка CRM → отчёт Excel и HTML-дашборд")
+        self.run_btn = ui.button(actions, "Запустить анализ", self._start_analysis,
+                                 kind="Accent", on="bg", icon=ICON["play"])
+        self.run_btn.pack(side="right")
+        self.dash_btn = ui.button(actions, "Открыть дашборд", self._start_dashboard,
+                                  on="bg", icon=ICON["globe"])
+        self.dash_btn.pack(side="right", padx=(0, px(8)))
+
+        src = self._section(p, "Источник")
+        grid = tk.Frame(src, bg=T["card"])
+        grid.pack(fill="x")
+        self.input_var = tk.StringVar(value=self._cfg.get("last_input", ""))
+        self.output_dir_var = tk.StringVar(value=self._cfg.get("last_output_dir", ""))
+        self._path_row(grid, 0, "Файл CRM", self.input_var, self._browse_input)
+        self._path_row(grid, 1, "Папка отчёта", self.output_dir_var, self._browse_output)
+        ui.label(grid, "Группировать по", "body", fg="text2").grid(row=2, column=0, sticky="w",
+                                                                   pady=(px(10), 0))
+        radios = tk.Frame(grid, bg=T["card"])
+        radios.grid(row=2, column=1, columnspan=2, sticky="w", pady=(px(10), 0))
+        for val, text in (("order", "дате заказа"), ("payment", "дате оплаты")):
+            ttk.Radiobutton(radios, text=text, variable=self._date_by, value=val).pack(
+                side="left", padx=(0, px(20)))
+
+        # Результат: сверка и KPI — появляются после первого запуска
+        self._result = tk.Frame(p, bg=T["bg"])
+        self._recon_bar = ui.InfoBar(self._result)
+        self._recon_bar.pack(fill="x", pady=(0, px(12)))
+        kpis = tk.Frame(self._result, bg=T["bg"])
+        kpis.pack(fill="x")
+        self._kpi = {}
+        for i, (key, caption) in enumerate((("crm", "CRM, тыс. ₽"), ("external", "Внешние, тыс. ₽"),
+                                            ("grand", "Итого, тыс. ₽"), ("dev", "Отклонение от бухгалтерии"))):
+            outer, body = ui.card(kpis, pad=14)
+            outer.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else px(6), 0))
+            kpis.columnconfigure(i, weight=1, uniform="kpi")
+            ui.label(body, caption, "caption", fg="text2").pack(anchor="w")
+            value = ui.label(body, "—", "kpi")
+            value.pack(anchor="w", pady=(px(2), 0))
+            self._kpi[key] = value
+
+    def _show_result(self, result):
+        pct = result.get("deviation_pct")
+        grand = result.get("grand_total", 0)
+        verified = result.get("verified_total", 0)
+        by = "по дате оплаты" if result.get("date_by") == "payment" else "по дате заказа"
+
+        if pct is None or verified <= 0:
+            self._recon_bar.set("info", f"CRM + внешние доходы: {_fmt_k(grand)} тыс. ₽. "
+                                        "Сверка с бухгалтерией не применима — подробности в журнале.")
         else:
-            plans.pop(name, None)
-        save_config(self._cfg)
+            kind = "ok" if abs(pct) < RECON_WARN_PCT else "warn" if abs(pct) < RECON_BAD_PCT else "err"
+            self._recon_bar.set(kind, f"Сверка {by}: CRM + внешние {_fmt_k(grand)} тыс. ₽ · "
+                                      f"бухгалтерия {_fmt_k(verified)} тыс. ₽ · "
+                                      f"{pct:+.2f}% — {recon_verdict(pct)}")
 
-    def _get_plan_rub(self):
-        result = {}
-        for name, var in self._plan_vars.items():
-            val = var.get().strip().replace(",", ".")
-            if val:
-                try:
-                    result[name] = float(val) * 1000
-                except ValueError:
-                    pass
-        return result or None
+        self._kpi["crm"].configure(text=_fmt_k(result.get("crm_total", 0)))
+        self._kpi["external"].configure(text=_fmt_k(result.get("full_external_total", 0)))
+        self._kpi["grand"].configure(text=_fmt_k(grand))
+        if pct is None:
+            self._kpi["dev"].configure(text="—", fg=T["text3"])
+        else:
+            color = T["ok"] if abs(pct) < RECON_WARN_PCT else T["warn"] if abs(pct) < RECON_BAD_PCT else T["err"]
+            self._kpi["dev"].configure(text=f"{pct:+.2f}%", fg=color)
+        if not self._result.winfo_ismapped():
+            self._result.pack(fill="x", padx=px(32))
 
-    # ============================================================
-    # СТРАНИЦА 4: ДАШБОРД
-    # ============================================================
-    def _build_page_dashboard(self):
-        p = self._pages["dashboard"]
-        T = self._T
-
-        self._page_header(p, "HTML-Дашборд",
-                          "Интерактивный дашборд с графиками — открывается в браузере")
-
-        c1 = self._card(p, "Входной файл", "📂")
-        self.dash_input_var = tk.StringVar(
-            value=self._cfg.get("last_input", ""))
-        self._file_row(c1, self.dash_input_var, self._browse_dash_input)
-
-        # Превью-карточки
-        preview_wrap = self._r(tk.Frame(p, bg=T["bg"]), "bg")
-        preview_wrap.pack(fill="x", padx=32, pady=(20, 0))
-
-        self._section_lbl(p, "СОДЕРЖИМОЕ ДАШБОРДА")
-
-        grid = self._r(tk.Frame(p, bg=T["bg"]), "bg")
-        grid.pack(fill="x", padx=32, pady=(4, 0))
-
-        items = [
-            ("📈", "Выручка по месяцам",  "Линейный с градиентом",  C_ORANGE),
-            ("🏆", "Топ-10 клиентов",     "Горизонтальный bar",     C_BLUE),
-            ("👤", "Топ-10 менеджеров",   "Вертикальный bar",       C_GREEN),
-            ("🍩", "Выручка по отраслям", "Doughnut-диаграмма",     "#8B5CF6"),
-        ]
-        for i, (icon, title, desc, color) in enumerate(items):
-            card = tk.Frame(grid, bg=T["surface"],
-                            highlightbackground=T["border"],
-                            highlightthickness=1)
-            card.grid(row=0, column=i, sticky="nsew",
-                      padx=(0, 8) if i < 3 else 0, pady=4, ipady=12)
-            grid.columnconfigure(i, weight=1)
-
-            tk.Frame(card, bg=color, height=2).pack(fill="x")
-            tk.Label(card, text=icon, font=("Segoe UI", 24),
-                     bg=T["surface"]).pack(pady=(12, 4))
-            tk.Label(card, text=title,
-                     font=("Segoe UI", 9, "bold"),
-                     bg=T["surface"], fg=T["text"]).pack()
-            tk.Label(card, text=desc,
-                     font=("Segoe UI", 8),
-                     bg=T["surface"], fg=T["muted"]).pack(pady=(2, 8))
-
-        self._section_lbl(p, "ЖУРНАЛ")
-        self.dash_log_box = self._log_box(p, height=5)
-
-        self.dash_btn = self._run_btn(
-            p, "Открыть дашборд в браузере",
-            self._start_dashboard,
-            color="#1D4ED8", hover="#1E40AF")
-
-    # ============================================================
-    # BROWSE / LOG
-    # ============================================================
     def _browse_input(self):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
         if path:
             self.input_var.set(path)
             self._cfg["last_input"] = path
             if not self.output_dir_var.get():
-                d = os.path.dirname(path)
-                self.output_dir_var.set(d)
-                self._cfg["last_output_dir"] = d
+                self.output_dir_var.set(os.path.dirname(path))
+                self._cfg["last_output_dir"] = os.path.dirname(path)
             save_config(self._cfg)
 
     def _browse_output(self):
@@ -1275,6 +551,79 @@ class App(tk.Tk):
             self.output_dir_var.set(path)
             self._cfg["last_output_dir"] = path
             save_config(self._cfg)
+
+    def _start_analysis(self):
+        inp = self.input_var.get().strip()
+        out = self.output_dir_var.get().strip()
+        if not inp:
+            messagebox.showwarning("", "Выберите файл выгрузки CRM.", parent=self)
+            return
+        if not out:
+            messagebox.showwarning("", "Укажите папку для отчёта.", parent=self)
+            return
+        out_path = os.path.join(out, f"аналитика_заказов_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+        plan = self._get_plan_rub()
+        date_by = self._date_by.get()  # Tk-переменную читаем в главном потоке
+        step = [0]
+
+        def log(msg):
+            lo = msg.lower()
+            for kw, n in self.STEPS.items():
+                if kw in lo and n > step[0]:
+                    step[0] = n
+                    self._ui(self._set_progress, n / len(self.STEPS) * 100)
+                    break
+            self._log(msg)
+
+        def work():
+            log(f"Файл: {os.path.basename(inp)}")
+            result = run_analytics(inp, out_path, log=log, manager_plan=plan, date_by=date_by,
+                                   verified_path=VERIFIED_PATH, external_path=EXTERNAL_INCOME_PATH)
+            self._ui(self._show_result, result)
+            self._ui(self._report_ready, result.get("output_path", out_path), "Отчёт готов")
+
+        self._run_task(self.run_btn, "Выполняется…", work, determinate=True)
+
+    def _start_dashboard(self):
+        inp = self.input_var.get().strip()
+        if not inp:
+            messagebox.showwarning("", "Выберите файл выгрузки CRM.", parent=self)
+            return
+
+        def work():
+            path = generate_dashboard(inp, log=self._log)
+            self._ui(self._report_ready, path, "Дашборд открыт")
+
+        self._run_task(self.dash_btn, "Готовлю…", work)
+
+    # ============================================================
+    # СТРАНИЦА: СРАВНЕНИЕ
+    # ============================================================
+    def _build_page_compare(self):
+        p = self._pages["compare"]
+        actions = self._page_header(p, "Сравнение периодов", "Две выгрузки CRM: менеджеры, клиенты, движение клиентов")
+        self.cmp_run_btn = ui.button(actions, "Сравнить", self._start_comparison,
+                                     kind="Accent", on="bg", icon=ICON["compare"])
+        self.cmp_run_btn.pack(side="right")
+
+        self.cmp_path_a, self.cmp_path_b = tk.StringVar(), tk.StringVar()
+        self.cmp_label_a = tk.StringVar(value="Период А")
+        self.cmp_label_b = tk.StringVar(value="Период Б")
+        self.cmp_output_dir = tk.StringVar(value=self._cfg.get("last_output_dir", ""))
+
+        for title, path_var, label_var in (("Период А", self.cmp_path_a, self.cmp_label_a),
+                                           ("Период Б", self.cmp_path_b, self.cmp_label_b)):
+            body = self._section(p, title)
+            grid = tk.Frame(body, bg=T["card"])
+            grid.pack(fill="x")
+            self._path_row(grid, 0, "Файл CRM", path_var, lambda v=path_var: self._browse_cmp(v))
+            ui.label(grid, "Метка в отчёте", "body", fg="text2").grid(row=1, column=0, sticky="w", pady=px(4))
+            ttk.Entry(grid, textvariable=label_var, width=24).grid(row=1, column=1, sticky="w", pady=px(4))
+
+        body = self._section(p)
+        grid = tk.Frame(body, bg=T["card"])
+        grid.pack(fill="x")
+        self._path_row(grid, 0, "Папка отчёта", self.cmp_output_dir, self._browse_cmp_output)
 
     def _browse_cmp(self, var):
         path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
@@ -1288,203 +637,204 @@ class App(tk.Tk):
         if path:
             self.cmp_output_dir.set(path)
 
-    def _browse_dash_input(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xls")])
-        if path:
-            self.dash_input_var.set(path)
-            self._cfg["last_input"] = path
-            self.input_var.set(path)
-            save_config(self._cfg)
-
-    def _log(self, msg):
-        self._write_log(self.log_box, msg)
-
-    def _cmp_log(self, msg):
-        self._write_log(self.cmp_log_box, msg)
-
-    def _dash_log(self, msg):
-        self._write_log(self.dash_log_box, msg)
-
-    # ============================================================
-    # АНАЛИЗ
-    # ============================================================
-    def _start_analysis(self):
-        inp = self.input_var.get().strip()
-        out = self.output_dir_var.get().strip()
-        if not inp:
-            messagebox.showwarning("", "Выберите входной файл.")
-            return
-        if not out:
-            messagebox.showwarning("", "Укажите папку для отчёта.")
-            return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(out, f"аналитика_заказов_{ts}.xlsx")
-        plan = self._get_plan_rub()
-        date_by = self._date_by.get()  # читаем Tk-переменную в главном потоке
-        self.main_bar.config(value=0)
-        self.main_pct.config(text="0%")
-        self.run_btn.configure(state="disabled", text="  Выполняется...  ")
-        self._start_anim()
-        self._recon_label.config(text="  Считаю...", fg=self._T["muted"])
-        log_fn = self._progress_log(self.main_bar, self.main_pct)
-        threading.Thread(target=self._thread_analysis,
-                         args=(inp, out_path, plan, log_fn, date_by),
-                         daemon=True).start()
-
-    def _thread_analysis(self, inp, out_path, plan, log_fn, date_by):
-        try:
-            log_fn(f"Файл: {os.path.basename(inp)}")
-            result = run_analytics(inp, out_path,
-                                   log=log_fn,
-                                   manager_plan=plan,
-                                   date_by=date_by,
-                                   verified_path=VERIFIED_PATH,
-                                   external_path=EXTERNAL_INCOME_PATH)
-            log_fn(f"✅ Готово: {out_path}")
-            self.after(0, lambda: (
-                self.main_bar.config(value=100),
-                self.main_pct.config(text="100%")))
-
-            if isinstance(result, dict):
-                path = result.get("output_path", out_path)
-                self.after(0, lambda r=result: self._update_recon(r))
-                self.after(0, lambda r=result: self._show_kpi_cards(r))
-                folder = os.path.dirname(path)
-                self.after(200, lambda p=path, f=folder: self._toast(
-                    f"Отчёт готов: {os.path.basename(p)}",
-                    kind="ok",
-                    action_text="Открыть папку",
-                    action_cmd=lambda: os.startfile(f),
-                    duration=6000))
-            else:
-                path = result or out_path
-                folder = os.path.dirname(path)
-                self.after(200, lambda p=path, f=folder: self._toast(
-                    f"Отчёт готов: {os.path.basename(p)}",
-                    kind="ok",
-                    action_text="Открыть папку",
-                    action_cmd=lambda: os.startfile(f),
-                    duration=6000))
-
-            self.after(0, lambda: self._on_success(path))
-        except Exception as e:
-            err = str(e)
-            log_fn(f"❌ ОШИБКА: {err}")
-            self.after(200, lambda m=err: self._toast(
-                f"Ошибка: {m[:80]}", kind="err", duration=7000))
-            self.after(0, lambda: messagebox.showerror("Ошибка", err))
-        finally:
-            self.after(0, self._stop_anim)
-            self.after(0, lambda: self.run_btn.configure(
-                state="normal", text="  Запустить анализ  "))
-
-    def _update_recon(self, result):
-        pct      = result.get("deviation_pct")
-        grand    = result.get("grand_total", 0)
-        verified = result.get("verified_total", 0)
-        date_by  = result.get("date_by", "order")
-
-        if pct is None or verified <= 0:
-            self._recon_label.config(
-                text=f"  CRM + внешние: {grand:,.0f} тыс. руб.".replace(",", " "),
-                fg=self._T["text"])
-            return
-
-        if abs(pct) < 2:
-            color, icon, verdict = C_GREEN, "✓", "отлично"
-        elif abs(pct) < 5:
-            color, icon, verdict = C_AMBER, "!", "в норме"
-        else:
-            color, icon, verdict = C_RED, "✕", "большое расхождение"
-
-        date_label = "дата оплаты" if date_by == "payment" else "дата заказа"
-        text = (f"  {icon}  {date_label.capitalize()}: "
-                f"CRM+внешние {grand:,.0f} тыс.  │  "
-                f"Цель {verified:,.0f} тыс.  │  "
-                f"{pct:+.2f}% — {verdict}").replace(",", " ")
-        self._recon_label.config(text=text, fg=color)
-
-    # ============================================================
-    # СРАВНЕНИЕ
-    # ============================================================
     def _start_comparison(self):
-        pa = self.cmp_path_a.get().strip()
-        pb = self.cmp_path_b.get().strip()
+        pa, pb = self.cmp_path_a.get().strip(), self.cmp_path_b.get().strip()
         od = self.cmp_output_dir.get().strip()
-        la = self.cmp_label_a.get().strip() or "Период А"
-        lb = self.cmp_label_b.get().strip() or "Период Б"
-        if not pa:
-            messagebox.showwarning("", "Выберите файл периода А.")
-            return
-        if not pb:
-            messagebox.showwarning("", "Выберите файл периода Б.")
-            return
-        if not od:
-            messagebox.showwarning("", "Укажите папку для отчёта.")
-            return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(od, f"сравнение_{ts}.xlsx")
-        self.cmp_run_btn.configure(state="disabled", text="  Выполняется...  ")
-        self._start_anim()
-        threading.Thread(target=self._thread_comparison,
-                         args=(pa, pb, out_path, la, lb),
-                         daemon=True).start()
+        la, lb = self.cmp_label_a.get().strip(), self.cmp_label_b.get().strip()
+        for value, msg in ((pa, "Выберите файл периода А."), (pb, "Выберите файл периода Б."),
+                           (od, "Укажите папку для отчёта.")):
+            if not value:
+                messagebox.showwarning("", msg, parent=self)
+                return
+        out_path = os.path.join(od, f"сравнение_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
 
-    def _thread_comparison(self, pa, pb, out_path, la, lb):
-        try:
-            self._cmp_log(f"Сравниваю «{la}» и «{lb}»")
-            run_comparison(pa, pb, out_path, la, lb, log=self._cmp_log)
-            self._cmp_log(f"✅ Готово: {out_path}")
-            folder = os.path.dirname(out_path)
-            self.after(200, lambda f=folder: self._toast(
-                f"Сравнение готово: {os.path.basename(out_path)}",
-                kind="ok",
-                action_text="Открыть папку",
-                action_cmd=lambda: os.startfile(f),
-                duration=6000))
-            self.after(0, lambda: self._on_success(out_path))
-        except Exception as e:
-            err = str(e)
-            self._cmp_log(f"❌ ОШИБКА: {err}")
-            self.after(200, lambda m=err: self._toast(
-                f"Ошибка: {m[:80]}", kind="err", duration=7000))
-            self.after(0, lambda: messagebox.showerror("Ошибка", err))
-        finally:
-            self.after(0, self._stop_anim)
-            self.after(0, lambda: self.cmp_run_btn.configure(
-                state="normal", text="  Сравнить периоды  "))
+        def work():
+            self._log(f"Сравниваю «{la or 'Период А'}» и «{lb or 'Период Б'}»")
+            run_comparison(pa, pb, out_path, la, lb, log=self._log)
+            self._ui(self._report_ready, out_path, "Сравнение готово")
+
+        self._run_task(self.cmp_run_btn, "Выполняется…", work)
 
     # ============================================================
-    # ДАШБОРД
+    # СТРАНИЦА: ПЛАНЫ МЕНЕДЖЕРОВ
     # ============================================================
-    def _start_dashboard(self):
-        inp = self.dash_input_var.get().strip()
-        if not inp:
-            messagebox.showwarning("", "Выберите входной файл.")
+    def _build_page_plan(self):
+        p = self._pages["plan"]
+        actions = self._page_header(p, "Планы менеджеров", "Тыс. ₽ — попадают в лист «03а_План_менеджеров»")
+        self._new_mgr = tk.StringVar()
+        ui.label(actions, "Новый менеджер", "body", fg="text2", bg="bg").pack(side="left", padx=(0, px(8)))
+        add = ttk.Entry(actions, textvariable=self._new_mgr, width=22)
+        add.pack(side="left", padx=(0, px(8)))
+        add.bind("<Return>", lambda e: self._add_manager_ui())
+        ui.button(actions, "Добавить", self._add_manager_ui, on="bg", icon=ICON["add"]).pack(side="left")
+
+        outer, body = ui.card(p, pad=8)
+        outer.pack(fill="both", expand=True, padx=px(32), pady=(0, px(12)))
+        canvas = tk.Canvas(body, bg=T["card"], highlightthickness=0)
+        sb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview, style="Thin.Vertical.TScrollbar")
+        self._plan_inner = tk.Frame(canvas, bg=T["card"])
+        self._plan_inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win = canvas.create_window((0, 0), window=self._plan_inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self._bind_mousewheel(canvas)
+
+        ui.label(self._plan_inner, "Менеджер", "caption", fg="text2").grid(
+            row=0, column=0, sticky="w", padx=px(12), pady=(px(6), px(4)))
+        ui.label(self._plan_inner, "План, тыс. ₽", "caption", fg="text2").grid(
+            row=0, column=1, sticky="w", padx=px(12), pady=(px(6), px(4)))
+        self._plan_inner.columnconfigure(0, weight=1)
+
+        saved = self._cfg.get("manager_plan", {})
+        for name in dict.fromkeys(DEFAULT_MANAGERS + list(saved)):
+            self._add_plan_row(name, str(saved.get(name, "")))
+
+    def _add_plan_row(self, name, val=""):
+        idx = len(self._plan_vars) + 1
+        tk.Frame(self._plan_inner, bg=T["divider"], height=1).grid(row=idx * 2 - 1, column=0, columnspan=2,
+                                                                   sticky="ew", padx=px(8))
+        ui.label(self._plan_inner, name).grid(row=idx * 2, column=0, sticky="w", padx=px(12), pady=px(4))
+        var = tk.StringVar(value=val)
+        var.trace_add("write", lambda *_: self._schedule_plan_save())
+        self._plan_vars[name] = var
+        ttk.Entry(self._plan_inner, textvariable=var, width=16, justify="right").grid(
+            row=idx * 2, column=1, padx=px(12), pady=px(4))
+
+    def _add_manager_ui(self):
+        name = self._new_mgr.get().strip()
+        if not name:
             return
-        self.dash_btn.configure(state="disabled", text="  Генерирую...  ")
-        self._start_anim()
-        threading.Thread(target=self._thread_dashboard,
-                         args=(inp,), daemon=True).start()
+        if name in self._plan_vars:
+            messagebox.showinfo("", f"«{name}» уже есть.", parent=self)
+            return
+        self._add_plan_row(name)
+        self._new_mgr.set("")
 
-    def _thread_dashboard(self, inp):
-        try:
-            generate_dashboard(inp, log=self._dash_log)
-        except Exception as e:
-            # Копируем текст: после выхода из except имя `e` удаляется,
-            # и отложенная lambda падала с NameError — диалог не показывался.
-            err = str(e)
-            self._dash_log(f"❌ ОШИБКА: {err}")
-            self.after(0, lambda: messagebox.showerror("Ошибка", err))
-        finally:
-            self.after(0, self._stop_anim)
-            self.after(0, lambda: self.dash_btn.configure(
-                state="normal", text="  Открыть дашборд в браузере  "))
+    def _schedule_plan_save(self):
+        # Не на каждое нажатие клавиши, а через полсекунды после последнего
+        if getattr(self, "_plan_job", None):
+            self.after_cancel(self._plan_job)
+        self._plan_job = self.after(500, self._save_plans)
 
-    def _on_success(self, path):
-        self._status_var.set(f"Готово: {os.path.basename(path)}")
+    def _save_plans(self):
+        self._plan_job = None
+        self._cfg["manager_plan"] = {n: v.get().strip() for n, v in self._plan_vars.items() if v.get().strip()}
+        save_config(self._cfg)
 
+    def _get_plan_rub(self):
+        result = {}
+        for name, var in self._plan_vars.items():
+            val = var.get().strip().replace(",", ".").replace(" ", "")
+            if val:
+                try:
+                    result[name] = float(val) * 1000
+                except ValueError:
+                    pass
+        return result or None
+
+    # ============================================================
+    # СТРАНИЦА: ДАННЫЕ БУХГАЛТЕРИИ (редакторы справочников)
+    # ============================================================
+    def _build_page_data(self):
+        p = self._pages["data"]
+        self._page_header(p, "Данные бухгалтерии", "Справочники, которые используются при сверке")
+        outer, body = ui.card(p, pad=4)
+        outer.pack(fill="x", padx=px(32))
+        self._data_rows = {}
+        items = [
+            ("verified", ICON["ok"], "Верифицированные цифры", self._open_verified_editor, VerifiedFiguresEditor),
+            ("external", ICON["money"], "Внешние доходы", self._open_external_editor, ExternalIncomeEditor),
+            ("import", ICON["import"], "Импорт «Доходы ГГГГ.xlsx»", self._open_dohody_import, DohodyImportDialog),
+            ("aliases", ICON["link"], "Алиасы клиентов", self._open_aliases_editor, ClientAliasesEditor),
+        ]
+        first = True
+        for key, icon, title, command, available in items:
+            if available is None:
+                continue
+            if not first:
+                tk.Frame(body, bg=T["divider"], height=1).pack(fill="x", padx=px(12))
+            first = False
+            self._data_rows[key] = self._settings_row(body, icon, title, command)
+
+    def _settings_row(self, parent, icon, title, command):
+        row = tk.Frame(parent, bg=T["card"], cursor="hand2")
+        row.pack(fill="x")
+        ic = ui.label(row, icon, "icon", fg="text2")
+        ic.pack(side="left", padx=(px(16), px(16)), pady=px(14))
+        text = tk.Frame(row, bg=T["card"])
+        text.pack(side="left", fill="x", expand=True)
+        t1 = ui.label(text, title, "body")
+        t1.pack(anchor="w")
+        t2 = ui.label(text, "", "caption", fg="text2")
+        t2.pack(anchor="w")
+        ch = ui.label(row, ICON["chev_right"], "icon_sm", fg="text2")
+        ch.pack(side="right", padx=px(16))
+        widgets = (row, ic, text, t1, t2, ch)
+
+        def paint(bg):
+            for w in widgets:
+                w.configure(bg=bg)
+        for w in widgets:
+            w.bind("<Button-1>", lambda e: command())
+            w.bind("<Enter>", lambda e: paint(T["subtle"]))
+            w.bind("<Leave>", lambda e: paint(T["card"]))
+        return t2
+
+    def _refresh_data_page(self):
+        """Подписи строк — по текущему содержимому файлов."""
+        captions = {}
+        vf = _read_json(VERIFIED_PATH)
+        if vf:
+            captions["verified"] = (f"Годовые итоги · {vf.get('_год', '—')} · всего с программатиком "
+                                    f"{_fmt_k(vf.get('total_with_prog', 0))} ₽")
+        ext = _read_json(EXTERNAL_INCOME_PATH)
+        if ext:
+            n = sum(1 for k, v in ext.items() if not k.startswith('_') and isinstance(v, dict))
+            captions["external"] = f"Помесячно · {ext.get('_год', '—')} · статей: {n}"
+        captions["import"] = "Обновить внешние доходы из мастер-файла бухгалтерии"
+        al = _read_json(ALIASES_PATH)
+        captions["aliases"] = (f"Групп: {len(al.get('groups', []))} — объединение написаний клиентов"
+                               if al else "Объединение написаний клиентов")
+        for key, lbl in self._data_rows.items():
+            lbl.configure(text=captions.get(key, "Файл не найден"))
+
+    def _after_editor(self, dialog):
+        """После закрытия редактора — обновить подписи на странице «Данные»."""
+        if dialog is not None and dialog.winfo_exists():
+            self.wait_window(dialog)
+        self._refresh_data_page()
+
+    def _open_external_editor(self):
+        if not os.path.exists(EXTERNAL_INCOME_PATH):
+            messagebox.showerror("Нет файла", f"Файл не найден:\n{EXTERNAL_INCOME_PATH}", parent=self)
+            return
+        self._after_editor(ExternalIncomeEditor(self, EXTERNAL_INCOME_PATH))
+
+    def _open_dohody_import(self):
+        self._after_editor(DohodyImportDialog(self, EXTERNAL_INCOME_PATH))
+
+    def _open_aliases_editor(self):
+        if not os.path.exists(ALIASES_PATH):
+            save_json_default(ALIASES_PATH, {"_описание": "Правила нормализации клиентов.", "groups": []})
+        self._after_editor(ClientAliasesEditor(self, ALIASES_PATH))
+
+    def _open_verified_editor(self):
+        if not os.path.exists(VERIFIED_PATH):
+            save_json_default(VERIFIED_PATH, DEFAULT_VERIFIED)
+        self._after_editor(VerifiedFiguresEditor(self, VERIFIED_PATH))
+
+
+def save_json_default(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        messagebox.showerror("Ошибка", str(e))
+
+
+ui.enable_dpi_awareness()
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()

@@ -1,524 +1,253 @@
 # ============================================================
 # comparison.py — сравнительный анализ двух периодов
-# Вызывается из app.py, использует вспомогательные функции из analytics.py
+# Вызывается из app.py. Загрузка и фильтры — общие с отчётом
+# «Анализ» (crm_data), оформление — excel_style.
 # ============================================================
+
+import os
 
 import pandas as pd
-import os
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.chart import BarChart, Reference
-from openpyxl.utils import get_column_letter
+from openpyxl import Workbook
+from openpyxl.chart import Reference
+from openpyxl.styles import Font
 
-from analytics import (
-    parse_money, pick_client, normalize_client, client_rank_mask,
-    EXCLUDE_MANAGERS, EXCLUDE_PROJECTS,
-    COL_MONTH, COL_ORDER, COL_DATE, COL_MANAGER,
-    COL_REVENUE, COL_PROJECT,
-    COL_CLIENT, COL_CLIENT_RA, COL_REKLAMD
+from crm_data import (
+    COL_MANAGER, COL_ORDER, COL_REVENUE, EXCLUDE_MANAGERS,
+    client_rank_mask, load_crm, mask_no_events,
+)
+from excel_style import (
+    ACCENT, ACCENT_2, HEADER_FILL, HEADER_FONT, LOST_FILL, NEG_FONT, NEW_FILL, POS_FONT, POSITIVE,
+    autosize_sheet, color_series, make_chart, style_body_cell, style_header_row,
 )
 
+DELTA_COL = 'Δ выручка, тыс.'
 
-# ============================================================
-# ЗАГРУЗКА И ПОДГОТОВКА ОДНОГО ПЕРИОДА
-# ============================================================
 
 def _load_period(path: str, log) -> pd.DataFrame:
     """
-    Загружает файл, применяет те же фильтры и нормализацию, что и run_analytics.
-
-    EXCLUDE_MANAGERS и EXCLUDE_PROJECTS здесь НЕ вырезаются из общего датасета —
-    как и в run_analytics (analytics.py), они влияют только на конкретные срезы
-    (статистика по менеджерам / средний чек), иначе "Выручка", "Заказов" и
-    "Уникальных клиентов" в сравнении периодов не совпадают с отчётом "Анализ".
+    Загружает файл с той же очисткой, что и run_analytics. EXCLUDE_MANAGERS
+    и мероприятия не вырезаются из общего датасета — как и в отчёте «Анализ»,
+    они влияют только на конкретные срезы (менеджеры / клиенты / средний чек).
     """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Файл не найден: {path}")
-
-    df = pd.read_excel(path, dtype=object)
-    df.columns = df.columns.map(lambda x: x.strip() if isinstance(x, str) else x)
-
-    # Убираем строку "Итого"
-    if COL_MONTH in df.columns:
-        df = df.loc[~df[COL_MONTH].astype(str).str.strip().str.lower().eq("итого")]
-    df = df.dropna(how="all").reset_index(drop=True)
-
-    # Парсим выручку. Строки с нулевой/отрицательной/пустой выручкой не выбрасываем
-    # (сторно, корректировки) — иначе "Заказов"/"Клиентов" здесь не совпадут с
-    # отчётом "Анализ", где run_analytics такие строки оставляет в расчётах.
-    df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
-
-    # Клиент
-    df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1)
-    df['КОНЕЧНЫЙ_КЛИЕНТ'] = df['КОНЕЧНЫЙ_КЛИЕНТ'].apply(normalize_client)
-
+    df = load_crm(path)
     log(f"  Загружено строк после фильтров: {len(df)}")
     return df
-
-
-def _mask_no_events(df: pd.DataFrame) -> pd.Series:
-    """Маска строк без мероприятий — для среднего/медианного чека (см. README)."""
-    if COL_PROJECT in df.columns:
-        return ~df[COL_PROJECT].fillna('').isin(EXCLUDE_PROJECTS)
-    return pd.Series(True, index=df.index)
 
 
 # ============================================================
 # РАСЧЁТЫ ПО ПЕРИОДУ
 # ============================================================
 
+def _stats(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """Выручка (тыс.) и число строк-заказов по ключу."""
+    stats = (
+        df.groupby(key)
+        .agg(Выручка_руб=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'count'))
+        .reset_index()
+        .sort_values('Выручка_руб', ascending=False)
+    )
+    stats['Выручка_тыс'] = (stats['Выручка_руб'] / 1000).round(2)
+    return stats
+
+
 def _manager_stats(df: pd.DataFrame) -> pd.DataFrame:
     if COL_MANAGER not in df.columns:
         return pd.DataFrame(columns=[COL_MANAGER, 'Выручка_руб', 'Заказов', 'Выручка_тыс'])
-    # Менеджеры вне отдела исключаются только из этого среза (см. README), а не из общих итогов.
-    df = df.loc[~df[COL_MANAGER].isin(EXCLUDE_MANAGERS)]
-    stats = (
-        df.groupby(COL_MANAGER)
-        .agg(
-            Выручка_руб=(COL_REVENUE, 'sum'),
-            Заказов=(COL_ORDER, 'count')
-        )
-        .reset_index()
-        .sort_values('Выручка_руб', ascending=False)
-    )
-    stats['Выручка_тыс'] = (stats['Выручка_руб'] / 1000).round(2)
-    return stats
+    # Менеджеры вне отдела исключаются только из этого среза (см. README)
+    return _stats(df.loc[~df[COL_MANAGER].isin(EXCLUDE_MANAGERS)], COL_MANAGER)
 
 
 def _client_stats(df: pd.DataFrame) -> pd.DataFrame:
-    # Без мероприятий — как лист 02_Топ_клиентов в отчёте "Анализ"
-    stats = (
-        df.loc[client_rank_mask(df)].groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        .agg(
-            Выручка_руб=(COL_REVENUE, 'sum'),
-            Заказов=(COL_ORDER, 'count')
-        )
-        .reset_index()
-        .sort_values('Выручка_руб', ascending=False)
-    )
-    stats['Выручка_тыс'] = (stats['Выручка_руб'] / 1000).round(2)
-    return stats
+    # Без мероприятий — как лист 02_Топ_клиентов в отчёте «Анализ»
+    return _stats(df.loc[client_rank_mask(df)], 'КОНЕЧНЫЙ_КЛИЕНТ')
 
 
 # ============================================================
-# ФОРМАТИРОВАНИЕ EXCEL
+# ЛИСТЫ
 # ============================================================
 
-HEADER_FILL   = PatternFill("solid", start_color="1F3864", end_color="1F3864")
-HEADER_FONT   = Font(bold=True, color="FFFFFF", name="Segoe UI", size=10)
-NEW_FILL      = PatternFill("solid", start_color="E2EFDA", end_color="E2EFDA")   # зелёный
-LOST_FILL     = PatternFill("solid", start_color="FCE4D6", end_color="FCE4D6")   # красный
-POS_FONT      = Font(color="375623", name="Segoe UI", size=9)
-NEG_FONT      = Font(color="C00000", name="Segoe UI", size=9)
-NEUTRAL_FONT  = Font(name="Segoe UI", size=9)
-THIN_BORDER   = Border(
-    bottom=Side(style='thin', color="D9D9D9")
-)
-
-def _style_header(ws, row_idx: int):
-    for cell in ws[row_idx]:
-        cell.fill   = HEADER_FILL
-        cell.font   = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-def _auto_width(ws, min_w=10, max_w=50):
-    for col in ws.columns:
-        max_len = max((len(str(c.value)) if c.value else 0) for c in col)
-        ws.column_dimensions[col[0].column_letter].width = min(max(max_len + 2, min_w), max_w)
-
-def _write_df(ws, df: pd.DataFrame, start_row=2):
-    for r_idx, row in enumerate(df.itertuples(index=False), start=start_row):
-        for c_idx, val in enumerate(row, start=1):
-            cell = ws.cell(row=r_idx, column=c_idx, value=val)
-            cell.font = NEUTRAL_FONT
-            cell.border = THIN_BORDER
-            cell.alignment = Alignment(vertical="center")
+def _append_row(ws, values, fill=None):
+    ws.append(list(values))
+    for cell in ws[ws.max_row]:
+        style_body_cell(cell, fill)
 
 
-# ============================================================
-# ЛИСТ 1: СВОДКА
-# ============================================================
+def _color_delta(ws, delta_idx, pct_idx=None, first_row=2):
+    for r in range(first_row, ws.max_row + 1):
+        val = ws.cell(r, delta_idx).value
+        if val is not None:
+            font = POS_FONT if float(val) >= 0 else NEG_FONT
+            ws.cell(r, delta_idx).font = font
+            if pct_idx:
+                ws.cell(r, pct_idx).font = font
+
 
 def _sheet_summary(wb, df_a, df_b, label_a, label_b):
     ws = wb.create_sheet("01_Сводка")
     ws.freeze_panes = "A2"
+    ws.append(["Метрика", label_a, label_b, "Δ абс.", "Δ %"])
+    style_header_row(ws, 1)
 
-    headers = ["Метрика", label_a, label_b, "Δ абс.", "Δ %"]
-    ws.append(headers)
-    _style_header(ws, 1)
-
-    def pct(a, b):
-        if a and a != 0:
-            return round((b - a) / abs(a) * 100, 1)
-        return None
-
-    metrics = []
-
-    rev_a = round(df_a[COL_REVENUE].sum() / 1000, 2)
-    rev_b = round(df_b[COL_REVENUE].sum() / 1000, 2)
-    metrics.append(("Выручка, тыс. руб.", rev_a, rev_b))
-
-    ord_a = len(df_a)
-    ord_b = len(df_b)
-    metrics.append(("Количество заказов", ord_a, ord_b))
-
-    # Средний/медианный чек считаются без мероприятий (см. README) — как в run_analytics.
-    mask_a = _mask_no_events(df_a)
-    mask_b = _mask_no_events(df_b)
-
-    avg_a = round(df_a.loc[mask_a, COL_REVENUE].mean() / 1000, 2)
-    avg_b = round(df_b.loc[mask_b, COL_REVENUE].mean() / 1000, 2)
-    metrics.append(("Средний чек, тыс. руб.", avg_a, avg_b))
-
-    med_a = round(df_a.loc[mask_a, COL_REVENUE].median() / 1000, 2)
-    med_b = round(df_b.loc[mask_b, COL_REVENUE].median() / 1000, 2)
-    metrics.append(("Медианный чек, тыс. руб.", med_a, med_b))
-
-    cli_a = df_a['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
-    cli_b = df_b['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()
-    metrics.append(("Уникальных клиентов", cli_a, cli_b))
-
+    # Средний/медианный чек — без мероприятий (см. README), как в run_analytics
+    mask_a, mask_b = mask_no_events(df_a), mask_no_events(df_b)
+    metrics = [
+        ("Выручка, тыс. руб.", round(df_a[COL_REVENUE].sum() / 1000, 2), round(df_b[COL_REVENUE].sum() / 1000, 2)),
+        ("Количество заказов", len(df_a), len(df_b)),
+        ("Средний чек, тыс. руб.", round(df_a.loc[mask_a, COL_REVENUE].mean() / 1000, 2),
+                                   round(df_b.loc[mask_b, COL_REVENUE].mean() / 1000, 2)),
+        ("Медианный чек, тыс. руб.", round(df_a.loc[mask_a, COL_REVENUE].median() / 1000, 2),
+                                     round(df_b.loc[mask_b, COL_REVENUE].median() / 1000, 2)),
+        ("Уникальных клиентов", df_a['КОНЕЧНЫЙ_КЛИЕНТ'].nunique(), df_b['КОНЕЧНЫЙ_КЛИЕНТ'].nunique()),
+    ]
     if COL_MANAGER in df_a.columns and COL_MANAGER in df_b.columns:
-        mgr_a = df_a[COL_MANAGER].nunique()
-        mgr_b = df_b[COL_MANAGER].nunique()
-        metrics.append(("Активных менеджеров", mgr_a, mgr_b))
+        metrics.append(("Активных менеджеров", df_a[COL_MANAGER].nunique(), df_b[COL_MANAGER].nunique()))
 
-    for row_data in metrics:
-        name, va, vb = row_data
-        delta_abs = round(vb - va, 2) if isinstance(va, (int, float)) and isinstance(vb, (int, float)) else None
-        delta_pct = pct(va, vb) if isinstance(va, (int, float)) else None
-        row = [name, va, vb, delta_abs, delta_pct]
-        ws.append(row)
-        r = ws.max_row
-        for c in range(1, 6):
-            ws.cell(r, c).font = NEUTRAL_FONT
-            ws.cell(r, c).border = THIN_BORDER
-            ws.cell(r, c).alignment = Alignment(vertical="center")
-        # Цвет дельты
-        if delta_abs is not None:
-            font = POS_FONT if delta_abs >= 0 else NEG_FONT
-            ws.cell(r, 4).font = font
-            ws.cell(r, 5).font = font
+    for name, va, vb in metrics:
+        delta_abs = round(vb - va, 2)
+        delta_pct = round((vb - va) / abs(va) * 100, 1) if va else None
+        _append_row(ws, [name, va, vb, delta_abs, delta_pct])
+    _color_delta(ws, 4, 5)
 
     ws.row_dimensions[1].height = 22
-    _auto_width(ws)
+    autosize_sheet(ws)
 
 
-# ============================================================
-# ЛИСТ 2: МЕНЕДЖЕРЫ
-# ============================================================
-
-def _sheet_managers(wb, df_a, df_b, label_a, label_b):
-    ws = wb.create_sheet("02_Менеджеры")
-    ws.freeze_panes = "A2"
-
-    mgr_a = _manager_stats(df_a).rename(columns={
-        'Выручка_тыс': f'Выручка_{label_a}_тыс',
-        'Заказов': f'Заказов_{label_a}'
-    })
-    mgr_b = _manager_stats(df_b).rename(columns={
-        'Выручка_тыс': f'Выручка_{label_b}_тыс',
-        'Заказов': f'Заказов_{label_b}'
-    })
-
+def _merge_periods(stats_a, stats_b, key, label_a, label_b, sort_by_delta):
+    """Слияние статистики двух периодов по ключу + Δ выручки."""
+    col_a, col_b = f'Выручка_{label_a}_тыс', f'Выручка_{label_b}_тыс'
     merged = pd.merge(
-        mgr_a[[COL_MANAGER, f'Выручка_{label_a}_тыс', f'Заказов_{label_a}']],
-        mgr_b[[COL_MANAGER, f'Выручка_{label_b}_тыс', f'Заказов_{label_b}']],
-        on=COL_MANAGER, how='outer'
+        stats_a.rename(columns={'Выручка_тыс': col_a, 'Заказов': f'Заказов_{label_a}'})
+               [[key, col_a, f'Заказов_{label_a}']],
+        stats_b.rename(columns={'Выручка_тыс': col_b, 'Заказов': f'Заказов_{label_b}'})
+               [[key, col_b, f'Заказов_{label_b}']],
+        on=key, how='outer'
     ).fillna(0)
-
-    col_a = f'Выручка_{label_a}_тыс'
-    col_b = f'Выручка_{label_b}_тыс'
-    merged['Δ выручка, тыс.'] = (merged[col_b] - merged[col_a]).round(2)
+    merged[DELTA_COL] = (merged[col_b] - merged[col_a]).round(2)
     merged['Δ %'] = merged.apply(
         lambda r: round((r[col_b] - r[col_a]) / abs(r[col_a]) * 100, 1) if r[col_a] != 0 else None, axis=1
     )
-    merged = merged.sort_values(col_b, ascending=False).reset_index(drop=True)
-
-    headers = list(merged.columns)
-    ws.append(headers)
-    _style_header(ws, 1)
-    _write_df(ws, merged)
-
-    # Цвет дельты
-    delta_col_idx = headers.index('Δ выручка, тыс.') + 1
-    pct_col_idx   = headers.index('Δ %') + 1
-    for row_idx in range(2, ws.max_row + 1):
-        val = ws.cell(row_idx, delta_col_idx).value
-        if val is not None:
-            font = POS_FONT if float(val) >= 0 else NEG_FONT
-            ws.cell(row_idx, delta_col_idx).font = font
-            ws.cell(row_idx, pct_col_idx).font = font
-
-    _auto_width(ws)
-    return merged  # вернём для графика
+    return merged.sort_values(DELTA_COL if sort_by_delta else col_b, ascending=False).reset_index(drop=True)
 
 
-# ============================================================
-# ЛИСТ 3: КЛИЕНТЫ
-# ============================================================
-
-def _sheet_clients(wb, df_a, df_b, label_a, label_b):
-    ws = wb.create_sheet("03_Клиенты")
+def _sheet_table(wb, title, merged):
+    ws = wb.create_sheet(title)
     ws.freeze_panes = "A2"
-
-    cli_a = _client_stats(df_a).rename(columns={
-        'Выручка_тыс': f'Выручка_{label_a}_тыс',
-        'Заказов': f'Заказов_{label_a}'
-    })
-    cli_b = _client_stats(df_b).rename(columns={
-        'Выручка_тыс': f'Выручка_{label_b}_тыс',
-        'Заказов': f'Заказов_{label_b}'
-    })
-
-    merged = pd.merge(
-        cli_a[['КОНЕЧНЫЙ_КЛИЕНТ', f'Выручка_{label_a}_тыс', f'Заказов_{label_a}']],
-        cli_b[['КОНЕЧНЫЙ_КЛИЕНТ', f'Выручка_{label_b}_тыс', f'Заказов_{label_b}']],
-        on='КОНЕЧНЫЙ_КЛИЕНТ', how='outer'
-    ).fillna(0)
-
-    col_a = f'Выручка_{label_a}_тыс'
-    col_b = f'Выручка_{label_b}_тыс'
-    merged['Δ выручка, тыс.'] = (merged[col_b] - merged[col_a]).round(2)
-    merged['Δ %'] = merged.apply(
-        lambda r: round((r[col_b] - r[col_a]) / abs(r[col_a]) * 100, 1) if r[col_a] != 0 else None, axis=1
-    )
-    merged = merged.sort_values('Δ выручка, тыс.', ascending=False).reset_index(drop=True)
-
     headers = list(merged.columns)
     ws.append(headers)
-    _style_header(ws, 1)
-    _write_df(ws, merged)
-
-    delta_col_idx = headers.index('Δ выручка, тыс.') + 1
-    pct_col_idx   = headers.index('Δ %') + 1
-    for row_idx in range(2, ws.max_row + 1):
-        val = ws.cell(row_idx, delta_col_idx).value
-        if val is not None:
-            font = POS_FONT if float(val) >= 0 else NEG_FONT
-            ws.cell(row_idx, delta_col_idx).font = font
-            ws.cell(row_idx, pct_col_idx).font = font
-
-    _auto_width(ws)
-    return merged
+    style_header_row(ws, 1)
+    for row in merged.itertuples(index=False):
+        _append_row(ws, row)
+    _color_delta(ws, headers.index(DELTA_COL) + 1, headers.index('Δ %') + 1)
+    autosize_sheet(ws)
 
 
-# ============================================================
-# ЛИСТ 4: ДВИЖЕНИЕ КЛИЕНТОВ
-# ============================================================
+def _client_block(ws, title, df, clients, label, fill):
+    """Блок «новые/ушедшие клиенты»: заголовок + список с выручкой."""
+    ws.append([title])
+    ws.cell(ws.max_row, 1).font = Font(bold=True, name="Segoe UI", size=10)
+    ws.append(["Клиент", f"Выручка {label}, тыс.", "Заказов"])
+    style_header_row(ws, ws.max_row)
+    detail = (
+        df[df['КОНЕЧНЫЙ_КЛИЕНТ'].isin(clients)]
+        .groupby('КОНЕЧНЫЙ_КЛИЕНТ')
+        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'count'))
+        .reset_index()
+        .sort_values('Выручка', ascending=False)
+    )
+    detail['Выручка'] = (detail['Выручка'] / 1000).round(2)
+    for _, row in detail.iterrows():
+        _append_row(ws, [row['КОНЕЧНЫЙ_КЛИЕНТ'], row['Выручка'], row['Заказов']], fill)
+
 
 def _sheet_movement(wb, df_a, df_b, label_a, label_b):
     ws = wb.create_sheet("04_Движение_клиентов")
 
     clients_a = set(df_a['КОНЕЧНЫЙ_КЛИЕНТ'].dropna().unique())
     clients_b = set(df_b['КОНЕЧНЫЙ_КЛИЕНТ'].dropna().unique())
+    new_clients, lost_clients, kept_clients = clients_b - clients_a, clients_a - clients_b, clients_a & clients_b
 
-    new_clients  = clients_b - clients_a
-    lost_clients = clients_a - clients_b
-    kept_clients = clients_a & clients_b
-
-    rev_b = df_b.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[COL_REVENUE].sum()
     rev_a = df_a.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[COL_REVENUE].sum()
+    rev_b = df_b.groupby('КОНЕЧНЫЙ_КЛИЕНТ')[COL_REVENUE].sum()
 
-    # Итоговая сводка
-    summary_data = [
-        ("Постоянные клиенты (были в обоих периодах)", len(kept_clients),
-         round(rev_a[rev_a.index.isin(kept_clients)].sum() / 1000, 2),
-         round(rev_b[rev_b.index.isin(kept_clients)].sum() / 1000, 2)),
-        (f"Новые клиенты (только в {label_b})", len(new_clients),
-         0,
-         round(rev_b[rev_b.index.isin(new_clients)].sum() / 1000, 2)),
-        (f"Ушедшие клиенты (только в {label_a})", len(lost_clients),
-         round(rev_a[rev_a.index.isin(lost_clients)].sum() / 1000, 2),
-         0),
-    ]
+    def rev_k(rev, clients):
+        return round(rev[rev.index.isin(clients)].sum() / 1000, 2)
 
     ws.append(["Категория", "Клиентов", f"Выручка {label_a}, тыс.", f"Выручка {label_b}, тыс."])
-    _style_header(ws, 1)
-
-    fills = [None, NEW_FILL, LOST_FILL]
-    for i, row_data in enumerate(summary_data):
-        ws.append(list(row_data))
-        r = ws.max_row
-        for c in range(1, 5):
-            ws.cell(r, c).font = NEUTRAL_FONT
-            ws.cell(r, c).border = THIN_BORDER
-            if fills[i]:
-                ws.cell(r, c).fill = fills[i]
-
+    style_header_row(ws, 1)
+    _append_row(ws, ["Постоянные клиенты (были в обоих периодах)", len(kept_clients),
+                     rev_k(rev_a, kept_clients), rev_k(rev_b, kept_clients)])
+    _append_row(ws, [f"Новые клиенты (только в {label_b})", len(new_clients),
+                     0, rev_k(rev_b, new_clients)], NEW_FILL)
+    _append_row(ws, [f"Ушедшие клиенты (только в {label_a})", len(lost_clients),
+                     rev_k(rev_a, lost_clients), 0], LOST_FILL)
     ws.append([])
 
-    # Детальный список новых
-    ws.append([f"НОВЫЕ КЛИЕНТЫ — появились в {label_b}"])
-    ws.cell(ws.max_row, 1).font = Font(bold=True, name="Segoe UI", size=10)
-    ws.append(["Клиент", f"Выручка {label_b}, тыс.", "Заказов"])
-    _style_header(ws, ws.max_row)
-
-    new_detail = (
-        df_b[df_b['КОНЕЧНЫЙ_КЛИЕНТ'].isin(new_clients)]
-        .groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'count'))
-        .reset_index()
-        .sort_values('Выручка', ascending=False)
-    )
-    new_detail['Выручка'] = (new_detail['Выручка'] / 1000).round(2)
-    for _, row in new_detail.iterrows():
-        ws.append([row['КОНЕЧНЫЙ_КЛИЕНТ'], row['Выручка'], row['Заказов']])
-        r = ws.max_row
-        for c in range(1, 4):
-            ws.cell(r, c).fill = NEW_FILL
-            ws.cell(r, c).font = NEUTRAL_FONT
-            ws.cell(r, c).border = THIN_BORDER
-
+    _client_block(ws, f"НОВЫЕ КЛИЕНТЫ — появились в {label_b}", df_b, new_clients, label_b, NEW_FILL)
     ws.append([])
-
-    # Детальный список ушедших
-    ws.append([f"УШЕДШИЕ КЛИЕНТЫ — были в {label_a}, нет в {label_b}"])
-    ws.cell(ws.max_row, 1).font = Font(bold=True, name="Segoe UI", size=10)
-    ws.append(["Клиент", f"Выручка {label_a}, тыс.", "Заказов"])
-    _style_header(ws, ws.max_row)
-
-    lost_detail = (
-        df_a[df_a['КОНЕЧНЫЙ_КЛИЕНТ'].isin(lost_clients)]
-        .groupby('КОНЕЧНЫЙ_КЛИЕНТ')
-        .agg(Выручка=(COL_REVENUE, 'sum'), Заказов=(COL_ORDER, 'count'))
-        .reset_index()
-        .sort_values('Выручка', ascending=False)
-    )
-    lost_detail['Выручка'] = (lost_detail['Выручка'] / 1000).round(2)
-    for _, row in lost_detail.iterrows():
-        ws.append([row['КОНЕЧНЫЙ_КЛИЕНТ'], row['Выручка'], row['Заказов']])
-        r = ws.max_row
-        for c in range(1, 4):
-            ws.cell(r, c).fill = LOST_FILL
-            ws.cell(r, c).font = NEUTRAL_FONT
-            ws.cell(r, c).border = THIN_BORDER
-
-    _auto_width(ws)
+    _client_block(ws, f"УШЕДШИЕ КЛИЕНТЫ — были в {label_a}, нет в {label_b}",
+                  df_a, lost_clients, label_a, LOST_FILL)
+    autosize_sheet(ws)
 
 
-# ============================================================
-# ЛИСТ 5: ГРАФИКИ
-# ============================================================
+def _chart_table(ws, start_row, headers, rows):
+    """Вспомогательная таблица под график: шапка + строки, возвращает число строк."""
+    for c, h in enumerate(headers, 1):
+        cell = ws.cell(start_row, c, h)
+        cell.fill, cell.font = HEADER_FILL, HEADER_FONT
+    for i, values in enumerate(rows):
+        for c, v in enumerate(values, 1):
+            ws.cell(start_row + 1 + i, c, v)
+    return len(rows)
+
 
 def _sheet_charts(wb, mgr_merged, cli_merged, label_a, label_b):
     ws = wb.create_sheet("05_Графики")
     ws.sheet_view.showGridLines = False
-
     ws["A1"] = f"СРАВНЕНИЕ: {label_a}  vs  {label_b}"
-    ws["A1"].font = Font(bold=True, size=14, name="Segoe UI", color="F38120")
+    ws["A1"].font = Font(bold=True, size=14, name="Segoe UI", color=ACCENT)
     ws.row_dimensions[1].height = 28
 
-    col_a = f"Выручка_{label_a}_тыс"
-    col_b = f"Выручка_{label_b}_тыс"
+    col_a, col_b = f"Выручка_{label_a}_тыс", f"Выручка_{label_b}_тыс"
 
-    # ── 1. Менеджеры: сгруппированный горизонтальный столбчатый
-    ws["A3"] = "Менеджер"
-    ws["B3"] = label_a
-    ws["C3"] = label_b
-    for cell in [ws["A3"], ws["B3"], ws["C3"]]:
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
+    def add_grouped(start_row, key_label, rows, kind, title, anchor, axis):
+        n = _chart_table(ws, start_row, [key_label, label_a, label_b], rows)
+        chart = make_chart(kind, title, width=24, height=16, **axis)
+        chart.grouping = "clustered"
+        chart.add_data(Reference(ws, min_col=2, max_col=3, min_row=start_row, max_row=start_row + n),
+                       titles_from_data=True)
+        chart.set_categories(Reference(ws, min_col=1, min_row=start_row + 1, max_row=start_row + n))
+        color_series(chart, ACCENT, ACCENT_2)
+        ws.add_chart(chart, anchor)
+        return n
 
+    # 1. Менеджеры: сгруппированный горизонтальный
     mgr_top = mgr_merged.head(10).reset_index(drop=True)
-    for i, row in mgr_top.iterrows():
-        r = 4 + i
-        ws.cell(r, 1, row[COL_MANAGER])
-        ws.cell(r, 2, float(row[col_a]) if col_a in mgr_merged.columns else 0)
-        ws.cell(r, 3, float(row[col_b]) if col_b in mgr_merged.columns else 0)
+    n_mgr = add_grouped(3, "Менеджер",
+                        [(r[COL_MANAGER], float(r[col_a]), float(r[col_b])) for _, r in mgr_top.iterrows()],
+                        "bar", f"Менеджеры: {label_a} vs {label_b}", "E3", {'x_title': "тыс. руб."})
 
-    n_mgr = len(mgr_top)
-    chart_mgr = BarChart()
-    chart_mgr.type = "bar"
-    chart_mgr.grouping = "clustered"
-    chart_mgr.title = f"Менеджеры: {label_a} vs {label_b}"
-    chart_mgr.style = 10
-    chart_mgr.width = 24
-    chart_mgr.height = 16
-    chart_mgr.x_axis.title = "тыс. руб."
-
-    cats = Reference(ws, min_col=1, min_row=4, max_row=3 + n_mgr)
-    data_mgr = Reference(ws, min_col=2, max_col=3, min_row=3, max_row=3 + n_mgr)
-    chart_mgr.add_data(data_mgr, titles_from_data=True)
-    chart_mgr.set_categories(cats)
-    if chart_mgr.series:
-        chart_mgr.series[0].graphicalProperties.solidFill = "F38120"
-    if len(chart_mgr.series) > 1:
-        chart_mgr.series[1].graphicalProperties.solidFill = "4A90D9"
-    ws.add_chart(chart_mgr, "E3")
-
-    # ── 2. Клиенты: сгруппированный вертикальный столбчатый
+    # 2. Клиенты: топ-10 по сумме двух периодов, вертикальный
     start_row = 4 + n_mgr + 3
-    ws.cell(start_row, 1, "Клиент")
-    ws.cell(start_row, 2, label_a)
-    ws.cell(start_row, 3, label_b)
-    for c in range(1, 4):
-        ws.cell(start_row, c).fill = HEADER_FILL
-        ws.cell(start_row, c).font = HEADER_FONT
+    cli_top = cli_merged.assign(_total=cli_merged[col_a] + cli_merged[col_b]) \
+                        .nlargest(10, "_total").reset_index(drop=True)
+    n_cli = add_grouped(start_row, "Клиент",
+                        [(str(r["КОНЕЧНЫЙ_КЛИЕНТ"])[:30], float(r[col_a]), float(r[col_b]))
+                         for _, r in cli_top.iterrows()],
+                        "col", f"Топ-10 клиентов: {label_a} vs {label_b}", f"A{start_row}",
+                        {'y_title': "тыс. руб."})
 
-    cli_top = cli_merged.copy()
-    cli_top["_total"] = cli_top[col_a] + cli_top[col_b]
-    cli_top = cli_top.nlargest(10, "_total").reset_index(drop=True)
-
-    for i, row in cli_top.iterrows():
-        r = start_row + 1 + i
-        ws.cell(r, 1, str(row["КОНЕЧНЫЙ_КЛИЕНТ"])[:30])
-        ws.cell(r, 2, float(row[col_a]) if col_a in cli_merged.columns else 0)
-        ws.cell(r, 3, float(row[col_b]) if col_b in cli_merged.columns else 0)
-
-    n_cli = len(cli_top)
-    chart_cli = BarChart()
-    chart_cli.type = "col"
-    chart_cli.grouping = "clustered"
-    chart_cli.title = f"Топ-10 клиентов: {label_a} vs {label_b}"
-    chart_cli.style = 10
-    chart_cli.width = 24
-    chart_cli.height = 16
-    chart_cli.y_axis.title = "тыс. руб."
-
-    cats2 = Reference(ws, min_col=1, min_row=start_row+1, max_row=start_row+n_cli)
-    data_cli = Reference(ws, min_col=2, max_col=3, min_row=start_row, max_row=start_row+n_cli)
-    chart_cli.add_data(data_cli, titles_from_data=True)
-    chart_cli.set_categories(cats2)
-    if chart_cli.series:
-        chart_cli.series[0].graphicalProperties.solidFill = "F38120"
-    if len(chart_cli.series) > 1:
-        chart_cli.series[1].graphicalProperties.solidFill = "4A90D9"
-    ws.add_chart(chart_cli, f"A{start_row}")
-
-    # ── 3. Дельта выручки менеджеров (водопадный через столбчатый)
+    # 3. Дельта выручки менеджеров
     delta_row = start_row + n_cli + 5
-    ws.cell(delta_row, 1, "Менеджер")
-    ws.cell(delta_row, 2, "Δ выручка, тыс.")
-    ws.cell(delta_row, 1).fill = HEADER_FILL
-    ws.cell(delta_row, 1).font = HEADER_FONT
-    ws.cell(delta_row, 2).fill = HEADER_FILL
-    ws.cell(delta_row, 2).font = HEADER_FONT
+    n = _chart_table(ws, delta_row, ["Менеджер", DELTA_COL],
+                     [(r[COL_MANAGER], float(r[DELTA_COL])) for _, r in mgr_top.iterrows()])
+    chart = make_chart("col", "Изменение выручки по менеджерам (Δ тыс. руб.)", width=24, height=14,
+                       y_title="тыс. руб.")
+    chart.add_data(Reference(ws, min_col=2, min_row=delta_row, max_row=delta_row + n), titles_from_data=True)
+    chart.set_categories(Reference(ws, min_col=1, min_row=delta_row + 1, max_row=delta_row + n))
+    color_series(chart, POSITIVE)
+    ws.add_chart(chart, f"E{delta_row}")
 
-    delta_col = "Δ выручка, тыс."
-    if delta_col in mgr_merged.columns:
-        for i, row in mgr_top.iterrows():
-            r = delta_row + 1 + i
-            ws.cell(r, 1, row[COL_MANAGER])
-            ws.cell(r, 2, float(row[delta_col]) if delta_col in row.index else 0)
-
-        chart_delta = BarChart()
-        chart_delta.type = "col"
-        chart_delta.title = f"Изменение выручки по менеджерам (Δ тыс. руб.)"
-        chart_delta.style = 10
-        chart_delta.width = 24
-        chart_delta.height = 14
-        chart_delta.y_axis.title = "тыс. руб."
-
-        cats3 = Reference(ws, min_col=1, min_row=delta_row+1, max_row=delta_row+n_mgr)
-        data_delta = Reference(ws, min_col=2, min_row=delta_row, max_row=delta_row+n_mgr)
-        chart_delta.add_data(data_delta, titles_from_data=True)
-        chart_delta.set_categories(cats3)
-        if chart_delta.series:
-            chart_delta.series[0].graphicalProperties.solidFill = "22C55E"
-        ws.add_chart(chart_delta, f"E{delta_row}")
-
-    _auto_width(ws)
+    autosize_sheet(ws)
 
 
 # ============================================================
@@ -546,19 +275,20 @@ def run_comparison(
 
     log(f"Загружаю период А: {os.path.basename(path_a)}")
     df_a = _load_period(path_a, log)
-
     log(f"Загружаю период Б: {os.path.basename(path_b)}")
     df_b = _load_period(path_b, log)
 
     log("Формирую отчёт...")
-
-    from openpyxl import Workbook
     wb = Workbook()
     wb.remove(wb.active)  # удаляем дефолтный лист
 
     _sheet_summary(wb, df_a, df_b, label_a, label_b)
-    mgr_merged = _sheet_managers(wb, df_a, df_b, label_a, label_b)
-    cli_merged = _sheet_clients(wb, df_a, df_b, label_a, label_b)
+    mgr_merged = _merge_periods(_manager_stats(df_a), _manager_stats(df_b), COL_MANAGER,
+                                label_a, label_b, sort_by_delta=False)
+    _sheet_table(wb, "02_Менеджеры", mgr_merged)
+    cli_merged = _merge_periods(_client_stats(df_a), _client_stats(df_b), 'КОНЕЧНЫЙ_КЛИЕНТ',
+                                label_a, label_b, sort_by_delta=True)
+    _sheet_table(wb, "03_Клиенты", cli_merged)
     _sheet_movement(wb, df_a, df_b, label_a, label_b)
 
     if not mgr_merged.empty and not cli_merged.empty:

@@ -15,6 +15,7 @@ data_files = [
     ("verified_figures.json", "."),
     ("client_aliases.json", "."),
     ("icon.ico", "."),
+    ("templates", "templates"),  # шаблон HTML-дашборда
 ]
 
 add_data = []
