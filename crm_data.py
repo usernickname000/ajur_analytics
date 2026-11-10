@@ -349,21 +349,27 @@ def classify_industry_series(df):
     marketing_industry = raw.str.contains(r'реклам|маркет|выстав', regex=True, na=False)
     needs_text = (raw.eq('') | marketing_industry) & ~construction & ~exact
 
-    text = pd.Series('', index=df.index, dtype='string')
-    for column in (COL_POS_ORDER, COL_DESCRIPTION, COL_NOMEN, 'КОНЕЧНЫЙ_КЛИЕНТ'):
-        if column in df.columns:
-            values = df[column].astype('string').fillna('').str.lower()
-            text = text.str.cat(values, sep=' ')
-
-    expo = text.str.contains(_EXPO_RE, na=False)
-    ads = text.str.contains(_ADS_RE, na=False)
-    marketing = text.str.contains(_MARKETING_RE, na=False)
-
     result.loc[construction] = 'Строительство + Недвижимость'
     result.loc[exact] = raw.loc[exact].str.capitalize()
-    result.loc[needs_text & expo] = 'Выставки'
-    result.loc[needs_text & ~expo & ads] = 'Реклама'
-    result.loc[needs_text & ~expo & ~ads & marketing] = 'Маркетинг'
+
+    # Исходная функция проверяет текст заказа только для пустой отрасли
+    # и укрупнённой отрасли «Реклама / маркетинг / выставки». Не обрабатываем
+    # остальные строки повторно: на больших выгрузках это заметно быстрее.
+    candidate_index = needs_text[needs_text].index
+    if len(candidate_index):
+        text = pd.Series('', index=candidate_index, dtype='string')
+        for column in (COL_POS_ORDER, COL_DESCRIPTION, COL_NOMEN, 'КОНЕЧНЫЙ_КЛИЕНТ'):
+            if column in df.columns:
+                values = df.loc[candidate_index, column].astype('string').fillna('').str.lower()
+                text = text.str.cat(values, sep=' ')
+
+        expo = text.str.contains(_EXPO_RE, na=False)
+        ads = text.str.contains(_ADS_RE, na=False)
+        marketing = text.str.contains(_MARKETING_RE, na=False)
+
+        result.loc[candidate_index[expo.to_numpy()]] = 'Выставки'
+        result.loc[candidate_index[(~expo & ads).to_numpy()]] = 'Реклама'
+        result.loc[candidate_index[(~expo & ~ads & marketing).to_numpy()]] = 'Маркетинг'
     return result
 
 
