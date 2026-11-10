@@ -32,9 +32,16 @@ icon_args = ["--icon", icon_path] if os.path.exists(icon_path) else []
 if not icon_args:
     print("⚠ icon.ico не найден — собираем без иконки")
 
+# По умолчанию сохраняем совместимость с текущей поставкой (один EXE).
+# Для более быстрого запуска используйте: python build.py --onedir
+args = set(sys.argv[1:])
+if "--onedir" in args and "--onefile" in args:
+    raise SystemExit("Выберите только один режим: --onedir или --onefile")
+build_mode = "onedir" if "--onedir" in args else "onefile"
+
 cmd = [
     sys.executable, "-m", "PyInstaller",
-    "--onefile",
+    f"--{build_mode}",
     "--windowed",
     "--name", "AJUR Analytics",
     # pandas / numpy
@@ -74,10 +81,15 @@ print()
 result = subprocess.run(cmd, cwd=APP_DIR)
 
 if result.returncode == 0:
-    exe_path = os.path.join(APP_DIR, "dist", "AJUR Analytics.exe")
+    exe_path = (os.path.join(APP_DIR, "dist", "AJUR Analytics", "AJUR Analytics.exe")
+                if build_mode == "onedir"
+                else os.path.join(APP_DIR, "dist", "AJUR Analytics.exe"))
     print()
     print("✅ Сборка успешна!")
+    print(f"   Режим: {build_mode}")
     print(f"   Файл: {exe_path}")
+    if build_mode == "onedir":
+        print("   Для распространения передавайте всю папку 'AJUR Analytics', а не только EXE.")
 else:
     print()
     print("❌ Ошибка сборки — смотри вывод выше")
