@@ -15,6 +15,8 @@ import threading
 import tkinter as tk
 from time import perf_counter
 from datetime import datetime
+
+APP_IMPORT_STARTED = perf_counter()
 from tkinter import filedialog, messagebox, ttk
 
 import ui_theme as ui
@@ -187,6 +189,7 @@ class App(tk.Tk):
         self._show_page("analysis")
         ui.style_window(self)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._log(f"Инициализация Python и интерфейса: {perf_counter() - APP_IMPORT_STARTED:.2f} сек.")
 
     def _on_close(self):
         self._cfg["date_by"] = self._date_by.get()
