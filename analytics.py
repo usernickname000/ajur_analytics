@@ -7,6 +7,7 @@
 
 import json
 import os
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -16,10 +17,11 @@ from crm_data import (
     COL_BARTER, COL_DATE, COL_DISCOUNT_PCT, COL_MANAGER, COL_MONTH, COL_NOMEN,
     COL_ORDER, COL_POS_ORDER, COL_PROJECT, COL_REVENUE, COL_REVENUE_PAID, EXCLUDE_MANAGERS,
     EXCLUDE_REASON_BARTER,
-    _order_dup_mask, bucket_discount, categorize_revenue_amount, classify_industry,
+    _order_dup_mask, bucket_discount, categorize_revenue_amount,
+    classify_industry_series, pick_industry_series,
     client_rank_mask, count_orders, excluded_summary, load_crm,
     mask_no_events as _mask_no_events, mask_no_prog as _mask_no_prog, order_totals,
-    parse_dates, parse_money, parse_month, pick_industry, prepare_crm as apply_perimeter,
+    parse_dates, parse_money, parse_month, prepare_crm as apply_perimeter,
     run_data_quality_checks,
 )
 from paths import data_path
@@ -845,8 +847,8 @@ def verified_targets(verified):
 
 def add_derived_columns(df_full):
     """Отрасли, категории выручки и скидок (in place)."""
-    df_full['ОТРАСЛЬ_КЛИЕНТА'] = df_full.apply(pick_industry, axis=1)
-    df_full['ОТРАСЛЬ_КЛИЕНТА_НОРМ'] = df_full.apply(classify_industry, axis=1)
+    df_full['ОТРАСЛЬ_КЛИЕНТА'] = pick_industry_series(df_full)
+    df_full['ОТРАСЛЬ_КЛИЕНТА_НОРМ'] = classify_industry_series(df_full)
     df_full['Категория выручки'] = df_full[COL_REVENUE].apply(categorize_revenue_amount)
     if COL_DISCOUNT_PCT in df_full.columns:
         df_full['Скидка_%_число'] = pd.to_numeric(
@@ -1501,7 +1503,8 @@ def build_discounts(df_full, revenue_col, mask_no_events):
 
 
 def export_report(export_data, output_path, log):
-    """Пишет листы в xlsx, оформляет и добавляет лист с графиками."""
+    """Пишет, оформляет и сохраняет Excel-книгу за один цикл записи."""
+    started = perf_counter()
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         for sheet_name, df_sheet in export_data.items():
             safe_name = sheet_name[:31]
@@ -1511,16 +1514,18 @@ def export_report(export_data, output_path, log):
             except Exception as e:
                 log(f"Ошибка при сохранении листа {safe_name}: {e}")
 
-    log("Строю графики...")
-    try:
-        from openpyxl import load_workbook
-        wb = load_workbook(output_path)
-        style_workbook(wb, log=log)
-        add_report_charts(wb)
-        wb.save(output_path)
-        log("Графики добавлены ✅")
-    except Exception as e:
-        log(f"⚠ Графики не добавлены: {e}")
+        # Форматирование и графики добавляются к той же книге до закрытия
+        # ExcelWriter. Это исключает повторное чтение и повторное сохранение
+        # всего XLSX-файла через load_workbook().
+        style_workbook(writer.book, log=log)
+        log("Строю графики...")
+        try:
+            add_report_charts(writer.book)
+            log("Графики добавлены ✅")
+        except Exception as e:
+            log(f"⚠ Графики не добавлены: {e}")
+
+    log(f"Экспорт Excel завершён за {perf_counter() - started:.1f} сек.")
 
 
 def year_mismatch_warnings(df_full, ext_year, verified):

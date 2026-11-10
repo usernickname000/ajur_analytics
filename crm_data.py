@@ -230,6 +230,31 @@ def bucket_discount(x):
 # КЛИЕНТЫ И ОТРАСЛИ
 # ==============================
 
+def _first_nonempty_text(df, columns):
+    """Векторно выбирает первое заполненное текстовое значение из приоритетных колонок."""
+    result = pd.Series('', index=df.index, dtype=object)
+    for column in columns:
+        if column not in df.columns:
+            continue
+        source = df[column]
+        values = source.astype('string').str.strip()
+        valid = source.notna() & values.fillna('').ne('')
+        use = result.eq('') & valid
+        if use.any():
+            result.loc[use] = values.loc[use].astype(object)
+    return result
+
+
+def pick_client_series(df):
+    """Векторный эквивалент pick_client() для DataFrame."""
+    return _first_nonempty_text(df, (COL_CLIENT_RA, COL_CLIENT, COL_REKLAMD))
+
+
+def pick_industry_series(df):
+    """Векторный эквивалент pick_industry() для DataFrame."""
+    return _first_nonempty_text(df, (COL_INDUSTRY_CLIENT_RA, COL_INDUSTRY_CLIENT, COL_INDUSTRY_ADV))
+
+
 def pick_client(row):
     for c in [COL_CLIENT_RA, COL_CLIENT, COL_REKLAMD]:
         if c in row and pd.notna(row[c]) and str(row[c]).strip() != '':
@@ -307,6 +332,45 @@ def classify_industry(row):
     if _MARKETING_RE.search(text):
         return 'Маркетинг'
     return orig
+
+
+def classify_industry_series(df):
+    """Векторный эквивалент classify_industry(); сохраняет прежний порядок правил."""
+    if 'ОТРАСЛЬ_КЛИЕНТА' in df.columns:
+        orig = df['ОТРАСЛЬ_КЛИЕНТА']
+    else:
+        orig = pd.Series('', index=df.index, dtype=object)
+
+    raw = orig.astype('string').fillna('').str.strip().str.lower()
+    result = orig.astype(object).copy()
+
+    construction = raw.str.contains(r'строит|строй|недвиж', regex=True, na=False)
+    exact = raw.isin(['маркетинг', 'реклама', 'выставки'])
+    marketing_industry = raw.str.contains(r'реклам|маркет|выстав', regex=True, na=False)
+    needs_text = (raw.eq('') | marketing_industry) & ~construction & ~exact
+
+    result.loc[construction] = 'Строительство + Недвижимость'
+    result.loc[exact] = raw.loc[exact].str.capitalize()
+
+    # Исходная функция проверяет текст заказа только для пустой отрасли
+    # и укрупнённой отрасли «Реклама / маркетинг / выставки». Не обрабатываем
+    # остальные строки повторно: на больших выгрузках это заметно быстрее.
+    candidate_index = needs_text[needs_text].index
+    if len(candidate_index):
+        text = pd.Series('', index=candidate_index, dtype='string')
+        for column in (COL_POS_ORDER, COL_DESCRIPTION, COL_NOMEN, 'КОНЕЧНЫЙ_КЛИЕНТ'):
+            if column in df.columns:
+                values = df.loc[candidate_index, column].astype('string').fillna('').str.lower()
+                text = text.str.cat(values, sep=' ')
+
+        expo = text.str.contains(_EXPO_RE, na=False)
+        ads = text.str.contains(_ADS_RE, na=False)
+        marketing = text.str.contains(_MARKETING_RE, na=False)
+
+        result.loc[candidate_index[expo.to_numpy()]] = 'Выставки'
+        result.loc[candidate_index[(~expo & ads).to_numpy()]] = 'Реклама'
+        result.loc[candidate_index[(~expo & ~ads & marketing).to_numpy()]] = 'Маркетинг'
+    return result
 
 
 # ==============================
@@ -387,7 +451,7 @@ def load_crm(path, with_clients=True, required=(COL_ORDER, COL_REVENUE)):
                          f"{missing} ({os.path.basename(path)})")
     df[COL_REVENUE] = df[COL_REVENUE].apply(parse_money)
     if with_clients:
-        df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1).apply(normalize_client)
+        df['КОНЕЧНЫЙ_КЛИЕНТ'] = pick_client_series(df).apply(normalize_client)
     return df
 
 
@@ -429,7 +493,7 @@ def prepare_crm(df, log=None):
     """
     df = df.copy()
     if 'КОНЕЧНЫЙ_КЛИЕНТ' not in df.columns:
-        df['КОНЕЧНЫЙ_КЛИЕНТ'] = df.apply(pick_client, axis=1).apply(normalize_client)
+        df['КОНЕЧНЫЙ_КЛИЕНТ'] = pick_client_series(df).apply(normalize_client)
     df = mark_perimeter(df)
     excluded = df.loc[df[COL_EXCLUDED] != ''].reset_index(drop=True)
 

@@ -13,33 +13,15 @@ import json
 import queue
 import threading
 import tkinter as tk
+from time import perf_counter
 from datetime import datetime
+
+APP_IMPORT_STARTED = perf_counter()
 from tkinter import filedialog, messagebox, ttk
 
-import crm_data
 import ui_theme as ui
 from ui_theme import ICON, T, px
-from analytics import RECON_BAD_PCT, RECON_WARN_PCT, recon_verdict, run_analytics
 from paths import app_dir, bundle_dir, data_path
-from comparison import run_comparison
-from dashboard import generate_dashboard
-
-try:
-    from external_income_editor import ExternalIncomeEditor
-except ImportError:
-    ExternalIncomeEditor = None
-try:
-    from verified_figures_editor import VerifiedFiguresEditor
-except ImportError:
-    VerifiedFiguresEditor = None
-try:
-    from client_aliases_editor import ClientAliasesEditor
-except ImportError:
-    ClientAliasesEditor = None
-try:
-    from dohody_import_dialog import DohodyImportDialog
-except ImportError:
-    DohodyImportDialog = None
 
 VERSION = "3.1"
 
@@ -54,8 +36,8 @@ EXTERNAL_INCOME_PATH = data_path("external_income.json")
 VERIFIED_PATH        = data_path("verified_figures.json")
 ALIASES_PATH         = data_path("client_aliases.json")
 
-# Анализ и редактор алиасов должны работать с одним и тем же файлом
-crm_data.set_aliases_path(ALIASES_PATH)
+# Путь к алиасам совпадает с data_path() в crm_data.py. Сам модуль
+# импортируется лениво в рабочем потоке, чтобы окно появлялось быстрее.
 
 DEFAULT_MANAGERS = [
     "Петрова Э.", "Егорова И.", "Демахина Е.",
@@ -207,6 +189,7 @@ class App(tk.Tk):
         self._show_page("analysis")
         ui.style_window(self)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._log(f"Инициализация Python и интерфейса: {perf_counter() - APP_IMPORT_STARTED:.2f} сек.")
 
     def _on_close(self):
         self._cfg["date_by"] = self._date_by.get()
@@ -416,8 +399,20 @@ class App(tk.Tk):
     # ФОНОВЫЕ ЗАДАЧИ: прогресс + блокировка кнопки + обработка ошибок
     # ============================================================
     def _run_task(self, button, busy_text, worker, determinate=False):
+        # Не допускаем одновременный запуск нескольких тяжёлых задач:
+        # каждая из них независимо загружает pandas DataFrame и Excel-книгу.
+        if self._tasks:
+            self._toast("Другая операция ещё выполняется. Дождитесь её завершения.", "warn")
+            return
+
         idle_text = button.cget("text")
-        button.configure(state="disabled", text=busy_text)
+        started = perf_counter()
+        controls = [b for b in (getattr(self, "run_btn", None),
+                                getattr(self, "dash_btn", None),
+                                getattr(self, "cmp_run_btn", None)) if b is not None]
+        for control in controls:
+            control.configure(state="disabled")
+        button.configure(text=busy_text)
         self._tasks += 1
         if self._tasks == 1:
             self._progress.pack(fill="both", expand=True)
@@ -429,11 +424,14 @@ class App(tk.Tk):
             self._progress.start(12)
 
         def finish():
-            button.configure(state="normal", text=idle_text)
+            button.configure(text=idle_text)
+            for control in controls:
+                control.configure(state="normal")
             self._tasks = max(0, self._tasks - 1)
             if not self._tasks:
                 self._progress.stop()
                 self._progress.pack_forget()
+            self._log(f"Время выполнения «{idle_text}»: {perf_counter() - started:.1f} сек.")
 
         def run():
             try:
@@ -498,6 +496,8 @@ class App(tk.Tk):
             self._kpi[key] = value
 
     def _show_result(self, result):
+        from analytics import RECON_BAD_PCT, RECON_WARN_PCT, recon_verdict
+
         pct = result.get("deviation_pct")
         grand = result.get("grand_total", 0)
         verified = result.get("verified_total", 0)
@@ -564,6 +564,10 @@ class App(tk.Tk):
             self._log(msg)
 
         def work():
+            import crm_data
+            crm_data.set_aliases_path(ALIASES_PATH)
+            from analytics import run_analytics
+
             log(f"Файл: {os.path.basename(inp)}")
             result = run_analytics(inp, out_path, log=log, manager_plan=plan, date_by=date_by,
                                    verified_path=VERIFIED_PATH, external_path=EXTERNAL_INCOME_PATH)
@@ -579,6 +583,10 @@ class App(tk.Tk):
             return
 
         def work():
+            import crm_data
+            crm_data.set_aliases_path(ALIASES_PATH)
+            from dashboard import generate_dashboard
+
             path = generate_dashboard(inp, log=self._log)
             self._ui(self._report_ready, path, "Дашборд открыт")
 
@@ -637,6 +645,10 @@ class App(tk.Tk):
         out_path = os.path.join(od, f"сравнение_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
 
         def work():
+            import crm_data
+            crm_data.set_aliases_path(ALIASES_PATH)
+            from comparison import run_comparison
+
             self._log(f"Сравниваю «{la or 'Период А'}» и «{lb or 'Период Б'}»")
             run_comparison(pa, pb, out_path, la, lb, log=self._log)
             self._ui(self._report_ready, out_path, "Сравнение готово")
@@ -798,19 +810,39 @@ class App(tk.Tk):
         if not os.path.exists(EXTERNAL_INCOME_PATH):
             messagebox.showerror("Нет файла", f"Файл не найден:\n{EXTERNAL_INCOME_PATH}", parent=self)
             return
+        try:
+            from external_income_editor import ExternalIncomeEditor
+        except ImportError as exc:
+            messagebox.showerror("Ошибка загрузки редактора", str(exc), parent=self)
+            return
         self._after_editor(ExternalIncomeEditor(self, EXTERNAL_INCOME_PATH))
 
     def _open_dohody_import(self):
+        try:
+            from dohody_import_dialog import DohodyImportDialog
+        except ImportError as exc:
+            messagebox.showerror("Ошибка загрузки импорта", str(exc), parent=self)
+            return
         self._after_editor(DohodyImportDialog(self, EXTERNAL_INCOME_PATH))
 
     def _open_aliases_editor(self):
         if not os.path.exists(ALIASES_PATH):
             save_json_default(ALIASES_PATH, {"_описание": "Правила нормализации клиентов.", "groups": []})
+        try:
+            from client_aliases_editor import ClientAliasesEditor
+        except ImportError as exc:
+            messagebox.showerror("Ошибка загрузки редактора", str(exc), parent=self)
+            return
         self._after_editor(ClientAliasesEditor(self, ALIASES_PATH))
 
     def _open_verified_editor(self):
         if not os.path.exists(VERIFIED_PATH):
             save_json_default(VERIFIED_PATH, DEFAULT_VERIFIED)
+        try:
+            from verified_figures_editor import VerifiedFiguresEditor
+        except ImportError as exc:
+            messagebox.showerror("Ошибка загрузки редактора", str(exc), parent=self)
+            return
         self._after_editor(VerifiedFiguresEditor(self, VERIFIED_PATH))
 
 
