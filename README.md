@@ -15,13 +15,14 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-Сборка в один exe:
+Сборка приложения:
 
 ```powershell
-python build.py
+python build.py             # один EXE (удобнее передавать, но медленнее запускается)
+python build.py --onedir    # папка с EXE и библиотеками (рекомендуется для быстрой загрузки)
 ```
 
-Результат появится в `dist\AJUR Analytics.exe`. Иконка собирается отдельно через `make_icon.py`, причём только на Windows: ico, сделанный на Linux, Windows не принимает.
+В режиме `onefile` результат появится в `dist\AJUR Analytics.exe`. В режиме `onedir` запускайте `dist\AJUR Analytics\AJUR Analytics.exe` и передавайте пользователям всю папку целиком. Для настольной работы предпочтителен `onedir`: PyInstaller не распаковывает все библиотеки заново при каждом старте. Иконка собирается отдельно через `make_icon.py`, причём только на Windows: ico, сделанный на Linux, Windows не принимает.
 
 Настройки exe хранит рядом с собой: `config.json`, `external_income.json`, `verified_figures.json`, `client_aliases.json`. При первом запуске он сам выкладывает туда JSON-файлы, вшитые в сборку. Если переносите программу на другой компьютер, переносите всю папку, иначе потеряются планы менеджеров и правки внешних доходов.
 
