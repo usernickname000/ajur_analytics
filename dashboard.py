@@ -11,8 +11,8 @@ import pandas as pd
 
 from crm_data import (
     COL_MANAGER, COL_MONTH, COL_REVENUE, EXCLUDE_MANAGERS,
-    classify_industry, client_rank_mask, count_orders, load_crm, mask_no_events, order_totals,
-    parse_month, pick_industry, prepare_crm,
+    classify_industry_series, client_rank_mask, count_orders, load_crm, mask_no_events, order_totals,
+    parse_month, pick_industry_series, prepare_crm,
 )
 
 # Шаблон рядом с модулем (в собранном exe — в папке распаковки, см. build.py)
@@ -27,9 +27,9 @@ def _load_and_prepare(path: str) -> pd.DataFrame:
     """
     df, _ = prepare_crm(load_crm(path))
     df = df.dropna(subset=[COL_REVENUE]).reset_index(drop=True)
-    # Колонка должна называться именно 'ОТРАСЛЬ_КЛИЕНТА' — её читает classify_industry()
-    df['ОТРАСЛЬ_КЛИЕНТА'] = df.apply(pick_industry, axis=1)
-    df['ОТРАСЛЬ_НОРМ'] = df.apply(classify_industry, axis=1)
+    # Векторная классификация без Python-функции для каждой строки DataFrame.
+    df['ОТРАСЛЬ_КЛИЕНТА'] = pick_industry_series(df)
+    df['ОТРАСЛЬ_НОРМ'] = classify_industry_series(df)
     if COL_MONTH in df.columns:
         df['_month_dt'] = df[COL_MONTH].apply(parse_month)
     return df
